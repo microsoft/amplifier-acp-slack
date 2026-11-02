@@ -28,7 +28,7 @@ Install GitHub CLI, then clone the public source:
 
 ```sh
 gh repo clone microsoft/amplifier-acp-slack
-cd acp-slack-adapter
+cd amplifier-acp-slack
 ./install.sh --label "My agent"
 ```
 
