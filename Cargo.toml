@@ -1,0 +1,42 @@
+[package]
+name = "acp-slack-adapter"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+repository = "https://github.com/microsoft/amplifier-acp-slack"
+description = "Generic ACP integration with Slack conversations and presentation."
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+futures-util = "0.3"
+get_if_addrs = "0.5"
+libc = "0.2"
+pam-client = "0.5.0"
+rand = "0.8"
+rcgen = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }

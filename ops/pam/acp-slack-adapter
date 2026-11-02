@@ -1,0 +1,3 @@
+# Slack adapter: authenticate only the installing account using host policy.
+@include common-auth
+@include common-account

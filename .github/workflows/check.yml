@@ -1,0 +1,56 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libclang-dev pkg-config bubblewrap apparmor
+      - name: Permit the isolated terminal test on the ephemeral runner
+        run: |
+          if ! bwrap --unshare-all --ro-bind / / /bin/true; then
+            sudo apparmor_parser -r ops/apparmor/bwrap.profile
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked
+      - run: python3 -m venv /tmp/adapter-tests && /tmp/adapter-tests/bin/pip install aiohttp
+      - run: /tmp/adapter-tests/bin/python tests/process_integration.py
+      - run: /tmp/adapter-tests/bin/python tests/media.py
+      - run: /tmp/adapter-tests/bin/python tests/client_capabilities.py
+      - run: python3 tests/management_service.py
+      - uses: actions/setup-node@v4
+        if: matrix.os == 'ubuntu-24.04'
+        with:
+          node-version: 22
+      - run: npm ci && npx playwright install --with-deps chromium
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: ui/tests
+      - run: python3 tests/pam_live.py --browser
+        if: matrix.os == 'ubuntu-24.04'
+      - run: python3 tests/pam_live.py
+        if: matrix.os != 'ubuntu-24.04'
+      - run: cargo build --locked --release
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: ui/tests
+      - run: npx playwright install --with-deps chromium
+        working-directory: ui/tests
+      - run: npm test
+        working-directory: ui/tests

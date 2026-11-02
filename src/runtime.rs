@@ -1,0 +1,244 @@
+use crate::{
+    config::{self, Config},
+    driver, slack, store,
+};
+use anyhow::Result;
+use fs2::FileExt;
+use serde_json::json;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+use tokio::{sync::Notify, task::JoinSet};
+
+async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> Result<()> {
+    let home = std::fs::canonicalize(home)?;
+    config::private_dir(&home)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join("process.lock"))?;
+    lock.try_lock_exclusive()
+        .map_err(|_| anyhow::anyhow!("This installation already has a running process"))?;
+    let c = Config::load(&home)?;
+    if !c.enabled {
+        return Ok(());
+    }
+    let client = slack::Slack::new(&c, c.secrets(&home)?)?;
+    client.verify(&c).await?;
+    let store = Arc::new(Mutex::new(store::Store::open(&home)?));
+    store.lock().unwrap().bind_identity(&c)?;
+    store.lock().unwrap().recover()?;
+    store.lock().unwrap().apply_scope(&c)?;
+    runtime_status(
+        &home,
+        &c,
+        "running",
+        "Slack credentials verified; connecting to Slack",
+    )?;
+    let notify = Arc::new(Notify::new());
+    let mut socket = AbortTask(tokio::spawn(client.clone().listen(
+        c.clone(),
+        home.clone(),
+        store.clone(),
+        notify.clone(),
+    )));
+    let sender_store = store.clone();
+    let sender = client.clone();
+    let sender_home = home.clone();
+    let sender_revision = c.revision;
+    let mut publisher = AbortTask(tokio::spawn(async move {
+        loop {
+            let current = Config::load(&sender_home)?;
+            crate::permissions::refresh_messages(&sender_home, &current, &sender).await?;
+            if current.revision != sender_revision || !current.enabled {
+                break;
+            }
+            let next = sender_store.lock().unwrap().claim_outgoing(&current)?;
+            if let Some(o) = next {
+                match sender.publish(&o).await {
+                    Ok(ts) => sender_store.lock().unwrap().delivery(
+                        &o.id,
+                        "sent",
+                        Some(&ts),
+                        "Confirmed by Slack HTTP response",
+                        0,
+                    )?,
+                    Err(slack::ApiError::RateLimited(delay)) => {
+                        sender_store.lock().unwrap().delivery(
+                            &o.id,
+                            "ready",
+                            None,
+                            "Slack rate limit",
+                            (delay.max(1) * 1000) as i64,
+                        )?
+                    }
+                    Err(slack::ApiError::Rejected(reason)) => sender_store
+                        .lock()
+                        .unwrap()
+                        .delivery(&o.id, "failed", None, &reason, 0)?,
+                    Err(slack::ApiError::Uncertain) => {
+                        // Do not overwrite an echo that arrived while HTTP was pending.
+                        let s = sender_store.lock().unwrap();
+                        s.db.execute("UPDATE outbox SET status='uncertain',note='Delivery uncertain; do not resend without checking Slack' WHERE id=?1 AND status='sending'",[&o.id])?;
+                        s.audit("delivery_uncertain", json!({"id":o.id}))?;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    }));
+    let mut workers = JoinSet::new();
+    let mut timer = tokio::time::interval(std::time::Duration::from_millis(500));
+    let result = loop {
+        tokio::select! {
+            _=changes.changed()=>break Ok(()),
+            r=&mut socket.0=>break Err(anyhow::anyhow!("Slack listener stopped: {}",r.is_err())),
+            r=&mut publisher.0=>break Err(anyhow::anyhow!("Slack publisher stopped: {}",r.is_err())),
+            Some(r)=workers.join_next(),if !workers.is_empty()=>{
+                if r.is_err(){store.lock().unwrap().audit("worker_panic",json!({}))?;}
+            },
+            _=timer.tick()=>{},
+            _=notify.notified()=>{},
+        }
+        while workers.len() < c.attention.parallel_contexts {
+            let next = store.lock().unwrap().claim(&c.attention)?;
+            let Some(job) = next else { break };
+            if !c.allows(&job.trigger.channel, "")
+                || !c.should_wake(&job.trigger.channel, &job.trigger.text)
+            {
+                store.lock().unwrap().db.execute("UPDATE jobs SET status='superseded',note='Conversation no longer in the configured scope' WHERE id=?1",[&job.id])?;
+                continue;
+            }
+            let c = c.clone();
+            let home = home.clone();
+            let store = store.clone();
+            let client = client.clone();
+            workers.spawn(async move {
+                let participants=client.participants(&job.trigger.channel).await;
+                let history_result=client.recent(&job.trigger).await;
+                let prepared=(||->Result<_>{
+                    let mut s=store.lock().unwrap();
+                    match history_result {
+                        Ok(messages)=>for m in messages {
+                            if s.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions WHERE channel=?1 AND slack_ts=?2)",rusqlite::params![m.channel,m.ts],|r|r.get::<_,bool>(0))? {continue;}
+                            let id=format!("history:{}:{}:{}",m.channel,m.ts,m.revision);
+                            s.ingest(&id,&m,false)?;
+                        },
+                        Err(_)=>s.audit("history_incomplete",json!({"context":job.context,"note":"Using locally observed messages; Slack history unavailable"}))?,
+                    }
+                    let job=s.prepare(job.clone())?;
+                    let history=s.history(&job.trigger)?;
+                    let delivery=s.response_delivery(&job.context,&job.id)?;
+                    Ok((job,history,delivery))
+                })();
+                let (job,result)=match prepared {
+                    Ok((job,history,delivery))=>{
+                        let mut input=driver::request(&c,&job.trigger,history);
+                        input["job_id"]=json!(job.id);
+                        input["response_delivery"]=delivery;
+                        if job.reconsidered { input["continuation_note"]=json!("An earlier response was withheld and was NOT posted to Slack. Other participants did not see that draft. Review the actual conversation and delivery receipts before deciding what to say; do not treat a private proposal as shared or agreed. Work may already have been performed: check its result instead of repeating actions. If that evidence is unavailable, say so."); }
+                        input["participants_from_slack"]=serde_json::to_value(participants)?;
+                        if c.context.enabled {
+                            match crate::context::orientation_for(&c,&home,&input).await {
+                                Ok(orientation)=>input["orientation"]=orientation,
+                                Err(_)=> {
+                                    input["context_notice"]=json!("Live conversation orientation could not be fetched. Use the supplied bounded projection and available context tools; do not claim the projection is a complete conversation archive.");
+                                    store.lock().unwrap().audit("context_unavailable",json!({"context":job.context,"reason":"Live conversation orientation is temporarily unavailable"}))?;
+                                }
+                            }
+                        }
+                        let result=driver::decide(c.clone(),home,input).await;
+                        (job,result)
+                    },
+                    Err(e)=>(job,Err(e))
+                };
+                // Errors are categorized without logging prompts, secrets, or
+                // untrusted harness stderr to the shared service journal.
+                if result.is_err(){eprintln!("ACP turn failed in a conversation; see adapter activity");}
+                store.lock().unwrap().finish(&job,result,&c.attention)
+            });
+        }
+    };
+    socket.0.abort();
+    publisher.0.abort();
+    workers.abort_all();
+    while workers.join_next().await.is_some() {}
+    crate::permissions::cancel_all(&store.lock().unwrap(), "Connector stopped")?;
+    crate::permissions::refresh_messages(&home, &c, &client).await?;
+    store.lock().unwrap().audit("process_stopped", json!({}))?;
+    drop(lock);
+    result
+}
+
+struct AbortTask<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+fn runtime_status(home: &std::path::Path, c: &Config, state: &str, reason: &str) -> Result<()> {
+    config::private_write(
+        &home.join("runtime.json"),
+        &serde_json::to_vec(
+            &json!({"state":state,"config_revision":c.revision,"updated_at":crate::model::now_ms(),"reason":reason,"connections":[]}),
+        )?,
+    )
+}
+pub async fn supervise(
+    home: PathBuf,
+    mut changes: tokio::sync::watch::Receiver<u64>,
+) -> Result<()> {
+    loop {
+        changes.borrow_and_update();
+        let c = Config::load(&home)?;
+        if !c.enabled {
+            runtime_status(&home, &c, "stopped", "Connection paused")?;
+            if changes.changed().await.is_err() {
+                return Ok(());
+            }
+            continue;
+        }
+        if c.validate_ready().is_err() || c.secrets(&home).is_err() {
+            runtime_status(
+                &home,
+                &c,
+                "failed",
+                "Finish setup and verify credentials before starting",
+            )?;
+            if changes.changed().await.is_err() {
+                return Ok(());
+            }
+            continue;
+        }
+        runtime_status(
+            &home,
+            &c,
+            "connecting",
+            "Connecting the Slack app and ACP endpoint",
+        )?;
+        let observed = c.revision;
+        let result = run(home.clone(), changes.clone()).await;
+        if result.is_err() {
+            runtime_status(
+                &home,
+                &c,
+                "failed",
+                "Connection failed; check the configured Slack credentials and endpoint",
+            )?;
+            let s = store::Store::open(&home)?;
+            s.audit(
+                "connection_failed",
+                json!({"reason":"Connection could not start or stopped unexpectedly"}),
+            )?;
+        }
+        if *changes.borrow() != observed {
+            continue;
+        }
+        tokio::select! { r=changes.changed()=>if r.is_err(){return Ok(());}, _=tokio::time::sleep(std::time::Duration::from_secs(15))=>{} }
+    }
+}
