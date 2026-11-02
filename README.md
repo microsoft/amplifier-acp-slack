@@ -24,10 +24,10 @@ Linux is the supported service host in this release. Windows, Mac, Linux, iOS
 and Android can use the browser interface and Slack clients. Native Windows/macOS
 service installation is future work.
 
-Install GitHub CLI, then clone the public source:
+Install Git, then clone the public source:
 
 ```sh
-gh repo clone microsoft/amplifier-acp-slack
+git clone https://github.com/microsoft/amplifier-acp-slack.git
 cd amplifier-acp-slack
 ./install.sh --label "My agent"
 ```
