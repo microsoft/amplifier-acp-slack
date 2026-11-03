@@ -98,6 +98,10 @@ def cli(folder, *args, cwd=None, auth_dir=None):
             ('missing_scope', 'This Slack authorization cannot complete app setup. Reconnect your Slack account using the guided flow.'),
         ]:
             if code in output:
+                # An explicit rejection is different from a network failure.
+                # Keep this small status record safe for the management UI.
+                if auth_dir is None and code in {'invalid_auth', 'token_revoked', 'token_expired', 'missing_scope'}:
+                    write(folder / 'authorization-health.json', {'state': 'needs_attention', 'message': explanation})
                 raise SetupError(explanation)
         raise SetupError('Slack setup could not complete. Retry, or reconnect your Slack account. Your existing connection and any app already created are preserved.')
     return output
@@ -117,6 +121,11 @@ def summary(folder):
         ready = {'authorized': True, 'team_id': auth['team_id'], 'workspace': auth.get('team_domain', auth['team_id'])}
     except SetupError:
         ready = {'authorized': False}
+    health = read(folder / 'authorization-health.json', {})
+    ready['authorization'] = 'managed' if ready['authorized'] else 'missing'
+    if ready['authorized'] and health.get('state') == 'needs_attention':
+        ready['authorization'] = 'needs_attention'
+        ready['authorization_issue'] = health['message']
     pending = read(folder / 'pending.json', {})
     ready['authorization_pending'] = pending.get('expires_at', 0) > time.time()
     return ready
@@ -165,6 +174,9 @@ def execute(home, action, body):
         except BlockingIOError:
             raise SetupError('A Slack setup operation is already running. Try again shortly.')
         if action == 'authorize':
+            pending = read(folder / 'pending.json', {})
+            if pending.get('expires_at', 0) > time.time() and pending.get('ticket'):
+                return {'command': '/slackauthticket ' + pending['ticket'], 'expires_at': pending['expires_at']}
             output = cli(folder, 'auth', 'login', '--no-prompt')
             match = re.search(r'/slackauthticket ([A-Za-z0-9_+/=.-]+)', output)
             if not match:
@@ -188,6 +200,7 @@ def execute(home, action, body):
                 (staging / 'credentials.json').unlink(missing_ok=True)
                 raise SetupError('Authorize the workspace this connection already belongs to. Its previous access is preserved.')
             write(folder / 'auth/credentials.json', {auth['team_id']: auth})
+            (folder / 'authorization-health.json').unlink(missing_ok=True)
             (staging / 'credentials.json').unlink(missing_ok=True)
             (folder / 'pending.json').unlink(missing_ok=True)
             return summary(folder)
@@ -196,12 +209,14 @@ def execute(home, action, body):
             auth = authorization(folder)
             if auth['team_id'] != body.get('team_id'):
                 raise SetupError('Slack authorization belongs to another workspace.')
+            (folder / 'authorization-health.json').unlink(missing_ok=True)
             return {'token': auth['token']}
         if action == 'connect':
             cli(folder, 'auth', 'list')
             auth = authorization(folder)
             if body.get('team_id') and body['team_id'] != auth['team_id']:
                 raise SetupError('This connection belongs to another workspace. Authorize its original workspace.')
+            (folder / 'authorization-health.json').unlink(missing_ok=True)
             project = prepare_project(folder, body['manifest'], body.get('app_id'), auth)
             (folder / 'issued.json').unlink(missing_ok=True)
             cli(folder, 'deploy', '--team', auth['team_id'], '--app', 'deployed', '--manifest-source', 'local', cwd=project)

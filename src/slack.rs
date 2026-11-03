@@ -140,6 +140,92 @@ impl Slack {
         );
         Ok(())
     }
+    /// Resume only confirmed portions of a multipart reply. Each attempted part
+    /// has a durable identity before sending; uncertain effects are never replayed.
+    pub async fn publish_durable(
+        &self,
+        o: &Outgoing,
+        store: &Arc<Mutex<Store>>,
+    ) -> std::result::Result<String, ApiError> {
+        let parts = crate::reply_parts::split(&o.text)
+            .map_err(|_| ApiError::Rejected("reply_cannot_be_split_safely".into()))?;
+        if parts.len() == 1 {
+            return self.publish(o).await;
+        }
+        {
+            let s = store.lock().unwrap();
+            for (index, part) in parts.iter().enumerate() {
+                let client_id = uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_URL,
+                    format!("acp-reply:{}:{index}", o.id).as_bytes(),
+                )
+                .to_string();
+                s.db.execute("INSERT OR IGNORE INTO outbox_parts(outbox_id,part,client_id,text) VALUES(?1,?2,?3,?4)",rusqlite::params![o.id,index as i64,client_id,part.markdown]).map_err(|_|ApiError::Uncertain)?;
+            }
+        }
+        let mut first = None;
+        for index in 0..parts.len() {
+            let (client_id, text, status, ts): (String, String, String, Option<String>) = {
+                let s = store.lock().unwrap();
+                s.db.query_row("SELECT client_id,text,status,slack_ts FROM outbox_parts WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_|ApiError::Uncertain)?
+            };
+            if status == "sent" {
+                if first.is_none() {
+                    first = ts;
+                }
+                continue;
+            }
+            if status != "ready" {
+                return Err(ApiError::Uncertain);
+            }
+            store
+                .lock()
+                .unwrap()
+                .db
+                .execute(
+                    "UPDATE outbox_parts SET status='sending' WHERE outbox_id=?1 AND part=?2",
+                    rusqlite::params![o.id, index as i64],
+                )
+                .map_err(|_| ApiError::Uncertain)?;
+            let part = Outgoing {
+                id: client_id,
+                channel: o.channel.clone(),
+                thread: o.thread.clone(),
+                text,
+                media: if index + 1 == parts.len() {
+                    o.media.clone()
+                } else {
+                    vec![]
+                },
+            };
+            match self.publish(&part).await {
+                Ok(ts) => {
+                    store.lock().unwrap().db.execute("UPDATE outbox_parts SET status='sent',slack_ts=?3 WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index as i64,ts]).map_err(|_|ApiError::Uncertain)?;
+                    if first.is_none() {
+                        first = Some(ts);
+                    }
+                }
+                Err(error) => {
+                    let state = match &error {
+                        ApiError::RateLimited(_) => "ready",
+                        ApiError::Rejected(_) => "failed",
+                        ApiError::Uncertain => "uncertain",
+                    };
+                    store
+                        .lock()
+                        .unwrap()
+                        .db
+                        .execute(
+                            "UPDATE outbox_parts SET status=?3 WHERE outbox_id=?1 AND part=?2",
+                            rusqlite::params![o.id, index as i64, state],
+                        )
+                        .map_err(|_| ApiError::Uncertain)?;
+                    return Err(error);
+                }
+            }
+        }
+        first.ok_or(ApiError::Uncertain)
+    }
     pub async fn publish(&self, o: &Outgoing) -> std::result::Result<String, ApiError> {
         // Upload bytes first without sharing them. Once the message has been
         // posted, any file-completion failure is uncertain, never safe to retry.
@@ -181,7 +267,7 @@ impl Slack {
         // to translate standard Markdown into its native rich message blocks.
         // Do not combine this field with `text` or `blocks`, or convert/escape
         // the Markdown first (which would damage links and code). Validated
-        // contributions are capped at 3,800 characters, below Slack's 12,000.
+        // Each delivery part stays below Slack's 12,000-character limit.
         let mut p = json!({"channel":o.channel,"markdown_text":o.text,"client_msg_id":o.id,"unfurl_links":false,"unfurl_media":false,"parse":"none"});
         if !o.thread.is_empty() {
             p["thread_ts"] = o.thread.clone().into();
@@ -689,7 +775,7 @@ pub fn media_readiness(c: &Config, scopes: Option<&[String]>) -> Value {
       "outgoing":{"enabled":c.media.outgoing,"permitted":has("files:write")},
       "ready":has("files:read") && has("files:write"),
       "settings_url":if c.slack.app_id.is_empty(){"https://api.slack.com/apps".into()}else{format!("https://api.slack.com/apps/{}/oauth",c.slack.app_id)},
-      "note":if scopes.is_none(){"Slack did not return its granted scopes. Verify again; the manifest alone does not confirm access."}else if has("files:read") && has("files:write"){"Slack file permissions are installed. Enable attachment reading and delivery when ready."}else{"Add the missing Bot Token Scopes in OAuth & Permissions, then reinstall this existing app to the workspace. Recheck permissions afterward; creating a new app is unnecessary."}})
+      "note":if scopes.is_none(){"Slack did not return its granted scopes. Verify again; the manifest alone does not confirm access."}else if has("files:read") && has("files:write") && c.media.incoming && c.media.outgoing {"Files and images are ready."}else if has("files:read") && has("files:write"){"File access is available; this connection's attachment settings still apply."}else{"Add the missing Bot Token Scopes in OAuth & Permissions, then reinstall this existing app to the workspace. Recheck permissions afterward; creating a new app is unnecessary."}})
 }
 
 pub fn manifest(label: &str) -> Value {

@@ -26,12 +26,19 @@ shared room. Long private modal details are explicitly shortened; the dashboard
 retains the complete bounded request. The operator should reject an action when
 its supplied description is insufficient or misleading.
 
-Requests expire, and editing/deleting the source, changing the conversation,
-reconfiguring/pausing the connector, or ending/restarting the turn invalidates
-outstanding requests. A standard `cancelled` prompt result ends quietly without
-posting partial output or retrying the work. No response means no permission. Restart never replays the
-interrupted work. Closed cards lose their buttons when Slack confirms the update;
-a stale button remains ineffective even if that visual update fails.
+Requests default to a 15-minute expiry; `acp.client.permission_timeout_seconds`
+accepts 1–86,400 seconds. Human waiting does not consume the agent's execution
+timeout. A turn still has a total human-wait allowance equal to that configured
+expiry, so repeated requests cannot extend it indefinitely. Existing explicit
+expiry values remain unchanged until the owner updates them.
+
+Editing/deleting the source, changing the conversation, reconfiguring/pausing the
+connector, or ending/restarting the turn invalidates outstanding requests. A
+cancelled direct conversation receives a brief stopped-work notice; partial agent
+output is withheld and work is never retried automatically. No response means no
+permission. Closed cards retain the original action summary and private details,
+remove decision buttons, and distinguish approval from actual execution. A stale
+button remains ineffective even if its visual update fails.
 
 The connector binds every choice to its job, ACP session, configuration revision,
 source revision, conversation version, designated member, and Slack message.
@@ -56,7 +63,7 @@ config API and CLI use exactly the same fields.
   "terminal": true,
   "workspace_roots": ["/home/example/agents/alpha/workspace"],
   "approval_users": ["U0123456789"],
-  "permission_timeout_seconds": 180,
+  "permission_timeout_seconds": 900,
   "max_file_bytes": 1048576,
   "terminal_output_bytes": 262144,
   "terminal_timeout_seconds": 120

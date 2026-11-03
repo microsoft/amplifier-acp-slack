@@ -51,7 +51,11 @@ pub fn status(home: &Path) -> Value {
     value["credential_configured"] = enabled(home).into();
     value["managed_access"] = crate::provisioning::configured(home).into();
     value["profile"] = "agent-identity/1".into();
-    value["poll_seconds"] = 120.into();
+    value.as_object_mut().unwrap().remove("poll_seconds");
+    if value["update_mode"].is_null() {
+        value["update_mode"] = "connecting".into();
+    }
+    value["automatic_updates"] = (value["update_mode"] == "events").into();
     value
 }
 fn enabled(home: &Path) -> bool {
@@ -228,8 +232,44 @@ fn error_code(value: &Value) -> String {
 }
 
 pub async fn sync(home: &Path, c: &Config) -> Result<Value> {
+    sync_from(home, c, None).await
+}
+
+async fn sync_from(
+    home: &Path,
+    c: &Config,
+    update: Option<&driver::IdentityUpdate>,
+) -> Result<Value> {
     let _guard = lock(home)?;
     let mut saved = status(home);
+    if let Some(update) = update {
+        saved["update_mode"] = if update.automatic { "events" } else { "manual" }.into();
+        saved["automatic_updates"] = update.automatic.into();
+        if let Some(doc) = &update.document {
+            saved["source_revision"] = doc["revision"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(128)
+                .collect::<String>()
+                .into();
+            saved["agent_name"] = doc["display_name"]
+                .as_str()
+                .unwrap_or("Agent")
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .into();
+        }
+    }
+    if update.is_some_and(|u| u.document.is_none()) {
+        return record(
+            home,
+            saved,
+            "unsupported",
+            "This agent does not provide a portable image. Slack keeps its current icon.",
+        );
+    }
     if !enabled(home) {
         return record(
             home,
@@ -239,13 +279,34 @@ pub async fn sync(home: &Path, c: &Config) -> Result<Value> {
         );
     }
     if saved["retry_at"].as_i64().unwrap_or(0) > now_ms() {
-        return Ok(saved);
+        if let Some(doc) = update.and_then(|u| u.document.as_ref())
+            && doc["avatar"]["sha256"] != saved["synced_hash"]
+        {
+            return record(home, saved, "pending", "The new image is queued for Slack.");
+        }
+        let state = saved["state"].as_str().unwrap_or("waiting").to_owned();
+        let message = saved["message"].as_str().unwrap_or("").to_owned();
+        return record(home, saved, &state, &message);
     }
     ensure!(
         !c.slack.app_id.is_empty(),
         "Connect this adapter to a Slack app first"
     );
-    let result = sync_inner(home, c, &mut saved).await;
+    let result = async {
+        let doc = match update {
+            Some(update) => update.document.clone(),
+            None => driver::identity(c, home).await?,
+        };
+        let Some(doc) = doc else {
+            return Ok((
+                "unsupported".into(),
+                "This agent does not provide a portable image. Slack keeps its current icon."
+                    .into(),
+            ));
+        };
+        sync_inner(home, c, &mut saved, &doc).await
+    }
+    .await;
     match result {
         Ok((state, message)) => record(home, saved, &state, &message),
         Err(_) => {
@@ -259,15 +320,13 @@ pub async fn sync(home: &Path, c: &Config) -> Result<Value> {
         }
     }
 }
-async fn sync_inner(home: &Path, c: &Config, saved: &mut Value) -> Result<(String, String)> {
-    let Some(doc) = driver::identity(c, home).await? else {
-        return Ok((
-            "unsupported".into(),
-            "This ACP agent does not advertise portable portraits. Its Slack icon is unchanged."
-                .into(),
-        ));
-    };
-    let (bytes, hash) = portrait(&doc)?;
+async fn sync_inner(
+    home: &Path,
+    c: &Config,
+    saved: &mut Value,
+    doc: &Value,
+) -> Result<(String, String)> {
+    let (bytes, hash) = portrait(doc)?;
     saved["agent_name"] = doc["display_name"]
         .as_str()
         .unwrap_or("Agent")
@@ -440,18 +499,93 @@ fn retry_seconds(r: &reqwest::Response) -> i64 {
         .clamp(60, 86400)
 }
 
+/// One cheap presentation subscription per running connector. No recurring
+/// healthy checks, ACP sessions, or model process. Retry timers exist only when
+/// a connection fails, Slack throttles an upload, or an upload fails transiently.
 pub async fn run(home: PathBuf, c: Config) {
+    let mut reconnect_delay = 2;
     loop {
-        if let Ok(current) = Config::load(&home) {
-            if !current.enabled || current.revision != c.revision {
+        let (tx, mut updates) = tokio::sync::watch::channel(None);
+        let (source_config, source_home) = (c.clone(), home.clone());
+        let mut source =
+            tokio::spawn(
+                async move { driver::watch_identity(&source_config, &source_home, tx).await },
+            );
+        struct Stop(tokio::task::AbortHandle);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _stop = Stop(source.abort_handle());
+        let mut source_open = true;
+        let mut updates_open = true;
+        let mut latest = None;
+        let mut retry_at: Option<i64> = None;
+        let mut reconnect = false;
+        loop {
+            let changed = tokio::select! {
+                changed = updates.changed(), if updates_open => {
+                    updates_open = changed.is_ok();
+                    updates_open
+                },
+                result = &mut source, if source_open => {
+                    source_open = false;
+                    reconnect = !matches!(result, Ok(Ok(())));
+                    // The task may have sent its snapshot and exited before our
+                    // receiver was polled (legacy agents intentionally do so).
+                    updates.has_changed().unwrap_or(true)
+                },
+                _ = async {
+                    match retry_at {
+                        Some(at) => tokio::time::sleep(Duration::from_millis((at - now_ms()).max(1) as u64)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => true,
+            };
+            if changed {
+                if let Some(update) = updates.borrow_and_update().clone() {
+                    latest = Some(update);
+                }
+                if let Some(update) = &latest {
+                    reconnect_delay = 2;
+                    match sync_from(&home, &c, Some(update)).await {
+                        Ok(value)
+                            if matches!(
+                                value["state"].as_str(),
+                                Some("pending" | "rate_limited" | "needs_attention")
+                            ) =>
+                        {
+                            retry_at = Some(
+                                value["retry_at"]
+                                    .as_i64()
+                                    .unwrap_or(now_ms() + 120_000)
+                                    .max(now_ms() + 1000),
+                            );
+                        }
+                        Ok(_) => retry_at = None,
+                        Err(_) => retry_at = Some(now_ms() + 5000), // Another explicit sync may hold the lock.
+                    }
+                }
+            }
+            if !source_open && (reconnect || retry_at.is_none()) {
                 break;
             }
-        } else {
-            break;
         }
-        if enabled(&home) {
-            let _ = sync(&home, &c).await;
+        if !reconnect {
+            return;
+        } // Snapshot-only peer: manual refresh, never poll.
+        if let Ok(_guard) = lock(&home) {
+            let mut saved = status(&home);
+            saved["update_mode"] = "connecting".into();
+            let _ = record(
+                &home,
+                saved,
+                "needs_attention",
+                "Reconnecting to the agent for image changes.",
+            );
         }
-        tokio::time::sleep(Duration::from_secs(120)).await;
+        tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+        reconnect_delay = (reconnect_delay * 2).min(120);
     }
 }

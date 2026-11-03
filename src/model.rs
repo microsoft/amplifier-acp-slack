@@ -28,6 +28,8 @@ pub fn context_id(team: &str, channel: &str, thread: &str) -> String {
     .to_string()
 }
 
+pub const MAX_REPLY_CHARS: usize = 100_000;
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Decision {
@@ -52,8 +54,8 @@ impl Decision {
         anyhow::ensure!(self.reason.len() <= 4000, "Decision reason too large");
         if self.decision == "speak" {
             anyhow::ensure!(
-                !self.text.trim().is_empty() && self.text.chars().count() <= 3800,
-                "Public contribution must contain 1..3800 characters"
+                !self.text.trim().is_empty() && self.text.chars().count() <= MAX_REPLY_CHARS,
+                "Public contribution must contain 1..100000 characters"
             );
         } else {
             anyhow::ensure!(

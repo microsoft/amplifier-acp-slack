@@ -9,11 +9,16 @@ step. Workspace administrators retain their installation approval policy.
 
 Each installation owns its pinned Slack CLI, private credential store, refresh
 rotation, app association, and recovery state. Retrying setup reuses the recorded
-app. Existing manual connections are preserved and can opt into managed access.
+app. Confirmation finishes creation and starts the new connection immediately.
+Existing manual connections are preserved and can opt into managed access;
+confirming that access returns to the connection page without reinstalling or
+restarting a deliberately paused connection. Working legacy credentials do not
+trigger an authorization screen.
 No shared provisioning service or Constellation agent extension is required for
 messaging. Portable images remain an optional ACP identity extension.
 
-`GET /api/v1/setup/slack` reports authorization status; authenticated administrator
+`GET /api/v1/setup/slack` reports `authorization` (`managed`, `legacy`, `missing`,
+or `needs_attention`), `connection_ready`, `connection_running`, and `next_action`; authenticated administrator
 `POST` actions are `authorize`, `confirm` (write-only `challenge`), and `connect`.
 The CLI’s generic API command and `window.slackConnector.act` expose the same
 workflow. Ticket commands and confirmation codes never enter persisted UI state,
@@ -33,3 +38,8 @@ required on a new installation; the existing fleet was not reauthorized or reins
 References: [CLI authorization](https://docs.slack.dev/tools/slack-cli/guides/authorizing-the-slack-cli/),
 [deploy hook](https://docs.slack.dev/tools/slack-cli/reference/hooks/#deploy-optional),
 [app distribution](https://docs.slack.dev/app-management/distribution/).
+
+The normal connected page shows the agent, message/file/image readiness, and
+**Open in Slack**. Preferences and troubleshooting stay under **Settings**, with
+credentials and connection internals under **Advanced**. Saved views from an
+older version cannot reopen a completed authorization flow.

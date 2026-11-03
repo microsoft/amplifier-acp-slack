@@ -88,7 +88,7 @@ impl Default for ClientCapabilities {
             terminal: false,
             workspace_roots: vec![],
             approval_users: vec![],
-            permission_timeout_seconds: 180,
+            permission_timeout_seconds: 900,
             max_file_bytes: 1024 * 1024,
             terminal_output_bytes: 256 * 1024,
             terminal_timeout_seconds: 120,
@@ -290,7 +290,7 @@ impl Config {
             "Permission approvers must be Slack member IDs"
         );
         ensure!(
-            (1..=900).contains(&client.permission_timeout_seconds)
+            (1..=86400).contains(&client.permission_timeout_seconds)
                 && (1..=3600).contains(&client.terminal_timeout_seconds)
                 && (1..=4 * 1024 * 1024).contains(&client.max_file_bytes)
                 && (1..=1024 * 1024).contains(&client.terminal_output_bytes),

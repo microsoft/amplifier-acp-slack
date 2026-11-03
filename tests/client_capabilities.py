@@ -84,6 +84,13 @@ async def main():
             await fixture.action(post,0)
             await until(lambda:any(p.get('channel')=='Dapproval' for p in fixture.updated),'buttons removed')
             assert count(home,"SELECT COUNT(*) FROM permissions WHERE status='approved'")==1
+            closed=next(p for p in fixture.updated if p['channel']=='Dapproval')
+            assert 'Create the harmless approval-check file' in json.dumps(closed),closed
+            assert 'permission_details' in json.dumps(closed) and 'acp_permission' not in json.dumps(closed)
+            assert 'not whether the action ran' in json.dumps(closed)
+            views_before=len(fixture.views)
+            await fixture.action(post,0,action_id='permission_details')
+            await until(lambda:len(fixture.views)>views_before,'closed request details available')
             passed('Private Slack details show merged tool-call arguments only to the initiating authorized human')
             passed('Approval requires the initiating allowlisted human and exact app/workspace/message; replay and persistent grants rejected')
             (workspace/'approved.txt').unlink()
@@ -92,11 +99,12 @@ async def main():
             await until(lambda:any(p['channel']=='Ddenial' for p in fixture.posts),'denied turn returns')
             assert not (workspace/'approved.txt').exists();passed('Explicit denial returns the endpoint’s reject option without running the tool')
             _,post=await permission('Dcancelled','permission requested, cancelled turn');await fixture.action(post,1)
-            await until(lambda:count(home,"SELECT COUNT(*) FROM jobs WHERE status='pass' AND note='ACP turn cancelled'")==1,'cancelled turn finishes')
-            assert not any(p['channel']=='Dcancelled' for p in fixture.posts)
+            await until(lambda:count(home,"SELECT COUNT(*) FROM jobs WHERE status='speak' AND note='ACP turn cancelled'")==1,'cancelled turn finishes')
+            await until(lambda:any(p['channel']=='Dcancelled' for p in fixture.posts),'cancellation notice delivered')
+            assert all('stopped before finishing' in p.get('markdown_text','') for p in fixture.posts if p['channel']=='Dcancelled')
             assert count(home,"SELECT COUNT(*) FROM audit WHERE kind='acp_turn_cancelled'")==1
             assert count(home,"SELECT COUNT(*) FROM audit WHERE kind='driver_failed'")==0
-            passed('A standard cancelled stop reason ends gracefully without posting partial output or retrying the turn')
+            passed('A cancelled direct turn explains that work stopped, without posting partial agent output or retrying')
             _,post=await permission('Dexpire')
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='expired'",(post['client_msg_id'],))==1,'permission expires',timeout=10)
             await fixture.action(post,0);assert not (workspace/'approved.txt').exists();passed('Unanswered requests expire and cannot be approved later')
@@ -117,6 +125,17 @@ async def main():
             await until(lambda:any(p.get('markdown_text')=='ambiguous options refused' for p in fixture.posts),'ambiguous options refused')
             assert len(fixture.approvals)==prior
             passed('Duplicate permission option IDs cannot relabel a rejection as approval')
+            await stop()
+            config['revision']+=1;config['acp']['timeout_seconds']=1
+            private_json(home/'adapter.json',config)
+            await start()
+            _,post=await permission('Dlongwait')
+            await asyncio.sleep(2)
+            assert count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='pending'",(post['client_msg_id'],))==1
+            await fixture.action(post,0)
+            await until(lambda:any(p.get('channel')=='Dlongwait' for p in fixture.posts),'reply after wait longer than execution budget')
+            assert (workspace/'approved.txt').exists()
+            passed('Human approval waiting does not consume the agent execution budget')
             print(json.dumps({'passed':len(checks),'checks':checks},indent=2))
         except Exception:
             print((home/'service.log').read_text(),file=sys.stderr)

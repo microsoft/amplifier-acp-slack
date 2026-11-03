@@ -95,6 +95,8 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         check(api("GET", "/api/v1/setup/slack", credential=None)[0] == 401, "Slack setup requires sign-in")
         check(api("POST", "/api/v1/setup/slack", {"action":"authorize"}, issued["token"])[0] == 403, "Observer cannot authorize Slack")
         check(api("GET", "/api/v1/setup/slack")[1]["authorized"] is False, "Fresh setup has no authorization")
+        setup = api("GET", "/api/v1/setup/slack")[1]
+        check(setup["authorization"] == "missing" and setup["next_action"] == "authorize" and not setup["connection_ready"], "Fresh setup exposes one next action")
         check(api("POST", "/api/v1/setup/slack", {"action":"token"})[0] == 400, "Internal token operation is never exposed")
         check(api("POST", "/api/v1/setup/slack", {"action":"confirm","challenge":"code"})[0] == 400, "Expired authorization gives actionable error")
         with urllib.request.urlopen(base + "/", context=context) as response:

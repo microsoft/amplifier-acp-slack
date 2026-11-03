@@ -3,6 +3,7 @@
 /instances/
 /evidence/
 node_modules/
+/ui/tests/node_modules
 **/__pycache__/
 *.pyc
 

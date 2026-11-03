@@ -233,3 +233,112 @@ for line in sys.stdin:
     assert_eq!(count.load(Ordering::SeqCst), 3);
     server.abort();
 }
+
+#[tokio::test]
+async fn observation_deduplicates_and_legacy_peers_are_closed_after_one_snapshot() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = count.clone();
+    let router = Router::new()
+        .route(
+            "/auth.test",
+            post(|| async {
+                Json(json!({"ok":true,"team_id":"TTEST","user_id":"UTEST","bot_id":"BTEST"}))
+            }),
+        )
+        .route(
+            "/bots.info",
+            get(|| async { Json(json!({"ok":true,"bot":{"app_id":"ATEST"}})) }),
+        )
+        .route(
+            "/apps.icon.set",
+            post(move || {
+                let count = requests.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"ok":true}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join("secrets")).unwrap();
+    let source = home.join("source.json");
+    std::fs::write(&source, portrait(40, "uploaded").to_string()).unwrap();
+    let peer = home.join("peer.py");
+    let starts = home.join("starts");
+    std::fs::write(&peer,r#"import sys,json,time
+with open(sys.argv[2],'a') as f: f.write('start\n')
+ns='com.microsoft.amplifier.identity'
+for line in sys.stdin:
+ r=json.loads(line)
+ if r['method']=='initialize':
+  assert r['params']['_meta'][ns]['mode']=='observe'
+  cap={'schema':'agent-identity/1','method':'_amplifier/identity/get'}
+  if sys.argv[3]=='events': cap.update({'observation_only':True,'observation':{'subscribe':'_amplifier/identity/subscribe','changed':'_amplifier/identity/changed'}})
+  result={'protocolVersion':1,'_meta':{ns:cap}}
+ elif r['method'] in ('_amplifier/identity/get','_amplifier/identity/subscribe'): result=json.load(open(sys.argv[1]))
+ else: raise Exception('No session or model work allowed')
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
+ if r['method']=='_amplifier/identity/subscribe':
+  # Repeated equivalent notifications never cause duplicate Slack uploads.
+  for n in range(5):
+   print(json.dumps({'jsonrpc':'2.0','method':'_amplifier/identity/changed','params':result}),flush=True)
+   time.sleep(.03)
+"#).unwrap();
+    let mut c = Config::new("Observer".into(), "tester".into());
+    c.acp.command = "/usr/bin/python3".into();
+    c.acp.cwd = home.to_string_lossy().into();
+    c.acp.args = vec![
+        peer.to_string_lossy().into(),
+        source.to_string_lossy().into(),
+        starts.to_string_lossy().into(),
+        "events".into(),
+    ];
+    c.slack.app_id = "ATEST".into();
+    c.slack.bot_id = "BTEST".into();
+    c.slack.bot_user_id = "UTEST".into();
+    c.slack.team_id = "TTEST".into();
+    c.slack.loopback_test = true;
+    c.slack.api_base = format!("http://{addr}/");
+    c.save(home).unwrap();
+    private_write(
+        &home.join("secrets/slack.json"),
+        br#"{"app_token":"test-app","bot_token":"test-bot"}"#,
+    )
+    .unwrap();
+    private_write(
+        &home.join("secrets/portrait-configuration.json"),
+        br#"{"token":"test-configuration-token","expires_at":0}"#,
+    )
+    .unwrap();
+    let run = tokio::spawn(identity::run(home.to_owned(), c.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        while count.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 1);
+    assert_eq!(identity::status(home)["update_mode"], "events");
+    assert!(identity::status(home).get("poll_seconds").is_none());
+    run.abort();
+    let _ = run.await;
+    // Restart takes a snapshot and retains the upload checksum.
+    c.acp.args[3] = "legacy".into();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        identity::run(home.to_owned(), c),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 2);
+    assert_eq!(identity::status(home)["update_mode"], "manual");
+    server.abort();
+}

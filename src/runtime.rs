@@ -59,7 +59,7 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
             }
             let next = sender_store.lock().unwrap().claim_outgoing(&current)?;
             if let Some(o) = next {
-                match sender.publish(&o).await {
+                match sender.publish_durable(&o, &sender_store).await {
                     Ok(ts) => sender_store.lock().unwrap().delivery(
                         &o.id,
                         "sent",

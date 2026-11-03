@@ -18,7 +18,36 @@ pub fn initialize(store: &Store) -> Result<()> {
         slack_ts TEXT, shown_status TEXT NOT NULL DEFAULT '', body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS permissions_status ON permissions(status,expires);",
     )?;
+    let has_closed = store
+        .db
+        .prepare("PRAGMA table_info(permissions)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .any(|v| v.is_ok_and(|v| v == "closed_at"));
+    if !has_closed {
+        store
+            .db
+            .execute("ALTER TABLE permissions ADD COLUMN closed_at INTEGER", [])?;
+        // Upgrade recent existing cards in place, without posting new messages.
+        store.db.execute("UPDATE permissions SET shown_status='' WHERE status<>'pending' AND slack_ts IS NOT NULL AND id IN (SELECT id FROM permissions ORDER BY created DESC LIMIT 100)",[])?;
+    }
     Ok(())
+}
+/// Union of actual human-wait intervals, so concurrent requests cannot multiply
+/// the execution allowance. Old closed rows do not extend new turns.
+pub fn waiting_ms(store: &Store, job: &str, now: i64) -> Result<i64> {
+    let mut q=store.db.prepare("SELECT created,MIN(expires,COALESCE(closed_at,CASE WHEN status='pending' THEN ?2 ELSE created END),?2) FROM permissions WHERE job_id=?1 ORDER BY created")?;
+    let intervals = q
+        .query_map(params![job, now], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut end = 0;
+    let mut elapsed = 0;
+    for (start, stop) in intervals {
+        elapsed += (stop - start.max(end)).max(0);
+        end = end.max(stop);
+    }
+    Ok(elapsed)
 }
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(
@@ -43,8 +72,8 @@ fn live(store: &Store, c: &Config, id: &str) -> Result<bool> {
 }
 pub fn cancel_all(store: &Store, reason: &str) -> Result<()> {
     let changed = store.db.execute(
-        "UPDATE permissions SET status='cancelled',actor=?1 WHERE status='pending'",
-        [reason],
+        "UPDATE permissions SET status='cancelled',actor=?1,closed_at=?2 WHERE status='pending'",
+        params![reason, now_ms()],
     )?;
     if changed > 0 {
         store.audit(
@@ -69,7 +98,7 @@ pub fn expire(store: &Store, c: &Config) -> Result<()> {
             None
         };
         if let Some(state) = state {
-            store.db.execute("UPDATE permissions SET status=?2,actor='lifecycle' WHERE id=?1 AND status='pending'",params![id,state])?;
+            store.db.execute("UPDATE permissions SET status=?2,actor='lifecycle',closed_at=?3 WHERE id=?1 AND status='pending'",params![id,state,now_ms()])?;
             store.audit("permission_closed", json!({"id":id,"status":state}))?;
         }
     }
@@ -127,7 +156,7 @@ pub fn resolve(
         None => "cancelled",
         _ => anyhow::bail!("Persistent grants are not supported by this connector"),
     };
-    let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version=x.version)", params![id,status,option,actor,now_ms()])?;
+    let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4,closed_at=?5 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version=x.version)", params![id,status,option,actor,now_ms()])?;
     ensure!(n == 1, "Permission changed before the decision was applied");
     store.audit(
         "permission_resolved",
@@ -193,7 +222,7 @@ pub async fn details(home: &Path, c: &Config, slack: &Slack, payload: &Value) ->
         let raw = serde_json::to_string_pretty(&p["request"]["toolCall"])?;
         let text: Vec<char> = raw.chars().take(24000).collect();
         let mut blocks = vec![
-            json!({"type":"section","text":{"type":"plain_text","text":format!("Status: {}. Review this action, close this window, then choose an option on the original request. Allow once applies only to this request.",p["status"].as_str().unwrap_or("closed"))}}),
+            json!({"type":"section","text":{"type":"plain_text","text":format!("Status: {}. {}",p["status"].as_str().unwrap_or("closed"),if p["status"] == "pending" {"Close this window to decide on the original request. Allow once applies only to this action."} else {"This request is closed. These are the original action details; approval is not an execution result."})}}),
         ];
         for chunk in text.chunks(2800) {
             blocks.push(json!({"type":"section","text":{"type":"plain_text","text":chunk.iter().collect::<String>()}}));
@@ -229,25 +258,59 @@ fn summary(tool: &Value) -> String {
     }
     text.chars().take(1600).collect()
 }
+fn details_button(id: &str) -> Value {
+    json!({"type":"section","text":{"type":"plain_text","text":"Action details are available to the person who was asked."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}})
+}
+fn closed_card(id: &str, status: &str, tool: &Value) -> (String, Vec<Value>) {
+    let outcome = match status {
+        "approved" => "Approved. This records permission, not whether the action ran or succeeded.",
+        "denied" => "Declined. This request granted no permission.",
+        "expired" => {
+            "Expired without approval. Ask the agent to try again when you are ready; a fresh request is required."
+        }
+        _ => "Cancelled. This request granted no permission.",
+    };
+    let text = format!("{}\n{outcome}", summary(tool));
+    (
+        text.clone(),
+        vec![
+            json!({"type":"section","text":{"type":"plain_text","text":text}}),
+            details_button(id),
+        ],
+    )
+}
 pub async fn refresh_messages(home: &Path, c: &Config, slack: &Slack) -> Result<()> {
     let rows = {
         let store = Store::open(home)?;
         expire(&store, c)?;
-        let mut stmt=store.db.prepare("SELECT id,channel,slack_ts,status FROM permissions WHERE slack_ts IS NOT NULL AND status<>'pending' AND shown_status<>status LIMIT 20")?;
+        let mut stmt=store.db.prepare("SELECT id,channel,slack_ts,status,body FROM permissions WHERE slack_ts IS NOT NULL AND status<>'pending' AND shown_status<>status LIMIT 20")?;
         stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (id, channel, ts, status) in rows {
-        let text = format!("Agent permission: {status}. This request is closed.");
-        if slack.call("chat.update",json!({"channel":channel,"ts":ts,"text":text,"blocks":[{"type":"section","text":{"type":"plain_text","text":text}}]}),false).await.is_ok() {
-            Store::open(home)?.db.execute("UPDATE permissions SET shown_status=?2 WHERE id=?1",params![id,status])?;
+    for (id, channel, ts, status, body) in rows {
+        let request: Value = serde_json::from_str(&body)?;
+        let (text, blocks) = closed_card(&id, &status, &request["toolCall"]);
+        if slack
+            .call(
+                "chat.update",
+                json!({"channel":channel,"ts":ts,"text":text,"blocks":blocks}),
+                false,
+            )
+            .await
+            .is_ok()
+        {
+            Store::open(home)?.db.execute(
+                "UPDATE permissions SET shown_status=?2 WHERE id=?1",
+                params![id, status],
+            )?;
         }
     }
     Ok(())
@@ -259,8 +322,15 @@ struct Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         if let Ok(s) = Store::open(&self.home) {
-            let _=s.db.execute("UPDATE permissions SET status='cancelled',actor='turn ended' WHERE id=?1 AND status='pending'",[&self.id]);
+            let _=s.db.execute("UPDATE permissions SET status='cancelled',actor='turn ended',closed_at=?2 WHERE id=?1 AND status='pending'",params![&self.id,now_ms()]);
         }
+    }
+}
+fn wait_label(seconds: u64) -> String {
+    if seconds >= 60 && seconds.is_multiple_of(60) {
+        format!("{} minutes", seconds / 60)
+    } else {
+        format!("{seconds} seconds")
     }
 }
 pub async fn request(
@@ -347,7 +417,7 @@ pub async fn request(
     buttons.push(json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":"Cancel request"},"value":format!("{id}:cancel")}));
     // Slack requires action_id uniqueness within a block. Each option gets its own block.
     let mut blocks = vec![
-        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed from {sender}\n{}\nExpires in {} seconds. Allow once applies only to this request.",summary(&params["toolCall"]),c.acp.client.permission_timeout_seconds)}}),
+        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed\n{}\nYou have {} to decide. Allow once applies only to this action.",summary(&params["toolCall"]),wait_label(c.acp.client.permission_timeout_seconds))}}),
     ];
     blocks.push(json!({"type":"section","text":{"type":"plain_text","text":"Review the action details privately before deciding."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}}));
     for button in buttons {
@@ -384,5 +454,48 @@ pub async fn request(
         }
         drop(s);
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn closed_cards_retain_context_and_private_details_without_decision_buttons() {
+        let tool = json!({"title":"Run repository checks","kind":"execute","rawInput":{"command":"PRIVATE COMMAND"}});
+        for status in ["approved", "denied", "expired", "cancelled"] {
+            let (text, blocks) = closed_card("request-1", status, &tool);
+            assert!(text.contains("Run repository checks"));
+            assert!(!text.contains("PRIVATE COMMAND"));
+            assert!(json!(blocks).to_string().contains("permission_details"));
+            assert!(!json!(blocks).to_string().contains("acp_permission"));
+        }
+        assert!(
+            closed_card("id", "approved", &tool)
+                .0
+                .contains("not whether the action ran")
+        );
+        assert!(
+            closed_card("id", "expired", &tool)
+                .0
+                .contains("fresh request")
+        );
+    }
+    #[test]
+    fn human_wait_is_union_of_bounded_intervals_for_only_this_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        for (id, job, start, end, status, closed) in [
+            ("a", "job", 100, 900, "approved", Some(300)),
+            ("b", "job", 200, 700, "pending", None),
+            ("c", "other", 1, 900, "pending", None),
+            ("d", "job", 800, 900, "pending", None),
+        ] {
+            s.db.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,channel,thread,body,closed_at) VALUES(?1,?2,'ctx','session','Uowner',1,?3,?4,?5,'Droom','','{}',?6)",params![id,job,start,end,status,closed]).unwrap();
+        }
+        assert_eq!(waiting_ms(&s, "job", 500).unwrap(), 400);
+        assert_eq!(waiting_ms(&s, "job", 1000).unwrap(), 700);
+        assert_eq!(waiting_ms(&s, "absent", 1000).unwrap(), 0);
+        assert_eq!(wait_label(900), "15 minutes");
     }
 }
