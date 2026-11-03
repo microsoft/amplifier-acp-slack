@@ -48,6 +48,12 @@ for line in sys.stdin:
             output='permission '+json.dumps(outcome)
             if outcome.get('optionId')=='yes':
                 (cwd/'approved.txt').write_text('Explicitly approved')
+            if 'successive' in trigger:
+                outcomes=[outcome]
+                for _ in range(2):
+                    response=call('session/request_permission',{'sessionId':sid,'toolCall':{'toolCallId':'fixture-tool'},'options':options})
+                    outcomes.append(response['result']['outcome'])
+                output='successive permissions '+json.dumps(outcomes)
         elif 'callbacks' in trigger:
             base={'sessionId':sid};path=str(cwd/'client-file.txt')
             assert call('fs/write_text_file',{**base,'path':path,'content':'first\nsecond\n'})['result']=={}

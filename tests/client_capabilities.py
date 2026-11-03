@@ -136,6 +136,25 @@ async def main():
             await until(lambda:any(p.get('channel')=='Dlongwait' for p in fixture.posts),'reply after wait longer than execution budget')
             assert (workspace/'approved.txt').exists()
             passed('Human approval waiting does not consume the agent execution budget')
+            prior=len(fixture.approvals)
+            _,first=await permission('Dsuccessive','successive permission requests')
+            await asyncio.sleep(2)
+            await fixture.action(first,0)
+            await until(lambda:len(fixture.approvals)==prior+2,'second permission displayed')
+            second=fixture.approvals[-1]
+            first_row=rows(home,'SELECT created,closed_at FROM permissions WHERE id=?',(first['client_msg_id'],))[0]
+            second_row=rows(home,'SELECT created,expires FROM permissions WHERE id=?',(second['client_msg_id'],))[0]
+            remaining=4000-(first_row[1]-first_row[0])
+            assert second_row[1]-second_row[0]==remaining
+            assert 0 < remaining < 2500
+            label='less than a second' if remaining<1000 else ('1 second' if remaining<2000 else f'{remaining//1000} seconds')
+            assert f'About {label} remains' in json.dumps(second),second
+            await until(lambda:any(p.get('channel')=='Dsuccessive' for p in fixture.posts),'successive permissions finish')
+            output=next(p['markdown_text'] for p in fixture.posts if p.get('channel')=='Dsuccessive')
+            outcomes=json.loads(output.removeprefix('successive permissions '))
+            assert outcomes==[{'outcome':'selected','optionId':'yes'},{'outcome':'cancelled'},{'outcome':'cancelled'}],outcomes
+            assert len(fixture.approvals)==prior+2,'Exhausted budget must not offer a new card'
+            passed('Successive permissions share one deadline budget; exhausted requests cancel without a misleading new card')
             print(json.dumps({'passed':len(checks),'checks':checks},indent=2))
         except Exception:
             print((home/'service.log').read_text(),file=sys.stderr)

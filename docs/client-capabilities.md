@@ -26,11 +26,12 @@ shared room. Long private modal details are explicitly shortened; the dashboard
 retains the complete bounded request. The operator should reject an action when
 its supplied description is insufficient or misleading.
 
-Requests default to a 15-minute expiry; `acp.client.permission_timeout_seconds`
-accepts 1–86,400 seconds. Human waiting does not consume the agent's execution
-timeout. A turn still has a total human-wait allowance equal to that configured
-expiry, so repeated requests cannot extend it indefinitely. Existing explicit
-expiry values remain unchanged until the owner updates them.
+Each turn defaults to 15 minutes of human approval time;
+`acp.client.permission_timeout_seconds` accepts 1–86,400 seconds. Human waiting
+does not consume the agent's execution timeout. Successive requests expire after
+the remaining allowance and show that reduced time on their cards. Once the
+allowance is exhausted, further requests return cancelled without posting another
+card. Existing explicit values remain unchanged until the owner updates them.
 
 Editing/deleting the source, changing the conversation, reconfiguring/pausing the
 connector, or ending/restarting the turn invalidates outstanding requests. A

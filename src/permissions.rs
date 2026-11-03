@@ -327,10 +327,21 @@ impl Drop for Pending {
     }
 }
 fn wait_label(seconds: u64) -> String {
-    if seconds >= 60 && seconds.is_multiple_of(60) {
+    if seconds == 1 {
+        "1 second".into()
+    } else if seconds == 60 {
+        "1 minute".into()
+    } else if seconds >= 60 && seconds.is_multiple_of(60) {
         format!("{} minutes", seconds / 60)
     } else {
         format!("{seconds} seconds")
+    }
+}
+fn remaining_wait_label(milliseconds: i64) -> String {
+    if milliseconds < 1000 {
+        "less than a second".into()
+    } else {
+        wait_label((milliseconds / 1000) as u64)
     }
 }
 pub async fn request(
@@ -391,11 +402,20 @@ pub async fn request(
     let thread = input["conversation"]["thread"].as_str().unwrap_or("");
     let job = input["job_id"].as_str().context("Missing job binding")?;
     let body = json!({"toolCall":params["toolCall"],"options":options});
-    let expires = now_ms() + 1000 * c.acp.client.permission_timeout_seconds as i64;
-    {
+    let remaining = {
         let s = Store::open(home)?;
-        s.db.execute("DELETE FROM permissions WHERE status<>'pending' AND shown_status=status AND id NOT IN (SELECT id FROM permissions ORDER BY created DESC LIMIT 1000)",[])?;
-        s.db.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,channel,thread,body) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?10,?11)",params![id,job,ctx,session,sender,c.revision as i64,now_ms(),expires,channel,thread,body.to_string()])?;
+        let created = now_ms();
+        let remaining = (1000 * c.acp.client.permission_timeout_seconds as i64)
+            .saturating_sub(waiting_ms(&s, job, created)?);
+        if remaining <= 0 {
+            s.audit("permission_declined", json!({"context":ctx,"job_id":job,"reason":"This turn has used all of its human approval time; no permission granted"}))?;
+            return Ok(cancelled);
+        }
+        let expires = created + remaining;
+        // Retain the intervals of every active turn: another request must not
+        // recover approval time merely because older cards were pruned.
+        s.db.execute("DELETE FROM permissions WHERE status<>'pending' AND shown_status=status AND job_id NOT IN (SELECT id FROM jobs WHERE status='running') AND id NOT IN (SELECT id FROM permissions ORDER BY created DESC LIMIT 1000)",[])?;
+        s.db.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,channel,thread,body) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?10,?11)",params![id,job,ctx,session,sender,c.revision as i64,created,expires,channel,thread,body.to_string()])?;
         if !live(&s, c, &id)? {
             s.db.execute(
                 "UPDATE permissions SET status='cancelled' WHERE id=?1",
@@ -407,7 +427,8 @@ pub async fn request(
             "permission_requested",
             json!({"id":id,"context":ctx,"session_id":session,"approver":sender,"expires":expires}),
         )?;
-    }
+        remaining
+    };
     let _pending = Pending {
         home: home.to_owned(),
         id: id.clone(),
@@ -417,7 +438,7 @@ pub async fn request(
     buttons.push(json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":"Cancel request"},"value":format!("{id}:cancel")}));
     // Slack requires action_id uniqueness within a block. Each option gets its own block.
     let mut blocks = vec![
-        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed\n{}\nYou have {} to decide. Allow once applies only to this action.",summary(&params["toolCall"]),wait_label(c.acp.client.permission_timeout_seconds))}}),
+        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed\n{}\nAbout {} remains to decide. Approval requests in this turn share the same time budget. Allow once applies only to this action.",summary(&params["toolCall"]),remaining_wait_label(remaining))}}),
     ];
     blocks.push(json!({"type":"section","text":{"type":"plain_text","text":"Review the action details privately before deciding."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}}));
     for button in buttons {
