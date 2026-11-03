@@ -875,7 +875,7 @@ pub async fn mcp(
                     } else {
                         json!({})
                     };
-                    result["tools"].as_array_mut().unwrap().push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":props,"additionalProperties":false},"annotations":{"readOnlyHint":name.ends_with("status"),"destructiveHint":false,"openWorldHint":true}}));
+                    result["tools"].as_array_mut().unwrap().push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":props,"required":if name.ends_with("apply") || name.ends_with("rollback") { json!(["plan_id"]) } else { json!([]) },"additionalProperties":false},"annotations":{"readOnlyHint":name.ends_with("status"),"destructiveHint":false,"openWorldHint":true}}));
                 }
             }
             Ok(rpc(id, result))
