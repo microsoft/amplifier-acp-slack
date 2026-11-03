@@ -71,6 +71,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config", get(config_get).put(config_put))
         .route("/api/v1/status", get(status))
         .route("/api/v1/lifecycle", post(lifecycle))
+        .route(
+            "/api/v1/updates",
+            get(crate::updates::get).post(crate::updates::action),
+        )
+        .route(
+            "/api/v1/updates/policy",
+            axum::routing::put(crate::updates::configure),
+        )
         .route("/api/v1/credentials/slack", post(credentials))
         .route(
             "/api/v1/identity",
@@ -822,6 +830,7 @@ async fn token_delete(
 }
 fn operations() -> Value {
     json!([
+        {"path":"updates","methods":["GET"],"scope":"observe"},{"path":"updates","methods":["POST"],"scope":"admin"},{"path":"updates/policy","methods":["PUT"],"scope":"admin"},
         {"path":"identity","methods":["GET"],"scope":"observe"},{"path":"identity","methods":["POST"],"scope":"admin"},{"path":"identity/credential","methods":["PUT","DELETE"],"scope":"admin"},{"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/slack","methods":["GET","POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"conversations/{id}/mode","methods":["GET","POST"],"scope":"admin"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
     ])
 }
@@ -849,6 +858,8 @@ pub fn openapi_value() -> Value {
         "Lifecycle":{"type":"object","required":["action"],"properties":{"action":{"enum":["start","stop"]}}},
         "Credentials":{"type":"object","required":["app_token","bot_token"],"properties":{"app_token":{"type":"string","writeOnly":true},"bot_token":{"type":"string","writeOnly":true},"app_id":{"type":"string"},"expected_revision":{"type":"integer"}}},
         "SlackSetup":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["authorize","confirm","connect"]},"challenge":{"type":"string","maxLength":256,"writeOnly":true}}},
+        "UpdateCommand":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["plan","apply","rollback"]},"plan_id":{"type":["string","null"],"format":"uuid"}}},
+        "UpdatePolicy":{"type":"object","additionalProperties":false,"required":["expected_revision","enabled","agent_enabled"],"properties":{"expected_revision":{"type":"integer","minimum":0},"enabled":{"type":"boolean"},"agent_enabled":{"type":"boolean"}}},
         "Check":{"type":"object","properties":{"target":{"enum":["all","acp","slack"]}}},
         "Token":{"type":"object","required":["name","scopes"],"properties":{"name":{"type":"string"},"scopes":{"type":"array","items":{"enum":["admin","observe","ui","context"]}},"expires_in_seconds":{"type":"integer","minimum":60,"maximum":31622400}}},
         "ViewCreate":{"type":"object","properties":{"label":{"type":"string"}}},
@@ -883,6 +894,8 @@ pub fn openapi_value() -> Value {
             }
             let body = match (method, path) {
                 ("PUT", "config") => Some("ConfigUpdate"),
+                ("PUT", "updates/policy") => Some("UpdatePolicy"),
+                ("POST", "updates") => Some("UpdateCommand"),
                 ("PUT", "secrets/{name}") => Some("SecretWrite"),
                 ("POST", "lifecycle") => Some("Lifecycle"),
                 ("POST", "credentials/slack") => Some("Credentials"),
@@ -1121,6 +1134,7 @@ pub async fn serve(home: PathBuf) -> Result<()> {
         "management_service_started",
         json!({"version":env!("CARGO_PKG_VERSION"),"port":port}),
     )?;
+    crate::updates::recover(&state.home);
     let runtime_home = state.home.clone();
     let changes = state.changes.subscribe();
     let runtime_task = tokio::spawn(monitor_runtime(

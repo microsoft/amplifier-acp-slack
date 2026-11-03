@@ -886,3 +886,69 @@ async fn mcp_rejects_cross_origin_requests_before_reading_slack() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(f.fake.lock().unwrap().calls.is_empty());
 }
+
+#[tokio::test]
+async fn connector_updates_require_explicit_policy_and_verified_owner_dm() {
+    let f = Fixture::new().await;
+    let owner = f.grant("DOWNER", "", "UOWNER", false);
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+    let (_, before) = f.call("/context/mcp", Some(&owner), list.clone()).await;
+    let names = before["result"]["tools"].as_array().unwrap();
+    assert!(
+        names
+            .iter()
+            .any(|v| v["name"] == "slack_connector_update_status")
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|v| v["name"] == "slack_connector_update_apply")
+    );
+    let apply = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slack_connector_update_apply","arguments":{"plan_id":"00000000-0000-0000-0000-000000000000"}}});
+    assert_eq!(
+        f.call("/context/mcp", Some(&owner), apply.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    acp_slack_adapter::config::private_dir(&f.home.path().join("updates")).unwrap();
+    private_write(&f.home.path().join("updates/policy.json"),json!({"schema":1,"adapter_id":f.state.instance_config().id,"revision":1,"enabled":true,"agent_enabled":true,"owner_slack_user_id":"UOWNER"}).to_string().as_bytes()).unwrap();
+    for (room, actor, bot) in [
+        ("CSHARED", "UOWNER", false),
+        ("DSPOOF", "UOWNER", false),
+        ("DOTHER", "UPEER", false),
+        ("DOWNER", "UOWNER", true),
+    ] {
+        let grant = f.grant(room, "", actor, bot);
+        assert_eq!(
+            f.call("/context/mcp", Some(&grant), apply.clone()).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let (_, listed) = f.call("/context/mcp", Some(&grant), list.clone()).await;
+        assert!(
+            !listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == "slack_connector_update_apply")
+        );
+    }
+    assert_eq!(
+        f.call("/context/mcp", Some(&f.token), apply.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (_, listed) = f.call("/context/mcp", Some(&owner), list).await;
+    let supported = acp_slack_adapter::updates::status(f.home.path()).unwrap()["supported"] == true;
+    assert_eq!(
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["name"] == "slack_connector_update_apply"),
+        supported
+    );
+    if supported {
+        let (_,invalid)=f.call("/context/mcp",Some(&owner),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slack_connector_update_plan","arguments":{"command":"do anything"}}})).await;
+        assert_eq!(invalid["error"]["code"], -32602);
+    }
+}

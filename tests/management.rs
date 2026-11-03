@@ -465,3 +465,58 @@ fn openapi_references_are_self_contained() {
     visit(&api, &api);
     assert!(api["paths"]["/api/v1/secrets/{name}"]["put"]["requestBody"].is_object());
 }
+
+#[tokio::test]
+async fn update_policy_requires_admin_and_cannot_grant_implicit_owner_access() {
+    let (_temp, state, token) = fixture();
+    assert_eq!(
+        request(state.clone(), "GET", "/api/v1/updates", None, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let context = auth::issue_token(&state, "read-only context", &["context".into()], 300).unwrap()
+        ["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let body = json!({"expected_revision":0,"enabled":true,"agent_enabled":true});
+    assert_eq!(
+        request(
+            state.clone(),
+            "PUT",
+            "/api/v1/updates/policy",
+            Some(&context),
+            Some(body.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            state.clone(),
+            "POST",
+            "/api/v1/updates",
+            Some(&context),
+            Some(json!({"action":"plan"}))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            state.clone(),
+            "PUT",
+            "/api/v1/updates/policy",
+            Some(&token),
+            Some(body)
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, status) = request(state.clone(), "GET", "/api/v1/updates", Some(&token), None).await;
+    assert_eq!(status["enabled"], false);
+}

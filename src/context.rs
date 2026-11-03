@@ -839,8 +839,93 @@ pub async fn mcp(
             ))
         }
         "ping" => Ok(rpc(id, json!({}))),
-        "tools/list" => Ok(rpc(id, mcp_tools())),
+        "tools/list" => {
+            let mut result = mcp_tools();
+            if authority.owner && authority.origin.as_ref().is_some_and(|c| c.direct) {
+                for (name, description) in [
+                    (
+                        "slack_connector_update_status",
+                        "Inspect this connector’s fixed-source update plan and status.",
+                    ),
+                    (
+                        "slack_connector_update_plan",
+                        "Prepare a verified update from this connector’s trusted Microsoft main build. No deployment yet.",
+                    ),
+                    (
+                        "slack_connector_update_apply",
+                        "Queue this prepared update after current work and replies drain; preserve configuration and sessions.",
+                    ),
+                    (
+                        "slack_connector_update_rollback",
+                        "Queue rollback of this connector’s last successful update after current work drains.",
+                    ),
+                ] {
+                    if !name.ends_with("status")
+                        && !crate::updates::agent_allowed(
+                            &state.home,
+                            &config,
+                            &authority.actor,
+                            true,
+                        )
+                    {
+                        continue;
+                    }
+                    let props = if name.ends_with("apply") || name.ends_with("rollback") {
+                        json!({"plan_id":{"type":"string","format":"uuid"}})
+                    } else {
+                        json!({})
+                    };
+                    result["tools"].as_array_mut().unwrap().push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":props,"required":if name.ends_with("apply") || name.ends_with("rollback") { json!(["plan_id"]) } else { json!([]) },"additionalProperties":false},"annotations":{"readOnlyHint":name.ends_with("status"),"destructiveHint":false,"openWorldHint":true}}));
+                }
+            }
+            Ok(rpc(id, result))
+        }
         "tools/call" => {
+            if let Some(name) = body["params"]["name"]
+                .as_str()
+                .filter(|n| n.starts_with("slack_connector_update_"))
+            {
+                if !(authority.owner && authority.origin.as_ref().is_some_and(|c| c.direct))
+                    || (name != "slack_connector_update_status"
+                        && !crate::updates::agent_allowed(
+                            &state.home,
+                            &config,
+                            &authority.actor,
+                            true,
+                        ))
+                {
+                    return Err(ApiError::forbidden());
+                }
+                let args = body["params"]
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let Some(object) = args.as_object() else {
+                    return Ok(rpc_error(id, -32602, "Invalid update arguments"));
+                };
+                let operation = name.trim_start_matches("slack_connector_update_");
+                if object.keys().any(|k| k != "plan_id")
+                    || (!["apply", "rollback"].contains(&operation) && !object.is_empty())
+                {
+                    return Ok(rpc_error(id, -32602, "Invalid update arguments"));
+                }
+                let value = if operation == "status" {
+                    crate::updates::status(&state.home).map_err(ApiError::from)
+                } else {
+                    crate::updates::queue(
+                        &state.home,
+                        crate::updates::Command {
+                            action: operation.into(),
+                            plan_id: args["plan_id"].as_str().map(str::to_owned),
+                        },
+                        true,
+                    )
+                }?;
+                return Ok(rpc(
+                    id,
+                    json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false}),
+                ));
+            }
             let operation = match body["params"]["name"].as_str() {
                 Some("slack_context_list") => "list",
                 Some("slack_context_read") => "read",

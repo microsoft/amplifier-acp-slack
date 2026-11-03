@@ -21,5 +21,6 @@ pub mod server;
 pub mod slack;
 pub mod state;
 pub mod store;
+pub mod updates;
 pub mod views;
 pub mod work_status;

@@ -112,7 +112,11 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
             _=notify.notified()=>{},
         }
         while workers.len() < c.attention.parallel_contexts {
+            let Some(admission) = crate::updates::admission(&home)? else {
+                break;
+            };
             let next = store.lock().unwrap().claim(&c.attention)?;
+            drop(admission);
             let Some(job) = next else { break };
             if !c.allows(&job.trigger.channel, "")
                 || !c.should_wake(&job.trigger.channel, &job.trigger.text)
