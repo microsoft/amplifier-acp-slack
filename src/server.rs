@@ -46,6 +46,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/lifecycle", post(lifecycle))
         .route("/api/v1/credentials/slack", post(credentials))
+        .route(
+            "/api/v1/identity",
+            get(crate::identity::get).post(crate::identity::sync_api),
+        )
+        .route(
+            "/api/v1/identity/credential",
+            axum::routing::put(crate::identity::credential).delete(crate::identity::disconnect),
+        )
         .route("/api/v1/check", post(check))
         .route("/api/v1/manifest", get(manifest))
         .route("/api/v1/media/readiness", post(media_check))
@@ -236,7 +244,7 @@ pub fn status_value(state: &AppState) -> ApiResult<Value> {
     let observations = Store::open(&state.home)?.status()?;
     let addresses = state.addresses.read().unwrap().clone();
     Ok(
-        json!({"id":c.id,"label":c.label,"version":env!("CARGO_PKG_VERSION"),"enabled":c.enabled,"setup_complete":c.setup_complete,"config_revision":c.revision,"runtime":runtime,"credentials":{"slack":c.secrets(&state.home).is_ok()},"state":observations,"connections":runtime["connections"].as_array().cloned().unwrap_or_default(),"addresses":addresses,"restart_required":addresses.get("effective_server").is_some_and(|s|*s!=json!(c.server)),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"pending_permissions":Store::open(&state.home)?.db.query_row("SELECT COUNT(*) FROM permissions WHERE status='pending'",[],|r|r.get::<_,i64>(0))?,"uptime_ms":now_ms()-state.started_at}),
+        json!({"id":c.id,"label":c.label,"version":env!("CARGO_PKG_VERSION"),"enabled":c.enabled,"setup_complete":c.setup_complete,"config_revision":c.revision,"runtime":runtime,"credentials":{"slack":c.secrets(&state.home).is_ok()},"state":observations,"connections":runtime["connections"].as_array().cloned().unwrap_or_default(),"addresses":addresses,"restart_required":addresses.get("effective_server").is_some_and(|s|*s!=json!(c.server)),"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"pending_permissions":Store::open(&state.home)?.db.query_row("SELECT COUNT(*) FROM permissions WHERE status='pending'",[],|r|r.get::<_,i64>(0))?,"uptime_ms":now_ms()-state.started_at}),
     )
 }
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -776,7 +784,7 @@ async fn token_delete(
 }
 fn operations() -> Value {
     json!([
-        {"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
+        {"path":"identity","methods":["GET"],"scope":"observe"},{"path":"identity","methods":["POST"],"scope":"admin"},{"path":"identity/credential","methods":["PUT","DELETE"],"scope":"admin"},{"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
     ])
 }
 async fn descriptor(
@@ -786,7 +794,7 @@ async fn descriptor(
     auth::check(&state, &headers, "observe", false)?;
     let c = state.instance_config();
     Ok(Json(
-        json!({"api_version":"1","id":c.id,"kind":"conversation-adapter","implementation":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},"namespace":"io.github.bkrabach.acp-slack-adapter","interfaces":{"agent":{"protocol":"ACP","role":"client","transport":"stdio"},"conversation":{"protocol":"Slack Socket Mode","role":"app"},"management":{"protocol":"acp-slack-adapter.management/1","base":"api/v1/","standard_acp":false}},"participation":{"profile":"slack-conversation-decision/1","standard_acp":false,"description":"Optional prompt convention requesting speak/pass decisions through standard ACP prompts"},"context_provider":{"id":format!("slack:{}",c.id),"query":"/context/v1/query","mcp":"/context/mcp","enabled":c.context.enabled,"standard_acp":false,"mcp_transport":"streamable-http","owner_linked":!c.context.owner_slack_user_id.is_empty()},"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"capabilities":["config","credentials","secrets","lifecycle","observations","ui-state","conversation-context","interactive-permissions","local-client-tools"],"schema":"api/v1/schema","openapi":"api/v1/openapi.json","ui":{"entry":"./","embed_protocol":"acp-slack-adapter.ui/1","embed_origins":c.server.embed_origins,"authentication":"Owner sign-in or authenticated same-origin proxy; iframe embedding does not grant access"},"operations":operations()}),
+        json!({"api_version":"1","id":c.id,"kind":"conversation-adapter","implementation":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},"namespace":"io.github.bkrabach.acp-slack-adapter","interfaces":{"agent":{"protocol":"ACP","role":"client","transport":"stdio"},"conversation":{"protocol":"Slack Socket Mode","role":"app"},"management":{"protocol":"acp-slack-adapter.management/1","base":"api/v1/","standard_acp":false}},"participation":{"profile":"slack-conversation-decision/1","standard_acp":false,"description":"Optional prompt convention requesting speak/pass decisions through standard ACP prompts"},"context_provider":{"id":format!("slack:{}",c.id),"query":"/context/v1/query","mcp":"/context/mcp","enabled":c.context.enabled,"standard_acp":false,"mcp_transport":"streamable-http","owner_linked":!c.context.owner_slack_user_id.is_empty()},"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"capabilities":["config","credentials","secrets","lifecycle","observations","ui-state","conversation-context","interactive-permissions","local-client-tools","agent-identity/1"],"schema":"api/v1/schema","openapi":"api/v1/openapi.json","ui":{"entry":"./","embed_protocol":"acp-slack-adapter.ui/1","embed_origins":c.server.embed_origins,"authentication":"Owner sign-in or authenticated same-origin proxy; iframe embedding does not grant access"},"operations":operations()}),
     ))
 }
 async fn schema(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -849,9 +857,17 @@ pub fn openapi_value() -> Value {
             if let Some(schema) = body {
                 entry["requestBody"] = json!({"required":true,"content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}});
             }
+            if method == "PUT" && path == "identity/credential" {
+                entry["requestBody"] = json!({"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","writeOnly":true},"refresh_token":{"type":"string","writeOnly":true},"expires_at":{"type":"integer"}}}}}});
+            }
             methods.insert(method.to_lowercase(), entry);
         }
-        paths.insert(format!("/api/v1/{path}"), json!(methods));
+        paths
+            .entry(format!("/api/v1/{path}"))
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .unwrap()
+            .extend(methods);
     }
     json!({"openapi":"3.1.0","info":{"title":"ACP Slack Adapter Management","version":env!("CARGO_PKG_VERSION"),"description":"Optional management contract, separate from ACP. Cookie mutations require X-CSRF-Token."},"security":[{"bearer":[]}],"components":{"securitySchemes":{"bearer":{"type":"http","scheme":"bearer"}},"schemas":schemas},"paths":paths})
 }
