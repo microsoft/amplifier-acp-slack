@@ -34,6 +34,55 @@ The CLI accepts `update plan`, `update apply --plan-id …`, and
 repository, destination, service name, credential, or arbitrary binary path.
 Other experiences can use the management API with administrator authority.
 
+## CLI walkthrough
+
+Run these commands as the installation owner, with its service running and the
+update policy enabled above. Replace `/path/to/installation` with the connector's
+installation folder:
+
+```sh
+/path/to/installation/bin/acp-slack-adapter --home /path/to/installation update plan
+/path/to/installation/bin/acp-slack-adapter --home /path/to/installation update status
+```
+
+The plan command returns JSON with an `id`; save that value as your plan ID.
+Status wraps the latest plan in `current`: check that `current.id` matches your
+saved ID and wait for `current.state` to become `ready`. Inspect its
+`source_commit`, `run_url`, `artifact_digest`, `binary_sha256` and `up_to_date`
+before deciding to apply. Planning alone does not replace the executable.
+Replace `PLAN_ID` below with that returned `id` (not the source commit):
+
+```sh
+/path/to/installation/bin/acp-slack-adapter --home /path/to/installation update apply --plan-id PLAN_ID
+/path/to/installation/bin/acp-slack-adapter --home /path/to/installation update status
+```
+
+Queuing is not completion: both plan and apply start asynchronous work. Check
+status again until the same plan reaches its result; `succeeded` means the update
+completed its health checks. If it is `deferred`, existing work or uncertain
+reply delivery still needs attention: inspect `current.reason` and
+`current.waiting_for` (`running_turns`, `pending_replies`, `uncertain_deliveries`).
+Let work finish or reconcile uncertain delivery before retrying apply with the
+same plan ID. Do not treat `failed`, `rolled_back` or `recovery_required` as a
+successful update; inspect the reason, and resolve host issues before recovery.
+The management endpoint may be briefly unavailable during restart; check status
+again once the service is reachable.
+
+For a plan in `succeeded`, rollback uses the same ID; `recovery_required` also
+allows retrying that plan's rollback after the host issue is resolved:
+
+```sh
+/path/to/installation/bin/acp-slack-adapter --home /path/to/installation update rollback --plan-id PLAN_ID
+/path/to/installation/bin/acp-slack-adapter --home /path/to/installation update status
+```
+
+Rollback is asynchronous too: confirm `current.id` and a `rolled_back` result,
+not just a queued receipt. Normal rollback requires the installed binary still
+to match that plan's updated binary and its backup to pass digest verification;
+it is not an arbitrary version selector and does not restore the old database.
+
+## How updates run
+
 The source is fixed to `microsoft/amplifier-acp-slack` main. Planning requires a
 successful push run of its `check.yml` workflow at that exact source revision,
 then downloads the matching platform artifact and verifies GitHub's recorded
