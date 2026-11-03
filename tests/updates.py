@@ -85,6 +85,32 @@ class Updates(unittest.TestCase):
         self.assertEqual(self.secret.read_text(),'private-not-exported')
         self.assertTrue((self.folder/'backup/state.sqlite3').exists())
         with sqlite3.connect(self.home/'state.sqlite3') as db:self.assertEqual(db.execute("SELECT session_id FROM session_bindings WHERE context='saved'").fetchone()[0],'session-preserved')
+    def test_enabled_connector_health_uses_current_socket_audit(self):
+        cfg=u.read(self.home/'adapter.json');cfg['enabled']=True;u.write(self.home/'adapter.json',cfg)
+        started=u.read(self.home/'endpoints.json')['started_at'];updated=started+1
+        runtime={'state':'running','config_revision':cfg['revision'],'updated_at':updated,'connections':[]}
+        u.write(self.home/'runtime.json',runtime)
+        def socket(state,at):
+            with sqlite3.connect(self.home/'state.sqlite3') as db:
+                db.execute("INSERT INTO audit(time,kind,data) VALUES(?,'connection',?)",(at,json.dumps({'state':state})))
+        status={'runtime':runtime,'connections':[]}
+        self.assertFalse(u.current_socket_healthy(self.home,status,started,cfg['revision']))
+        socket('connected',started-1)
+        self.assertFalse(u.current_socket_healthy(self.home,status,started,cfg['revision']))
+        socket('connected',updated)
+        self.assertTrue(u.current_socket_healthy(self.home,status,started,cfg['revision']))
+        # Exercise the actual HTTPS status response and Controller.health,
+        # including its deliberately empty connections placeholder.
+        with patch.object(u,'service',return_value='fixture-only'),patch.object(u,'run',return_value=(self.home/'fixture.pid').read_bytes()):
+            u.Controller(self.home,self.id).health(self.original)
+        for state in ['connecting','reconnecting','disconnected']:
+            socket(state,updated+1)
+            self.assertFalse(u.current_socket_healthy(self.home,status,started,cfg['revision']))
+        socket('connected',updated+2)
+        self.assertFalse(u.current_socket_healthy(self.home,status,updated+1,cfg['revision']))
+        self.assertFalse(u.current_socket_healthy(self.home,status,started,cfg['revision']+1))
+        runtime['state']='failed'
+        self.assertFalse(u.current_socket_healthy(self.home,status,started,cfg['revision']))
     def test_fixed_source_and_verified_artifact_provenance(self):
         archive=io.BytesIO()
         executable=b"#!/bin/sh\nprintf 'acp-slack-adapter fixture\\n'\n"
