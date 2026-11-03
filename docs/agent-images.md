@@ -1,7 +1,8 @@
 # Keep an agent's Slack image in sync
 
-Upload an image in the connected agent's identity settings. In this connector,
-open **Connection settings → Agent image → Connect image updates**. Supply a
+Upload an image in the connected agent's identity settings. During setup, choose
+**Keep the agent’s image updated in Slack** on the connection page. For an existing
+connection, open **Connection settings → Agent image → Connect image updates**. Supply a
 Slack app configuration access token and its refresh token, generated for the
 workspace under **Your App Configuration Tokens** at https://api.slack.com/apps.
 Use a separate token pair per connector: rotating a shared refresh token in two

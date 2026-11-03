@@ -65,12 +65,19 @@ Supported Slack attachments now become capability-checked ACP content, and nativ
 
 ## Connect Slack
 
-1. Open the printed URL and sign in. Confirm the prefilled agent connection.
+1. Open the printed URL and sign in. The installed agent is already selected.
 2. Use **Create app in Slack**. If Slack shows app choices, select **From a manifest → Continue**. Choose the workspace and create the prepared app.
 3. In Slack's **Basic Information → App-Level Tokens**, create a token with
    `connections:write`. In **OAuth & Permissions**, install the app and copy its
    bot token. Paste both into the connector's two private credential fields.
-4. Verify and start. In Slack, add the app to a channel, or open its direct message.
+4. Click **Connect to Slack**. The connector verifies access and starts. Use
+   **Open agent in Slack** to begin, or invite the app into a channel.
+
+Preferences are optional; the existing participation setting is preserved. You can
+also connect automatic image updates on this same page. Slack requires separate
+app-configuration permission for icons; this is optional and never blocks messaging.
+A failed agent check keeps successfully saved Slack access, so retrying does not
+require another copy/paste. See the [onboarding design and interaction budget](docs/onboarding.md).
 
 The setup derives app/workspace IDs and checks that the two credentials belong to
 the same app. A separate app per agent gives each its own visible identity and
