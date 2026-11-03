@@ -299,9 +299,12 @@ async fn sync_inner(home: &Path, c: &Config, saved: &mut Value) -> Result<(Strin
     if !secret.refresh_token.is_empty() && secret.expires_at <= now_ms() / 1000 + 300 {
         let r = client
             .post(format!("{}tooling.tokens.rotate", c.slack.api_base))
-            .json(&json!({"refresh_token":secret.refresh_token}))
+            // This unauthenticated endpoint does not reliably parse JSON;
+            // Slack returns "missing required field: refresh_token" for it.
+            .form(&[("refresh_token", &secret.refresh_token)])
             .send()
             .await?;
+        saved["retry_at"] = (now_ms() + 120_000).into();
         if r.status().as_u16() == 429 {
             saved["retry_at"] = (now_ms() + retry_seconds(&r) * 1000).into();
             return Ok((
@@ -315,13 +318,7 @@ async fn sync_inner(home: &Path, c: &Config, saved: &mut Value) -> Result<(Strin
         );
         let result = response(r).await?;
         if result["ok"] != true {
-            return Ok((
-                "needs_access".into(),
-                format!(
-                    "Reconnect app configuration access: {}.",
-                    error_code(&result)
-                ),
-            ));
+            return Ok(refresh_error(&result));
         }
         ensure!(
             result["team_id"] == c.slack.team_id,
@@ -388,6 +385,31 @@ async fn sync_inner(home: &Path, c: &Config, saved: &mut Value) -> Result<(Strin
         "Slack accepted this agent’s image. Slack clients may briefly cache the previous icon."
             .into(),
     ))
+}
+fn refresh_error(result: &Value) -> (String, String) {
+    let code = error_code(result);
+    if matches!(
+        code.as_str(),
+        "invalid_refresh_token"
+            | "invalid_auth"
+            | "token_revoked"
+            | "token_expired"
+            | "account_inactive"
+    ) {
+        (
+            "needs_access".into(),
+            format!(
+                "Slack image access has expired or was revoked ({code}). Replace image access to reconnect."
+            ),
+        )
+    } else {
+        (
+            "needs_attention".into(),
+            format!(
+                "The connector could not refresh image access ({code}). It will retry automatically; you do not need to re-enter your credentials."
+            ),
+        )
+    }
 }
 fn retry_seconds(r: &reqwest::Response) -> i64 {
     r.headers()

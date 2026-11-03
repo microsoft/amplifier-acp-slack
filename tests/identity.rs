@@ -3,9 +3,10 @@ use acp_slack_adapter::{
     identity,
 };
 use axum::{
-    Json, Router,
+    Form, Json, Router,
     body::Bytes,
     extract::State,
+    http::HeaderMap,
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -42,13 +43,38 @@ fn refuses_remote_urls_corruption_and_oversized_portraits() {
 #[tokio::test]
 async fn syncs_changes_clearing_and_restart_without_sessions_or_public_urls() {
     let count = Arc::new(AtomicUsize::new(0));
-    async fn set_icon(State(count): State<Arc<AtomicUsize>>, bytes: Bytes) -> Json<Value> {
+    let rotations = Arc::new(AtomicUsize::new(0));
+    let rotation_error = Arc::new(AtomicUsize::new(0));
+    async fn set_icon(
+        State(count): State<Arc<AtomicUsize>>,
+        headers: HeaderMap,
+        bytes: Bytes,
+    ) -> Json<Value> {
+        assert_eq!(headers["authorization"], "Bearer test-rotated-access");
         assert!(bytes.windows(16).any(|s| s == b"agent-avatar.png"));
         assert!(!bytes.windows(9).any(|s| s == b"name=\"url"));
         count.fetch_add(1, Ordering::SeqCst);
         Json(json!({"ok":true}))
     }
     let router = Router::new()
+        .route("/tooling.tokens.rotate", post({
+            let rotations = rotations.clone();
+            let rotation_error = rotation_error.clone();
+            move |Form(fields): Form<std::collections::HashMap<String, String>>| {
+                let rotations = rotations.clone();
+                let rotation_error = rotation_error.clone();
+                async move {
+                    assert_eq!(fields.len(), 1);
+                    let attempt = rotations.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(fields["refresh_token"], if attempt == 0 { "test-refresh+with&special=characters" } else { "test-rotated-refresh" });
+                    match rotation_error.load(Ordering::SeqCst) {
+                        1 => Json(json!({"ok":false,"error":"invalid_arguments"})),
+                        2 => Json(json!({"ok":false,"error":"invalid_refresh_token"})),
+                        _ => Json(json!({"ok":true,"token":"test-rotated-access","refresh_token":"test-rotated-refresh","exp":acp_slack_adapter::state::now_ms()/1000+43200,"team_id":"TTEST"})),
+                    }
+                }
+            }
+        }))
         .route(
             "/auth.test",
             post(|| async {
@@ -99,7 +125,7 @@ for line in sys.stdin:
     .unwrap();
     private_write(
         &home.join("secrets/portrait-configuration.json"),
-        br#"{"token":"test-configuration-token","refresh_token":"","expires_at":0}"#,
+        br#"{"token":"test-configuration-token","refresh_token":"test-refresh+with&special=characters","expires_at":0}"#,
     )
     .unwrap();
     assert!(
@@ -113,6 +139,14 @@ for line in sys.stdin:
         "synced"
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(rotations.load(Ordering::SeqCst), 1);
+    let mut secret: Value = serde_json::from_slice(
+        &std::fs::read(home.join("secrets/portrait-configuration.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(secret["token"], "test-rotated-access");
+    assert_eq!(secret["refresh_token"], "test-rotated-refresh");
+    assert!(secret["expires_at"].as_i64().unwrap() > acp_slack_adapter::state::now_ms() / 1000);
     fn allow_retry(home: &std::path::Path) {
         let mut s = identity::status(home);
         s["retry_at"] = 0.into();
@@ -138,6 +172,7 @@ for line in sys.stdin:
         "synced"
     );
     assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert_eq!(rotations.load(Ordering::SeqCst), 1);
     // An unconfigured source leaves an existing manual Slack icon alone.
     std::fs::remove_file(home.join("portrait-sync.json")).unwrap();
     assert_eq!(
@@ -150,6 +185,41 @@ for line in sys.stdin:
             .to_string()
             .contains("test-configuration-token")
     );
+    // Protocol errors are not evidence that the user supplied bad credentials.
+    std::fs::write(&source, portrait(120, "uploaded").to_string()).unwrap();
+    secret["expires_at"] = 0.into();
+    private_write(
+        &home.join("secrets/portrait-configuration.json"),
+        secret.to_string().as_bytes(),
+    )
+    .unwrap();
+    rotation_error.store(1, Ordering::SeqCst);
+    let failure = identity::sync(home, &config).await.unwrap();
+    assert_eq!(failure["state"], "needs_attention");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("do not need to re-enter")
+    );
+    assert!(failure["retry_at"].as_i64().unwrap() > acp_slack_adapter::state::now_ms());
+    identity::sync(home, &config).await.unwrap();
+    assert_eq!(rotations.load(Ordering::SeqCst), 2); // Back off, including on manual retry.
+    allow_retry(home);
+    rotation_error.store(2, Ordering::SeqCst);
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "needs_access"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &std::fs::read(home.join("secrets/portrait-configuration.json")).unwrap()
+        )
+        .unwrap(),
+        secret
+    );
+    allow_retry(home);
     let old = std::fs::read_to_string(&peer).unwrap();
     std::fs::write(
         &peer,
