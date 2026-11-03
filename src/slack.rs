@@ -178,6 +178,14 @@ impl Slack {
             if status != "ready" {
                 return Err(ApiError::Uncertain);
             }
+            if !store
+                .lock()
+                .unwrap()
+                .outgoing_source_current(&o.id)
+                .map_err(|_| ApiError::Uncertain)?
+            {
+                return Err(ApiError::Rejected("reply_source_changed".into()));
+            }
             store
                 .lock()
                 .unwrap()

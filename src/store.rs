@@ -514,6 +514,28 @@ impl Store {
         tx.commit()?;
         Ok(Some(out))
     }
+    /// Recheck the human source between multipart sends. New messages and our
+    /// own echoes may advance the context, but edits/deletion invalidate a reply.
+    pub fn outgoing_source_current(&self, id: &str) -> Result<bool> {
+        let raw: String = self.db.query_row(
+            "SELECT j.trigger FROM outbox o JOIN jobs j ON j.id=o.job_id WHERE o.id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let trigger: Message = serde_json::from_str(&raw)?;
+        let source: Option<String> = self
+            .db
+            .query_row(
+                "SELECT body FROM messages WHERE channel=?1 AND ts=?2",
+                params![trigger.channel, trigger.ts],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let source = source
+            .map(|raw| serde_json::from_str::<Message>(&raw))
+            .transpose()?;
+        Ok(source.is_some_and(|m| !m.deleted && m.revision == trigger.revision))
+    }
     pub fn delivery(
         &self,
         id: &str,

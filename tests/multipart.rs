@@ -14,11 +14,20 @@ struct Fixture {
     calls: Vec<Value>,
     fail: usize,
     uncertain: bool,
+    delete_source: Option<Arc<Mutex<Store>>>,
 }
 async fn message(State(state): State<Arc<Mutex<Fixture>>>, Json(body): Json<Value>) -> Json<Value> {
     let mut s = state.lock().unwrap();
     s.calls.push(body);
     let i = s.calls.len();
+    if i == 1
+        && let Some(store) = &s.delete_source
+    {
+        store.lock().unwrap().db.execute(
+            "UPDATE messages SET body=json_set(body,'$.deleted',json('true')) WHERE channel='Dtest' AND ts='1.000000'",
+            [],
+        ).unwrap();
+    }
     if i == s.fail {
         return Json(if s.uncertain {
             json!({"ok":false,"error":"request_timeout"})
@@ -156,5 +165,21 @@ async fn uncertain_part_is_not_replayed_after_restart() {
         .unwrap();
     assert_eq!(facts["items"][0]["parts"][0]["status"], "sent");
     assert_eq!(facts["items"][0]["parts"][1]["status"], "uncertain");
+    task.abort();
+}
+
+#[tokio::test]
+async fn source_deleted_during_delivery_stops_remaining_parts() {
+    let (slack, state, task) = fixture(false).await;
+    let home = tempfile::tempdir().unwrap();
+    let mut store = Store::open(home.path()).unwrap();
+    let (out, _) = queued(&mut store);
+    let store = Arc::new(Mutex::new(store));
+    state.lock().unwrap().delete_source = Some(store.clone());
+    assert!(matches!(
+        slack.publish_durable(&out, &store).await,
+        Err(ApiError::Rejected(reason)) if reason == "reply_source_changed"
+    ));
+    assert_eq!(state.lock().unwrap().calls.len(), 1);
     task.abort();
 }
