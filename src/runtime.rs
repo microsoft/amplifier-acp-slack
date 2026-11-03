@@ -38,6 +38,7 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
         "running",
         "Slack credentials verified; connecting to Slack",
     )?;
+    let _portrait = AbortTask(tokio::spawn(crate::identity::run(home.clone(), c.clone())));
     let notify = Arc::new(Notify::new());
     let mut socket = AbortTask(tokio::spawn(client.clone().listen(
         c.clone(),

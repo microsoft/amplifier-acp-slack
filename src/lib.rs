@@ -6,6 +6,7 @@ pub mod context;
 pub mod driver;
 pub mod elicitation;
 pub mod error;
+pub mod identity;
 pub mod media;
 pub mod model;
 pub mod permissions;

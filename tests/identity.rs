@@ -1,0 +1,165 @@
+use acp_slack_adapter::{
+    config::{Config, private_write},
+    identity,
+};
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::State,
+    routing::{get, post},
+};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+fn portrait(color: u8, kind: &str) -> Value {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(512, 512, image::Rgba([color, 10, 20, 255]))
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    let bytes = out.into_inner();
+    json!({"schema":"agent-identity/1","agent_id":"test-agent","display_name":"Test teammate","revision":color.to_string(),"avatar":{"kind":kind,"media_type":"image/png","data":STANDARD.encode(&bytes),"sha256":format!("{:x}",Sha256::digest(&bytes))}})
+}
+#[test]
+fn refuses_remote_urls_corruption_and_oversized_portraits() {
+    let mut doc = portrait(100, "uploaded");
+    assert!(identity::portrait(&doc).is_ok());
+    doc["avatar"]["sha256"] = "wrong".into();
+    assert!(identity::portrait(&doc).is_err());
+    doc = portrait(100, "uploaded");
+    doc["avatar"].as_object_mut().unwrap().remove("data");
+    doc["avatar"]["url"] = "http://localhost/private".into();
+    assert!(identity::portrait(&doc).is_err());
+    doc = portrait(100, "uploaded");
+    doc["avatar"]["data"] = "A".repeat(2 * 1024 * 1024).into();
+    assert!(identity::portrait(&doc).is_err());
+}
+
+#[tokio::test]
+async fn syncs_changes_clearing_and_restart_without_sessions_or_public_urls() {
+    let count = Arc::new(AtomicUsize::new(0));
+    async fn set_icon(State(count): State<Arc<AtomicUsize>>, bytes: Bytes) -> Json<Value> {
+        assert!(bytes.windows(16).any(|s| s == b"agent-avatar.png"));
+        assert!(!bytes.windows(9).any(|s| s == b"name=\"url"));
+        count.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"ok":true}))
+    }
+    let router = Router::new()
+        .route(
+            "/auth.test",
+            post(|| async {
+                Json(json!({"ok":true,"team_id":"TTEST","user_id":"UTEST","bot_id":"BTEST"}))
+            }),
+        )
+        .route(
+            "/bots.info",
+            get(|| async { Json(json!({"ok":true,"bot":{"app_id":"ATEST"}})) }),
+        )
+        .route("/apps.icon.set", post(set_icon))
+        .with_state(count.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join("secrets")).unwrap();
+    let peer = home.join("peer.py");
+    std::fs::write(&peer,r#"import sys,json
+for line in sys.stdin:
+ r=json.loads(line)
+ if r['method']=='initialize': result={'protocolVersion':1,'_meta':{'com.microsoft.amplifier.identity':{'schema':'agent-identity/1','method':'_amplifier/identity/get'}}}
+ elif r['method']=='_amplifier/identity/get': result=json.load(open(sys.argv[1]))
+ else: raise Exception('No sessions or prompts allowed')
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
+"#).unwrap();
+    let source = home.join("portrait.json");
+    std::fs::write(&source, portrait(50, "uploaded").to_string()).unwrap();
+    let mut config = Config::new("Portrait test".into(), "tester".into());
+    config.acp.command = "/usr/bin/python3".into();
+    config.acp.cwd = home.to_string_lossy().into();
+    config.acp.args = vec![
+        peer.to_string_lossy().into(),
+        source.to_string_lossy().into(),
+    ];
+    config.slack.app_id = "ATEST".into();
+    config.slack.bot_id = "BTEST".into();
+    config.slack.bot_user_id = "UTEST".into();
+    config.slack.team_id = "TTEST".into();
+    config.slack.loopback_test = true;
+    config.slack.api_base = format!("http://{address}/");
+    config.save(home).unwrap();
+    private_write(
+        &home.join("secrets/slack.json"),
+        br#"{"app_token":"test-app","bot_token":"test-bot"}"#,
+    )
+    .unwrap();
+    private_write(
+        &home.join("secrets/portrait-configuration.json"),
+        br#"{"token":"test-configuration-token","refresh_token":"","expires_at":0}"#,
+    )
+    .unwrap();
+    assert!(
+        acp_slack_adapter::driver::identity(&config, home)
+            .await
+            .expect("identity connection")
+            .is_some()
+    );
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "synced"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    fn allow_retry(home: &std::path::Path) {
+        let mut s = identity::status(home);
+        s["retry_at"] = 0.into();
+        private_write(&home.join("portrait-sync.json"), s.to_string().as_bytes()).unwrap();
+    }
+    allow_retry(home);
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "synced"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    std::fs::write(&source, portrait(90, "uploaded").to_string()).unwrap();
+    allow_retry(home);
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "synced"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    std::fs::write(&source, portrait(10, "generated").to_string()).unwrap();
+    allow_retry(home);
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "synced"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    // An unconfigured source leaves an existing manual Slack icon alone.
+    std::fs::remove_file(home.join("portrait-sync.json")).unwrap();
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "waiting_for_image"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert!(
+        !identity::status(home)
+            .to_string()
+            .contains("test-configuration-token")
+    );
+    let old = std::fs::read_to_string(&peer).unwrap();
+    std::fs::write(
+        &peer,
+        old.replace("com.microsoft.amplifier.identity", "example.unsupported"),
+    )
+    .unwrap();
+    assert_eq!(
+        identity::sync(home, &config).await.unwrap()["state"],
+        "unsupported"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    server.abort();
+}

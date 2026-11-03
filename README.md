@@ -249,3 +249,5 @@ or an already established session ID; tool-scoped questions require a known tool
 Validation uses independent ACP peers and a local Socket Mode service, including
 login, URL opening, typed answers, wrong-user/view rejection, invalid input and
 transcript isolation. Live Slack UI confirmation is a separate check.
+
+Automatic Slack app portraits from compatible agents: [agent images](docs/agent-images.md).

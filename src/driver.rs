@@ -380,6 +380,28 @@ pub async fn check(c: &Config, home: &Path) -> Result<Value> {
         Ok(json!({"ok":true,"protocol_version":1,"agent_info":init["agentInfo"],"load_session":init["agentCapabilities"]["loadSession"]==true,"authentication":crate::acp_auth::authentication(&init),"note":"ACP handshake and session creation succeeded. No prompt or Slack message was sent."}))
     }).await.context("ACP connection check timed out")?
 }
+/// Optional presentation extension. No session, model prompt, or remote URL fetch.
+pub async fn identity(c: &Config, home: &Path) -> Result<Option<Value>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut config = c.clone();
+        config.acp.client = Default::default();
+        let (mut client, init) = Client::connect(&config, home).await?;
+        let capability = &init["_meta"]["com.microsoft.amplifier.identity"];
+        if capability["schema"] != "agent-identity/1"
+            || capability["method"] != "_amplifier/identity/get"
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            client
+                .peer
+                .request("_amplifier/identity/get", json!({}))
+                .await?,
+        ))
+    })
+    .await
+    .context("Agent identity check timed out")?
+}
 pub async fn decide(c: Config, home: PathBuf, input: Value) -> Result<Decision> {
     let timeout = c.acp.timeout_seconds;
     tokio::time::timeout(Duration::from_secs(timeout), turn(&c, &home, &input))

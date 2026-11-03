@@ -1,6 +1,6 @@
 [package]
 name = "acp-slack-adapter"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -11,6 +11,7 @@ description = "Generic ACP integration with Slack conversations and presentation
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 axum = { version = "0.8.9", features = ["ws", "macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 clap = { version = "4", features = ["derive"] }
@@ -21,7 +22,7 @@ libc = "0.2"
 pam-client = { version = "0.5.0", default-features = false }
 rand = "0.8"
 rcgen = "0.14"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
