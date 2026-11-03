@@ -60,10 +60,14 @@ impl TerminalState {
     }
 }
 pub fn advertised(c: &Config) -> Value {
-    if !(c.acp.client.read_text_file || c.acp.client.write_text_file || c.acp.client.terminal) {
-        return json!({});
+    let mut caps = json!({});
+    if c.acp.client.read_text_file || c.acp.client.write_text_file || c.acp.client.terminal {
+        caps = json!({"fs":{"readTextFile":c.acp.client.read_text_file && cfg!(unix),"writeTextFile":c.acp.client.write_text_file && cfg!(unix)},"terminal":c.acp.client.terminal && cfg!(target_os="linux")});
     }
-    json!({"fs":{"readTextFile":c.acp.client.read_text_file && cfg!(unix),"writeTextFile":c.acp.client.write_text_file && cfg!(unix)},"terminal":c.acp.client.terminal && cfg!(target_os="linux")})
+    if !c.acp.client.approval_users.is_empty() {
+        caps["elicitation"] = json!({"form":{},"url":{}})
+    }
+    caps
 }
 pub fn validate_local(c: &Config) -> Result<Vec<PathBuf>> {
     let p = &c.acp.client;

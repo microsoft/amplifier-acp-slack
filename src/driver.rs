@@ -30,6 +30,7 @@ struct Peer {
     output: BufReader<ChildStdout>,
     next: u64,
     read_buffer: Vec<u8>,
+    auth_methods: Value,
 }
 impl Peer {
     async fn write(&mut self, v: Value) -> Result<()> {
@@ -100,10 +101,12 @@ impl Peer {
         self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
         let mut callbacks = tokio::task::JoinSet::new();
+        let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
         loop {
             let v = tokio::select! {
                 result=callbacks.join_next(),if !callbacks.is_empty()=>{
                     let (request_id,result): (Value,Result<Value>)=result.context("Missing setup callback")??;
+                    questions.remove(&request_id.to_string());
                     self.write(match result {
                         Ok(result)=>json!({"jsonrpc":"2.0","id":request_id,"result":result}),
                         Err(_)=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"Client operation refused; inspect connector activity and configured scope"}}),
@@ -139,6 +142,31 @@ impl Peer {
                     }
                 }
                 return Ok(v["result"].clone());
+            }
+            if v["method"] == "$/cancel_request" {
+                if let Some(tx) = questions.remove(&v["params"]["requestId"].to_string()) {
+                    let _ = tx.send(());
+                }
+                continue;
+            }
+            if v["method"] == "elicitation/create" && v.get("id").is_some() {
+                let p = &v["params"];
+                let scoped = (p["requestId"] == id
+                    && p.get("sessionId").is_none()
+                    && p.get("toolCallId").is_none())
+                    || (sid.as_ref().is_some_and(|s| p["sessionId"] == *s)
+                        && p.get("requestId").is_none()
+                        && p.get("toolCallId").is_none());
+                if !scoped || callbacks.len() >= 16 || questions.contains_key(&v["id"].to_string())
+                {
+                    self.write(json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32602,"message":"Invalid question scope"}})).await?;
+                    continue;
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                questions.insert(v["id"].to_string(), tx);
+                let (c, home, input) = (c.clone(), home.to_owned(), input.clone());
+                callbacks.spawn(async move {let result=tokio::select!{r=crate::questions::request(&c,&home,&input,&v["params"])=>r,_=rx=>Ok(crate::elicitation::cancelled())};(v["id"].clone(),result)});
+                continue;
             }
             if v.get("id").is_none() || v.get("method").is_none() {
                 continue;
@@ -191,6 +219,43 @@ impl Peer {
                 (v["id"].clone(), result)
             });
         }
+    }
+    async fn authenticated_session(
+        &mut self,
+        method: &str,
+        params: Value,
+        c: &Config,
+        home: &Path,
+        input: &Value,
+        tools: &mut Option<Arc<crate::client_tools::ClientTools>>,
+    ) -> Result<Value> {
+        let result = self
+            .session_request(method, params.clone(), c, home, input, tools)
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(crate::acp_auth::authentication_required)
+        {
+            let choice = crate::acp_auth::choice(&self.auth_methods)?;
+            let answer = crate::questions::request(c, home, input, &choice).await?;
+            ensure!(
+                answer["action"] == "accept",
+                "Agent sign-in was not completed"
+            );
+            self.session_request(
+                "authenticate",
+                json!({"methodId":answer["content"]["method_id"]}),
+                c,
+                home,
+                input,
+                tools,
+            )
+            .await?;
+            return self
+                .session_request(method, params, c, home, input, tools)
+                .await;
+        }
+        result
     }
     async fn reject(&mut self, v: &Value) -> Result<()> {
         // Initialization and operator probes have no user turn/session binding.
@@ -266,6 +331,7 @@ impl Client {
                 output,
                 next: 0,
                 read_buffer: Vec::new(),
+                auth_methods: Value::Null,
             },
         })
     }
@@ -273,6 +339,7 @@ impl Client {
         crate::client_tools::validate_local(c)?;
         let r=self.peer.request("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":crate::client_tools::advertised(c)})).await?;
         ensure!(r["protocolVersion"] == 1, "ACP version mismatch");
+        self.peer.auth_methods = r["authMethods"].clone();
         Ok(r)
     }
     async fn connect(c: &Config, home: &Path) -> Result<(Self, Value)> {
@@ -353,7 +420,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         load_params["sessionId"] = json!(old);
         let restore = client
             .peer
-            .session_request("session/load", load_params, c, home, input, &mut tools)
+            .authenticated_session("session/load", load_params, c, home, input, &mut tools)
             .await;
         if let Err(ref error) = restore
             && crate::acp_auth::authentication_required(error)
@@ -368,7 +435,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             store.audit("session_replaced",json!({"context":ctx,"reason":"Agent could not restore the previous session; rebuilding from the Slack conversation"}))?;
             let r = client
                 .peer
-                .session_request(
+                .authenticated_session(
                     "session/new",
                     session_params.clone(),
                     c,
@@ -385,7 +452,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     } else {
         let r = client
             .peer
-            .session_request("session/new", session_params, c, home, input, &mut tools)
+            .authenticated_session("session/new", session_params, c, home, input, &mut tools)
             .await?;
         r["sessionId"]
             .as_str()
@@ -433,11 +500,13 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut permissions = 0;
     let mut retried_direct = false;
     let mut callbacks = tokio::task::JoinSet::new();
+    let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
     let mut tool_calls: HashMap<String, Value> = HashMap::new();
     loop {
         let v = tokio::select! {
             result=callbacks.join_next(),if !callbacks.is_empty()=>{
                 let (request_id,result): (Value,Result<Value>)=result.context("Missing callback")??;
+                questions.remove(&request_id.to_string());
                 let response=match result {
                     Ok(result)=>json!({"jsonrpc":"2.0","id":request_id,"result":result}),
                     Err(_)=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"Client operation refused; inspect connector activity and configured scope"}}),
@@ -557,6 +626,31 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                     Ok(None) => {}
                 }
             }
+        }
+        if v["method"] == "$/cancel_request" {
+            if let Some(tx) = questions.remove(&v["params"]["requestId"].to_string()) {
+                let _ = tx.send(());
+            }
+            continue;
+        }
+        if v["method"] == "elicitation/create" && v.get("id").is_some() {
+            let p = &v["params"];
+            let scoped = (p["requestId"] == id
+                && p.get("sessionId").is_none()
+                && p.get("toolCallId").is_none())
+                || (p["sessionId"] == sid
+                    && p.get("requestId").is_none()
+                    && p.get("toolCallId")
+                        .is_none_or(|t| t.as_str().is_some_and(|t| tool_calls.contains_key(t))));
+            if !scoped || callbacks.len() >= 16 || questions.contains_key(&v["id"].to_string()) {
+                client.peer.write(json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32602,"message":"Invalid question scope"}})).await?;
+                continue;
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            questions.insert(v["id"].to_string(), tx);
+            let (c, home, input) = (c.clone(), home.to_owned(), input.clone());
+            callbacks.spawn(async move {let result=tokio::select!{r=crate::questions::request(&c,&home,&input,&v["params"])=>r,_=rx=>Ok(crate::elicitation::cancelled())};(v["id"].clone(),result)});
+            continue;
         }
         if v.get("id").is_some() && v.get("method").is_some() {
             ensure!(callbacks.len() < 16, "Too many pending client operations");

@@ -56,6 +56,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/activity", get(activity))
         .route("/api/v1/conversations", get(conversations))
+        .route("/api/v1/questions", get(questions_get))
+        .route("/api/v1/questions/{id}/decision", post(question_decision))
         .route("/api/v1/permissions", get(permissions_get))
         .route(
             "/api/v1/permissions/{id}/decision",
@@ -240,6 +242,39 @@ pub fn status_value(state: &AppState) -> ApiResult<Value> {
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     auth::check(&state, &headers, "observe", false)?;
     Ok(Json(status_value(&state)?))
+}
+async fn questions_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    auth::check(&state, &headers, "admin", false)?;
+    Ok(Json(
+        json!({"items":crate::questions::list(&state.home,&state.instance_config())?}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionDecision {
+    action: String,
+    content: Option<Value>,
+}
+async fn question_decision(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<QuestionDecision>,
+) -> ApiResult<Json<Value>> {
+    let actor = auth::check(&state, &headers, "admin", true)?.actor;
+    crate::questions::decide(
+        &state.home,
+        &state.instance_config(),
+        &id,
+        &body.action,
+        body.content.as_ref(),
+        &actor,
+    )
+    .map_err(|e| ApiError::bad(e.to_string()))?;
+    Ok(Json(json!({"ok":true})))
 }
 async fn permissions_get(
     State(state): State<Arc<AppState>>,
@@ -741,7 +776,7 @@ async fn token_delete(
 }
 fn operations() -> Value {
     json!([
-        {"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
+        {"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
     ])
 }
 async fn descriptor(

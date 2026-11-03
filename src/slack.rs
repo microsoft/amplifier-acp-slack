@@ -260,7 +260,10 @@ impl Slack {
             .map_err(|e| anyhow::anyhow!("Slack context fetch: {e:?}"))?;
         let mut out = Vec::new();
         for raw in result["messages"].as_array().into_iter().flatten() {
-            if raw["metadata"]["event_type"] == "acp_permission" {
+            if matches!(
+                raw["metadata"]["event_type"].as_str(),
+                Some("acp_permission" | "acp_question")
+            ) {
                 continue;
             }
             if let Some(n) = normalize(&m.team, &m.channel, raw, None) {
@@ -395,8 +398,18 @@ impl Slack {
                             }
                             if envelope["type"]=="interactive" {
                                 ensure!(verified_hello,"Slack interactions arrived before app identity verification");
-                                if let Some(id)=envelope["envelope_id"].as_str(){ws.send(Ws::Text(json!({"envelope_id":id}).to_string().into())).await?;}
                                 let payload=&envelope["payload"];
+                                let is_question_view=payload["view"]["callback_id"]=="acp_question" && matches!(payload["type"].as_str(),Some("view_submission"|"view_closed"));
+                                let answer=if is_question_view {
+                                    crate::questions::submit(home,&Config::load(home)?,payload).unwrap_or_else(|_|json!({"response_action":"update","view":{"type":"modal","title":{"type":"plain_text","text":"Question unavailable"},"close":{"type":"plain_text","text":"Close"},"blocks":[{"type":"section","text":{"type":"plain_text","text":"This question has closed or belongs to another person."}}]}}))
+                                }else{json!({})};
+                                if let Some(id)=envelope["envelope_id"].as_str(){ws.send(Ws::Text(json!({"envelope_id":id,"payload":answer}).to_string().into())).await?;}
+                                if is_question_view {continue;}
+                                if payload["actions"][0]["action_id"]=="acp_question_open" && crate::questions::open(home,&Config::load(home)?,self,payload).await.is_err(){store.lock().unwrap().audit("question_unavailable",json!({"reason":"Expired or unauthorized question"}))?;
+                                }
+                                if matches!(payload["actions"][0]["action_id"].as_str(),Some("acp_question_url"|"acp_question_decline")) && crate::questions::submit(home,&Config::load(home)?,payload).is_ok(){
+                                        let _=self.call("views.update",json!({"view_id":payload["view"]["id"],"view":{"type":"modal","title":{"type":"plain_text","text":"Response sent"},"close":{"type":"plain_text","text":"Close"},"blocks":[{"type":"section","text":{"type":"plain_text","text":"Your choice was sent to the agent. If you opened a sign-in page, finish there."}}]}}),false).await;
+                                }
                                 if payload["team"]["id"]==c.slack.team_id && payload["api_app_id"]==c.slack.app_id
                                     && payload["actions"][0]["action_id"] == "acp_permission" {
                                     let latest=Config::load(home)?;
@@ -533,7 +546,12 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
             return Ok(());
         }
     }
-    if own && e["metadata"]["event_type"] == "acp_permission" {
+    if own
+        && matches!(
+            e["metadata"]["event_type"].as_str(),
+            Some("acp_permission" | "acp_question")
+        )
+    {
         return Ok(());
     }
     if own

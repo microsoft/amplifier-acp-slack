@@ -125,4 +125,5 @@ async def main():
         finally:
             await stop();log.close();await runner.cleanup()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
