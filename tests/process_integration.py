@@ -373,6 +373,10 @@ async def main():
             await until(lambda: has_post("PRIVATE-BETA"), "private beta response")
             for home in homes.values():
                 for record in protocol(home, "prompt"):
+                    setup = record["input"]["context_tools"]
+                    assert setup["status"] == "disabled"
+                    assert setup["descriptor_supplied"] is False
+                    assert setup["authentication"] == "not_verified_by_session_setup"
                     if record["input"]["conversation"]["channel"] == "Cshared":
                         text = json.dumps(record["input"])
                         assert "PRIVATE-ALPHA" not in text and "PRIVATE-BETA" not in text
@@ -406,6 +410,8 @@ async def main():
             assert len({p["pid"] for p in alpha_prompts}) == len(alpha_prompts)
             assert any(p["session_id"] == alpha_prompts[0]["session_id"]
                        for p in protocol(homes["alpha"], "session_load"))
+            assert alpha_prompts[0]["input"]["context_tools"]["session_resumed"] is False
+            assert alpha_prompts[-1]["input"]["context_tools"]["session_resumed"] is True
             passed("A conversation resumes its ordinary ACP session across separate endpoint processes")
 
             root = await fixture.send("Cshared", "A thread root; no contribution needed")
@@ -436,14 +442,21 @@ async def main():
             fixture.retry_after = 1
             passed("A root edit invalidates an already queued thread reply before its delivery retry")
 
-            await fixture.send("Calpha", "ask alpha: permission request")
+            # An admitted bot turn has no human who can approve its action.
+            # Human-initiated approvals are exercised in client_capabilities.py.
+            await fixture.send("Calpha", "ask alpha: permission request", user="Ubeta", bot_id="Bbeta")
             await until(lambda: has_post("permission request"), "permission outcome")
             reply = protocol(homes["alpha"], "permission_reply")[-1]["value"]
             assert reply["result"]["outcome"] == {"outcome": "cancelled"}
             assert all("PRIVATE-THOUGHT" not in p["markdown_text"] and "WRONG-SESSION" not in p["markdown_text"]
                        for p in fixture.posts)
-            assert all(p["params"]["clientCapabilities"] == {} for p in protocol(homes["alpha"], "initialize"))
-            passed("Headless permission requests are cancelled; private thoughts and other session output stay private")
+            for handshake in protocol(homes["alpha"], "initialize"):
+                params = handshake["params"]
+                observing = params.get("_meta", {}).get("com.microsoft.amplifier.identity", {}).get("mode") == "observe"
+                expected = {} if observing else {"elicitation": {"form": {}, "url": {}}}
+                assert params["clientCapabilities"] == expected, params
+            assert count(homes["alpha"], "SELECT COUNT(*) FROM permissions") == 0
+            passed("Bot turns without a human approver cancel permission; local tools remain disabled and private output stays private")
 
             stale = await fixture.send("Calpha", "ask alpha: slow STALE-ORIGINAL")
             await until(lambda: has_prompt("alpha", "STALE-ORIGINAL"), "stale turn started")

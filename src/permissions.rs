@@ -1,4 +1,4 @@
-//! Human decisions for ACP permissions. Slack controls are bound to one live turn.
+//! Installation policy and human decisions for ACP permissions, bound to one live turn.
 use crate::{config::Config, model::now_ms, slack::Slack, store::Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
@@ -67,8 +67,46 @@ pub fn list(store: &Store) -> Result<Vec<Value>> {
 fn current(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(store.db.query_row("SELECT id,job_id,context,session_id,approver,created,expires,status,option_id,actor,channel,thread,slack_ts,body FROM permissions WHERE id=?1",[id],row).optional()?)
 }
+/// Match the callback's trusted turn input to the current persisted source.
+/// No caller-supplied identity can replace the sender recorded by Slack ingress.
+pub(crate) fn live_turn(db: &rusqlite::Connection, c: &Config, input: &Value) -> Result<bool> {
+    if !c.enabled {
+        return Ok(false);
+    }
+    let Some(job) = input["job_id"].as_str() else {
+        return Ok(false);
+    };
+    let Some(ctx) = input["conversation"]["context"].as_str() else {
+        return Ok(false);
+    };
+    let source: Option<String> = db.query_row(
+        "SELECT j.trigger FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND j.context=?2 AND m.context=j.context AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted') AND json_extract(m.body,'$.sender')=json_extract(j.trigger,'$.sender') AND json_extract(m.body,'$.bot')=json_extract(j.trigger,'$.bot')",
+        params![job,ctx], |r| r.get(0)).optional()?;
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    let source: crate::model::Message = serde_json::from_str(&source)?;
+    let source_value = serde_json::to_value(&source)?;
+    Ok(!source.deleted
+        && !source.sender.is_empty()
+        && source.team == c.slack.team_id
+        && source.context() == ctx
+        && input["conversation"]["channel"] == source.channel
+        && input["conversation"]["thread"] == source.thread
+        && [
+            "team", "channel", "thread", "ts", "revision", "sender", "bot",
+        ]
+        .iter()
+        .all(|key| input["trigger"][key] == source_value[key])
+        && c.allows(&source.channel, ""))
+}
+fn prune(store: &Store) -> Result<()> {
+    // Retain active-turn intervals so pruning cannot reset the human wait budget.
+    store.db.execute("DELETE FROM permissions WHERE status<>'pending' AND shown_status=status AND job_id NOT IN (SELECT id FROM jobs WHERE status='running') AND id NOT IN (SELECT id FROM permissions ORDER BY created DESC LIMIT 1000)",[])?;
+    Ok(())
+}
 fn live(store: &Store, c: &Config, id: &str) -> Result<bool> {
-    Ok(c.enabled && store.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions p JOIN jobs j ON j.id=p.job_id JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE p.id=?1 AND p.config_revision=?2 AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))", params![id,c.revision as i64], |r|r.get(0))?)
+    Ok(c.enabled && store.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions p JOIN jobs j ON j.id=p.job_id JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE p.id=?1 AND p.config_revision=?2 AND p.context=j.context AND m.context=j.context AND p.channel=m.channel AND p.thread=json_extract(j.trigger,'$.thread') AND p.approver=json_extract(j.trigger,'$.sender') AND NOT json_extract(j.trigger,'$.bot') AND json_extract(m.body,'$.sender')=p.approver AND NOT json_extract(m.body,'$.bot') AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))", params![id,c.revision as i64], |r|r.get(0))?)
 }
 pub fn cancel_all(store: &Store, reason: &str) -> Result<()> {
     let changed = store.db.execute(
@@ -120,14 +158,6 @@ pub fn resolve(
         p["status"] == "pending" && live(store, c, id)?,
         "Permission is no longer pending"
     );
-    ensure!(
-        c.acp
-            .client
-            .approval_users
-            .iter()
-            .any(|u| p["approver"] == *u),
-        "Permission approver is no longer authorized"
-    );
     if let Some(payload) = slack {
         ensure!(
             payload["team"]["id"] == c.slack.team_id
@@ -135,7 +165,8 @@ pub fn resolve(
                 && payload["user"]["id"] == p["approver"]
                 && payload["container"]["channel_id"] == p["channel"]
                 && payload["container"]["message_ts"] == p["slack_ts"]
-                && p["slack_ts"].is_string(),
+                && p["slack_ts"].is_string()
+                && payload["user"].get("is_bot") != Some(&json!(true)),
             "This control belongs to another person or conversation"
         );
     }
@@ -212,11 +243,8 @@ pub async fn details(home: &Path, c: &Config, slack: &Slack, payload: &Value) ->
                 && payload["user"]["id"] == p["approver"]
                 && payload["container"]["channel_id"] == p["channel"]
                 && payload["container"]["message_ts"] == p["slack_ts"]
-                && c.acp
-                    .client
-                    .approval_users
-                    .iter()
-                    .any(|u| p["approver"] == *u),
+                && p["slack_ts"].is_string()
+                && payload["user"].get("is_bot") != Some(&json!(true)),
             "Permission details belong to another person or conversation"
         );
         let raw = serde_json::to_string_pretty(&p["request"]["toolCall"])?;
@@ -324,6 +352,7 @@ impl Drop for Pending {
         if let Ok(s) = Store::open(&self.home) {
             let _=s.db.execute("UPDATE permissions SET status='cancelled',actor='turn ended',closed_at=?2 WHERE id=?1 AND status='pending'",params![&self.id,now_ms()]);
         }
+        crate::work_status::changed(&self.home);
     }
 }
 fn wait_label(seconds: u64) -> String {
@@ -356,11 +385,10 @@ pub async fn request(
     let ctx = input["conversation"]["context"]
         .as_str()
         .context("Missing conversation")?;
-    if input["trigger"]["bot"] != false || !c.acp.client.approval_users.iter().any(|u| u == sender)
-    {
+    if c.acp.client.approvals_required && (input["trigger"]["bot"] != false || sender.is_empty()) {
         Store::open(home)?.audit(
             "permission_declined",
-            json!({"context":ctx,"reason":"No configured human approver initiated this turn"}),
+            json!({"context":ctx,"reason":"A human must initiate a turn that requires approval"}),
         )?;
         return Ok(cancelled);
     }
@@ -402,6 +430,35 @@ pub async fn request(
     let thread = input["conversation"]["thread"].as_str().unwrap_or("");
     let job = input["job_id"].as_str().context("Missing job binding")?;
     let body = json!({"toolCall":params["toolCall"],"options":options});
+    let current_config = Config::load(home)?;
+    if current_config.revision != c.revision
+        || current_config.acp.client.approvals_required != c.acp.client.approvals_required
+    {
+        return Ok(cancelled);
+    }
+    if !c.acp.client.approvals_required {
+        let s = Store::open(home)?;
+        let tx = s.db.unchecked_transaction()?;
+        if !live_turn(&tx, &current_config, input)? {
+            s.audit("permission_declined", json!({"context":ctx,"job_id":job,"reason":"The initiating turn or source is no longer current"}))?;
+            tx.commit()?;
+            return Ok(cancelled);
+        }
+        let Some(choice) = options.iter().find(|v| v["kind"] == "allow_once") else {
+            s.audit("permission_declined", json!({"context":ctx,"job_id":job,"reason":"Automatic approval requires an advertised single-use allow option"}))?;
+            tx.commit()?;
+            return Ok(cancelled);
+        };
+        let created = now_ms();
+        prune(&s)?;
+        tx.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,option_id,actor,channel,thread,shown_status,body,closed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,'approved',?8,'policy:automatic',?9,?10,'approved',?11,?7)", params![id,job,ctx,session,sender,c.revision as i64,created,choice["optionId"].as_str(),channel,thread,body.to_string()])?;
+        s.audit("permission_auto_approved", json!({"id":id,"context":ctx,"job_id":job,"session_id":session,"option_id":choice["optionId"],"actor":"policy:automatic","config_revision":c.revision}))?;
+        tx.commit()?;
+        return Ok(json!({"outcome":{"outcome":"selected","optionId":choice["optionId"]}}));
+    }
+    if !live_turn(&Store::open(home)?.db, &current_config, input)? {
+        return Ok(cancelled);
+    }
     let remaining = {
         let s = Store::open(home)?;
         let created = now_ms();
@@ -412,9 +469,7 @@ pub async fn request(
             return Ok(cancelled);
         }
         let expires = created + remaining;
-        // Retain the intervals of every active turn: another request must not
-        // recover approval time merely because older cards were pruned.
-        s.db.execute("DELETE FROM permissions WHERE status<>'pending' AND shown_status=status AND job_id NOT IN (SELECT id FROM jobs WHERE status='running') AND id NOT IN (SELECT id FROM permissions ORDER BY created DESC LIMIT 1000)",[])?;
+        prune(&s)?;
         s.db.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,channel,thread,body) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?10,?11)",params![id,job,ctx,session,sender,c.revision as i64,created,expires,channel,thread,body.to_string()])?;
         if !live(&s, c, &id)? {
             s.db.execute(
@@ -433,6 +488,7 @@ pub async fn request(
         home: home.to_owned(),
         id: id.clone(),
     };
+    crate::work_status::changed(home);
     let slack = Slack::new(c, c.secrets(home)?)?;
     let mut buttons:Vec<Value>=options.iter().enumerate().map(|(i,o)|json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":o["name"].as_str().unwrap().chars().take(60).collect::<String>()},"value":format!("{id}:{i}")})).collect();
     buttons.push(json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":"Cancel request"},"value":format!("{id}:cancel")}));

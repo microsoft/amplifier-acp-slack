@@ -42,7 +42,7 @@ async def main():
         base=Path(tmp);home=base/'adapter';workspace=base/'workspace'
         for p in (home,home/'secrets',workspace):p.mkdir();p.chmod(0o700)
         (workspace/'escape').symlink_to(home,target_is_directory=True)
-        config={'schema':1,'id':str(uuid.uuid4()),'label':'alpha','revision':1,'enabled':True,'setup_complete':True,'participation':'mentions','acp':{'command':sys.executable,'args':[str(ROOT/'tests/capability_acp_fixture.py'),str(workspace)],'cwd':str(workspace),'timeout_seconds':40,'client':{'read_text_file':True,'write_text_file':True,'terminal':True,'workspace_roots':[str(workspace)],'approval_users':['UHUMAN'],'permission_timeout_seconds':4,'terminal_timeout_seconds':10}},'slack':{'team_id':'Ttest','app_id':'Aalpha','bot_user_id':'Ualpha','bot_id':'Balpha','channels':[],'allow_dms':True,'api_base':f'http://127.0.0.1:{fixture.port}/api/','loopback_test':True},'attention':{'parallel_contexts':2,'settle_ms':10,'minimum_reply_interval_seconds':0,'max_replies_per_context_per_hour':100,'max_replies_per_agent_per_hour':100,'max_decisions_per_agent_per_hour':200,'max_bot_replies_without_human':4},'server':{'bind':'127.0.0.1','port':0,'owner':getpass.getuser(),'pam_service':'acp-slack-adapter','public_url':None,'embed_origins':[]}}
+        config={'schema':1,'id':str(uuid.uuid4()),'label':'alpha','revision':1,'enabled':True,'setup_complete':True,'participation':'mentions','acp':{'command':sys.executable,'args':[str(ROOT/'tests/capability_acp_fixture.py'),str(workspace)],'cwd':str(workspace),'timeout_seconds':40,'client':{'read_text_file':True,'write_text_file':True,'terminal':True,'workspace_roots':[str(workspace)],'approval_users':[],'permission_timeout_seconds':4,'terminal_timeout_seconds':10}},'slack':{'team_id':'Ttest','app_id':'Aalpha','bot_user_id':'Ualpha','bot_id':'Balpha','channels':[],'allow_dms':True,'api_base':f'http://127.0.0.1:{fixture.port}/api/','loopback_test':True},'attention':{'parallel_contexts':2,'settle_ms':10,'minimum_reply_interval_seconds':0,'max_replies_per_context_per_hour':100,'max_replies_per_agent_per_hour':100,'max_decisions_per_agent_per_hour':200,'max_bot_replies_without_human':4},'server':{'bind':'127.0.0.1','port':0,'owner':getpass.getuser(),'pam_service':'acp-slack-adapter','public_url':None,'embed_origins':[]}}
         private_json(home/'adapter.json',config);private_json(home/'secrets/slack.json',{'app_token':'test-alpha-app','bot_token':'test-alpha'})
         log=(home/'service.log').open('wb');process=None
         async def start():
@@ -91,8 +91,8 @@ async def main():
             views_before=len(fixture.views)
             await fixture.action(post,0,action_id='permission_details')
             await until(lambda:len(fixture.views)>views_before,'closed request details available')
-            passed('Private Slack details show merged tool-call arguments only to the initiating authorized human')
-            passed('Approval requires the initiating allowlisted human and exact app/workspace/message; replay and persistent grants rejected')
+            passed('Private Slack details show merged tool-call arguments only to the initiating human')
+            passed('Approval requires the initiating human without an allowlist and exact app/workspace/message; replay and persistent grants rejected')
             (workspace/'approved.txt').unlink()
             _,post=await permission('Ddenial');await fixture.action(post,1)
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='denied'",(post['client_msg_id'],))==1,'denial recorded')

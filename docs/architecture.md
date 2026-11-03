@@ -135,7 +135,8 @@ neither ACP nor an observe credential grants that power.
 
 ## Optional ACP client capabilities
 
-[Client capabilities](client-capabilities.md) describes single-use human approval,
+[Client capabilities](client-capabilities.md) describes the single approval policy
+setting, including human decisions or audited automatic single-use approval,
 local file/terminal authority and the relationship to the endpoint’s own tools.
 Slack interactions are accepted only over the verified app Socket Mode connection;
 there is no unauthenticated public approval webhook. Management decisions use

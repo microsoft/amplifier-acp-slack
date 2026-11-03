@@ -1154,6 +1154,7 @@ pub async fn serve(home: PathBuf) -> Result<()> {
         .await;
     runtime_task.abort();
     let _ = runtime_task.await;
+    crate::work_status::shutdown(&state.home).await;
     signal_task.abort();
     result?;
     Ok(())

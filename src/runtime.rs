@@ -39,6 +39,11 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
         "Slack credentials verified; connecting to Slack",
     )?;
     let _portrait = AbortTask(tokio::spawn(crate::identity::run(home.clone(), c.clone())));
+    let mut work_status = AbortTask(tokio::spawn(crate::work_status::run(
+        home.clone(),
+        c.clone(),
+        client.clone(),
+    )));
     let notify = Arc::new(Notify::new());
     let mut socket = AbortTask(tokio::spawn(client.clone().listen(
         c.clone(),
@@ -153,7 +158,10 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                                 }
                             }
                         }
-                        let result=driver::decide(c.clone(),home,input).await;
+                        if !driver::optional_participation(&c,&input) {
+                            let _=crate::work_status::track(&home,&job);
+                        }
+                        let result=driver::decide(c.clone(),home.clone(),input).await;
                         (job,result)
                     },
                     Err(e)=>(job,Err(e))
@@ -161,7 +169,9 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                 // Errors are categorized without logging prompts, secrets, or
                 // untrusted harness stderr to the shared service journal.
                 if result.is_err(){eprintln!("ACP turn failed in a conversation; see adapter activity");}
-                store.lock().unwrap().finish(&job,result,&c.attention)
+                let result=store.lock().unwrap().finish(&job,result,&c.attention);
+                crate::work_status::changed(&home);
+                result
             });
         }
     };
@@ -169,6 +179,9 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
     publisher.0.abort();
     workers.abort_all();
     while workers.join_next().await.is_some() {}
+    work_status.0.abort();
+    let _ = (&mut work_status.0).await;
+    crate::work_status::shutdown(&home).await;
     crate::permissions::cancel_all(&store.lock().unwrap(), "Connector stopped")?;
     crate::permissions::refresh_messages(&home, &c, &client).await?;
     store.lock().unwrap().audit("process_stopped", json!({}))?;
@@ -198,6 +211,7 @@ pub async fn supervise(
         changes.borrow_and_update();
         let c = Config::load(&home)?;
         if !c.enabled {
+            crate::work_status::shutdown(&home).await;
             runtime_status(&home, &c, "stopped", "Connection paused")?;
             if changes.changed().await.is_err() {
                 return Ok(());

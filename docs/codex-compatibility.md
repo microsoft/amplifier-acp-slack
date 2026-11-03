@@ -19,7 +19,7 @@ their own folders.
 | Session load | Used when advertised. Otherwise the adapter creates a fresh session and supplies bounded Slack history. The no-load case is verified with an independent fixture. |
 | Agent-side tools | Work under the endpoint's own permissions; Codex file tools were exercised. |
 | Client filesystem/terminal tools | Added as opt-in local capabilities in 0.3.0; see [client capabilities](client-capabilities.md). The original 0.2.2 Codex tests below used agent-owned tools. |
-| Interactive approvals | Added in 0.3.0: expiring single-use Slack decisions and private detail views for explicitly configured humans, plus owner dashboard/API decisions. Disabled when no approver is configured. |
+| Interactive approvals | Single-use Slack decisions and private detail views for the initiating human, plus owner dashboard/API decisions. Set `acp.client.approvals_required=false` for audited automatic `allow_once` decisions; no separate approver list is needed. |
 | Ambient judgment | Prompted speak/pass JSON convention. Tested examples passed; this is not an ACP feature or proof of reliable social judgment. |
 | Cross-room retrieval | Optional, separately authorized context/MCP integration. Requires explicit configuration; ACP alone supplies no shared memory. |
 | Attachments and proactive posting elsewhere | Supported media is described in media.md; replies stay attached to the originating conversation/thread. |

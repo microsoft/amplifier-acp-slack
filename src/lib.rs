@@ -22,3 +22,4 @@ pub mod slack;
 pub mod state;
 pub mod store;
 pub mod views;
+pub mod work_status;
