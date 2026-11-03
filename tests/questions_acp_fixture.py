@@ -7,8 +7,8 @@ for line in sys.stdin:
  r=json.loads(line);m=r.get('method');p=r.get('params',{});i=r['id']
  if m=='initialize':
   assert p['clientCapabilities']['elicitation']=={'form':{},'url':{}}
-  result={'protocolVersion':1,'authMethods':[{'id':'browser','name':'Browser login'}]}
- elif m=='session/new' and not authed:
+  result={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'authMethods':[{'id':'browser','name':'Browser login'}]}
+ elif m in ['session/new','session/load'] and not authed:
   send({'id':i,'error':{'code':-32000}});continue
  elif m=='authenticate':
   assert p['methodId']=='browser'

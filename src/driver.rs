@@ -236,7 +236,8 @@ impl Peer {
             .as_ref()
             .is_err_and(crate::acp_auth::authentication_required)
         {
-            let choice = crate::acp_auth::choice(&self.auth_methods)?;
+            let choice = crate::acp_auth::choice(&self.auth_methods)
+                .map_err(|_| anyhow::Error::from(crate::acp_auth::AuthenticationRequired))?;
             let answer = crate::questions::request(c, home, input, &choice)
                 .await
                 .map_err(|_| anyhow::Error::from(crate::acp_auth::AuthenticationRequired))?;

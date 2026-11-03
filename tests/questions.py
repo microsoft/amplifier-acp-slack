@@ -38,6 +38,14 @@ async def main():
    status,data=await api('GET','questions');assert status==200 and data['items']==[]
    assert not rows(h,"SELECT 1 FROM audit WHERE data LIKE '%private-login-value%'")
    assert not rows(h,"SELECT 1 FROM messages WHERE body LIKE '%needs a private response%'")
+   before=rows(h,'SELECT context,endpoint,session_id FROM session_bindings');assert len(before)==1
+   await f.send('Dprivate','Try this saved conversation again')
+   p=await question(4);await view_response(p,action='acp_question_decline')
+   await until(lambda:bool(rows(h,"SELECT 1 FROM jobs WHERE status='failed'")),'cancelled authentication ends turn')
+   assert rows(h,'SELECT context,endpoint,session_id FROM session_bindings')==before
+   assert not rows(h,"SELECT 1 FROM audit WHERE kind='session_replaced'")
+   assert len(f.approvals)==4,'declining sign-in must not create another login question'
+   print('PASS cancelled reconnect authentication keeps the original session binding')
    print('PASS agent authentication + URL + typed form over actual ACP/socket/modal flow')
    print('PASS person/view/workspace scope, invalid answers, private URL, no transcript contamination')
   except Exception:
