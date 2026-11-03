@@ -237,11 +237,12 @@ impl Peer {
             .is_err_and(crate::acp_auth::authentication_required)
         {
             let choice = crate::acp_auth::choice(&self.auth_methods)?;
-            let answer = crate::questions::request(c, home, input, &choice).await?;
-            ensure!(
-                answer["action"] == "accept",
-                "Agent sign-in was not completed"
-            );
+            let answer = crate::questions::request(c, home, input, &choice)
+                .await
+                .map_err(|_| anyhow::Error::from(crate::acp_auth::AuthenticationRequired))?;
+            if answer["action"] != "accept" {
+                return Err(crate::acp_auth::AuthenticationRequired.into());
+            }
             self.session_request(
                 "authenticate",
                 json!({"methodId":answer["content"]["method_id"]}),
@@ -250,7 +251,8 @@ impl Peer {
                 input,
                 tools,
             )
-            .await?;
+            .await
+            .map_err(|_| anyhow::Error::from(crate::acp_auth::AuthenticationRequired))?;
             return self
                 .session_request(method, params, c, home, input, tools)
                 .await;
