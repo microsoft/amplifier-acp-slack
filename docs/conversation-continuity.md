@@ -79,6 +79,14 @@ must be reported as unavailable context rather than evidence of no history.
 
 ## Audience checks
 
+Connection settings offer **Restrict thread grants to their originating thread**
+(`context.thread_only_grants`). It defaults to false to preserve existing room
+navigation. When enabled, a non-owner grant originating in a thread can read,
+search, and orient only within that thread; parent-room and sibling-thread reads
+are denied. Prompt orientation obeys the same boundary. Room-level grants retain
+room access, and verified owner-private grants retain their existing shared
+membership policy. `authorize` reports the effective `scope`.
+
 - The configured owner Slack ID is an explicit identity link. Only a verified
   one-to-one DM from that user receives owner-private authority. Another person's
   DM and group DMs do not acquire it through a display name or channel-ID prefix.
