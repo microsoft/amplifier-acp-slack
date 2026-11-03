@@ -158,13 +158,22 @@ behind an unchanged entrypoint remains independent of this connector.
   acknowledgements do not fill the activity feed.
 
 The connector supports [interactive permissions and optional local client tools](docs/client-capabilities.md).
-An explicitly configured human can review and allow or deny a single ACP request
-in Slack; the connector owner has the same explicit action in its dashboard/API.
+The single approval policy, `acp.client.approvals_required`, defaults to `true`.
+The human who initiated a live turn can review and allow or deny its single-use
+ACP tool requests in Slack, without a separate `acp.client.approval_users` list.
+The connector owner can also explicitly decide through its dashboard/API using
+separate administrator authority. Turning the policy off automatically selects
+an advertised `allow_once` option for each eligible tool request and records the
+decision without posting an approval card. It does not grant persistent permission,
+supply credentials, enable client tools, or bypass agent/tool/service restrictions.
+Sign-in and clarification questions still require interaction.
+
 Filesystem and isolated Linux terminal callbacks are opt-in and bounded to local
 workspace roots. Agent-owned tools remain subject to the chosen agent's policy.
-Attachments and proactive cross-room posting are not implemented. These are text
-conversations, not a general Slack automation API. Process/folder independence
-under one OS account does not isolate a hostile agent implementation.
+Supported attachments are translated between Slack files and ACP content within
+the [media capabilities and limits](docs/media.md). Proactive cross-room posting
+is not implemented; this is not a general Slack automation API. Process/folder
+independence under one OS account does not isolate a hostile agent implementation.
 
 ## Fleet integration and verification
 
@@ -206,9 +215,12 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 
 ## Agent questions and sign-in
 
-Ordinary ACP form and URL questions appear as a **Respond privately** control,
-independent of the `acp.client.approvals_required` setting. Only the initiating human can
-open its Slack dialog. Other channel members see no question contents or answers.
+Ordinary ACP form and URL questions, including clarification and sign-in prompts,
+appear as a **Respond privately** control regardless of
+`acp.client.approvals_required`. Only the human who initiated the live turn can
+open and answer its Slack dialog; no `acp.client.approval_users` list is required.
+Other channel members see no question contents or answers. Automatic tool approval
+does not answer questions or complete sign-in.
 The operator may also inspect `GET /api/v1/questions` and explicitly answer via
 `POST /api/v1/questions/{id}/decision` with `{action, content?}` using the separate
 admin credential. That is recorded as an operator decision, not impersonation.
