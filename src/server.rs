@@ -1,3 +1,29 @@
+pub(crate) fn named_page(html: &str, name: &str, service: &str) -> String {
+    let escaped = name
+        .trim()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    let title = if escaped.is_empty() {
+        service.to_owned()
+    } else {
+        format!("{escaped}: {service}")
+    };
+    let Some(start) = html.find("<title>") else {
+        return html.to_owned();
+    };
+    let Some(end) = html[start..].find("</title>") else {
+        return html.to_owned();
+    };
+    format!(
+        "{}<title>{}</title>{}",
+        &html[..start],
+        title,
+        &html[start + end + 8..]
+    )
+}
 use crate::{
     auth,
     config::{Config, Secrets, private_dir, private_write, valid_secret_name},
@@ -58,6 +84,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/manifest", get(manifest))
         .route("/api/v1/media/readiness", post(media_check))
         .route("/api/v1/media/enable", post(media_enable))
+        .route(
+            "/api/v1/setup/slack",
+            get(crate::provisioning::get).post(crate::provisioning::action),
+        )
         .route("/api/v1/setup/complete", post(complete))
         .route("/api/v1/descriptor", get(descriptor))
         .route("/api/v1/schema", get(schema))
@@ -89,10 +119,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state)
 }
-async fn index() -> impl IntoResponse {
+async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../ui/index.html"),
+        named_page(
+            include_str!("../ui/index.html"),
+            &state.instance_config().label,
+            "Slack Connector",
+        ),
     )
 }
 async fn script() -> impl IntoResponse {
@@ -343,14 +377,14 @@ async fn lifecycle(
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SlackCredentials {
-    app_token: String,
-    bot_token: String,
+pub(crate) struct SlackCredentials {
+    pub app_token: String,
+    pub bot_token: String,
     #[serde(default)]
-    app_id: String,
-    expected_revision: Option<u64>,
+    pub app_id: String,
+    pub expected_revision: Option<u64>,
 }
-async fn credentials(
+pub(crate) async fn credentials(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<SlackCredentials>,
@@ -635,7 +669,7 @@ async fn manifest(
     auth::check(&state, &headers, "admin", false)?;
     Ok(Json(slack::manifest(&state.instance_config().label)))
 }
-async fn complete(
+pub(crate) async fn complete(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
@@ -784,7 +818,7 @@ async fn token_delete(
 }
 fn operations() -> Value {
     json!([
-        {"path":"identity","methods":["GET"],"scope":"observe"},{"path":"identity","methods":["POST"],"scope":"admin"},{"path":"identity/credential","methods":["PUT","DELETE"],"scope":"admin"},{"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
+        {"path":"identity","methods":["GET"],"scope":"observe"},{"path":"identity","methods":["POST"],"scope":"admin"},{"path":"identity/credential","methods":["PUT","DELETE"],"scope":"admin"},{"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/slack","methods":["GET","POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
     ])
 }
 async fn descriptor(
@@ -809,6 +843,7 @@ pub fn openapi_value() -> Value {
         "SecretWrite":{"type":"object","required":["value"],"properties":{"value":{"type":"string","writeOnly":true}}},
         "Lifecycle":{"type":"object","required":["action"],"properties":{"action":{"enum":["start","stop"]}}},
         "Credentials":{"type":"object","required":["app_token","bot_token"],"properties":{"app_token":{"type":"string","writeOnly":true},"bot_token":{"type":"string","writeOnly":true},"app_id":{"type":"string"},"expected_revision":{"type":"integer"}}},
+        "SlackSetup":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["authorize","confirm","connect"]},"challenge":{"type":"string","maxLength":256,"writeOnly":true}}},
         "Check":{"type":"object","properties":{"target":{"enum":["all","acp","slack"]}}},
         "Token":{"type":"object","required":["name","scopes"],"properties":{"name":{"type":"string"},"scopes":{"type":"array","items":{"enum":["admin","observe","ui","context"]}},"expires_in_seconds":{"type":"integer","minimum":60,"maximum":31622400}}},
         "ViewCreate":{"type":"object","properties":{"label":{"type":"string"}}},
@@ -847,6 +882,7 @@ pub fn openapi_value() -> Value {
                 ("POST", "lifecycle") => Some("Lifecycle"),
                 ("POST", "credentials/slack") => Some("Credentials"),
                 ("POST", "check") => Some("Check"),
+                ("POST", "setup/slack") => Some("SlackSetup"),
                 ("POST", "permissions/{id}/decision") => Some("PermissionDecision"),
                 ("POST", "tokens") => Some("Token"),
                 ("POST", "views") => Some("ViewCreate"),

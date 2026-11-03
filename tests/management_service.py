@@ -92,6 +92,14 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         check("private-service-canary" not in json.dumps(api("GET", "/api/v1/secrets")[1]), "Secret names do not return values")
         check("private-service-canary" not in json.dumps(api("GET", "/api/v1/activity")[1]), "Activity excludes secret values")
         check(api("POST", "/api/v1/setup/complete", {})[0] == 400, "Incomplete connection cannot start")
+        check(api("GET", "/api/v1/setup/slack", credential=None)[0] == 401, "Slack setup requires sign-in")
+        check(api("POST", "/api/v1/setup/slack", {"action":"authorize"}, issued["token"])[0] == 403, "Observer cannot authorize Slack")
+        check(api("GET", "/api/v1/setup/slack")[1]["authorized"] is False, "Fresh setup has no authorization")
+        check(api("POST", "/api/v1/setup/slack", {"action":"token"})[0] == 400, "Internal token operation is never exposed")
+        check(api("POST", "/api/v1/setup/slack", {"action":"confirm","challenge":"code"})[0] == 400, "Expired authorization gives actionable error")
+        with urllib.request.urlopen(base + "/", context=context) as response:
+            check(b"<title>Management verification: Slack Connector</title>" in response.read(), "Pre-login tab identifies connection")
+
         api_schema = api("GET", "/api/v1/openapi.json")[1]
         check(api_schema["paths"]["/api/v1/views/{id}/commands"]["post"]["requestBody"]["required"], "Programmatic UI contract discoverable")
         root_cert = (home / "tls/root-ca.crt").read_bytes()

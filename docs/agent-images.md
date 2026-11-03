@@ -1,14 +1,16 @@
 # Keep an agent's Slack image in sync
 
-Upload an image in the connected agent's identity settings. During setup, choose
-**Keep the agent’s image updated in Slack** on the connection page. For an existing
-connection, open **Connection settings → Agent image → Connect image updates**. Supply a
-Slack app configuration access token and its refresh token, generated for the
-workspace under **Your App Configuration Tokens** at https://api.slack.com/apps.
-Use a separate token pair per connector: rotating a shared refresh token in two
-processes would invalidate the other process's copy. These credentials can
-manage your apps; they stay in this connector's private secret store and are
-never sent to the ACP agent or included in configuration exports or UI state.
+Upload an image in the connected agent's identity settings. Guided Slack setup
+uses its existing authorization to manage the icon automatically. Existing
+connections can choose **Connection settings → Agent image → Authorize Slack for
+image updates**, approve once, and keep their existing app and message credentials.
+No separate image key is needed on this path. Slack CLI owns credential renewal
+inside this installation; its refresh token is never duplicated into another store.
+
+**Advanced image access** retains the manual app-configuration token option.
+Use a separate token pair per connector when choosing that path. Authorization
+stays in this connector's private secret store and never enters ACP prompts,
+configuration exports, or persisted UI state.
 
 The connector reads the optional `agent-identity/1` extension over its configured
 ACP connection every two minutes while running. It uploads changed image bytes
@@ -49,7 +51,7 @@ this extension keep their normal Slack icon and ordinary ACP behavior.
 - `POST /api/v1/identity` with `{}`: sync now (`admin`), respecting retry deadlines.
 - `PUT /api/v1/identity/credential` with `{ "token": "...", "refresh_token": "..." }`:
   save private configuration access (`admin`). Optional `expires_at` is Unix seconds.
-- `DELETE /api/v1/identity/credential`: stop synchronization and remove local access.
+- `DELETE /api/v1/identity/credential`: stop synchronization and remove legacy image access. Guided Slack authorization remains available for app management.
 
 The UI exposes `identity.open`, `identity.credentials`, `identity.sync` and
 `identity.disconnect` through `slackConnector.act`. Its view/modal state uses the

@@ -22,6 +22,7 @@ pub struct AppState {
     pub addresses: RwLock<Value>,
     pub login_gate: Arc<Semaphore>,
     pub check_gate: Arc<Semaphore>,
+    pub setup_gate: Semaphore,
     pub runtime_failure: RwLock<Option<Value>>,
 }
 impl AppState {
@@ -55,6 +56,7 @@ impl AppState {
             addresses: RwLock::new(json!({})),
             login_gate: Arc::new(Semaphore::new(2)),
             check_gate: Arc::new(Semaphore::new(1)),
+            setup_gate: Semaphore::new(1),
             runtime_failure: RwLock::new(None),
         })
     }

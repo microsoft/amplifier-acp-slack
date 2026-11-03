@@ -30,7 +30,7 @@ try {
   await page.locator('[data-control="auth.password"]').fill(password);
   phase='opening the dashboard after PAM sign-in with another app cookie present';
   await page.locator('[data-action="auth.login"]').click();
-  await page.locator('[data-control="setup.step.0"]').waitFor();
+  await page.locator('[data-control="setup.connect-screen"]').waitFor();
   checks.push('Real browser completes PAM sign-in with another app cookie on the same hostname');
   const cookies=await context.cookies(base);
   assert(cookies.some(c=>c.name==='ai_other_instance'));
@@ -38,7 +38,7 @@ try {
   checks.push('Browser retains the secure connector session alongside the other app session');
   phase='restoring the signed-in view after reload';
   await page.reload();
-  await page.locator('[data-control="setup.step.0"]').waitFor();
+  await page.locator('[data-control="setup.connect-screen"]').waitFor();
   await page.waitForFunction(()=>window.slackConnector?.snapshot().busy===false);
   await page.locator('[data-control="nav.activity"]').click();
   await page.locator('[data-control="nav.activity"][aria-current="page"]').waitFor();
