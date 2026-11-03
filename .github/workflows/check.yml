@@ -28,6 +28,7 @@ jobs:
       - run: /tmp/adapter-tests/bin/python tests/process_integration.py
       - run: /tmp/adapter-tests/bin/python tests/media.py
       - run: /tmp/adapter-tests/bin/python tests/client_capabilities.py
+      - run: /tmp/adapter-tests/bin/python tests/questions.py
       - run: python3 tests/management_service.py
       - uses: actions/setup-node@v4
         if: matrix.os == 'ubuntu-24.04'
@@ -41,6 +42,11 @@ jobs:
       - run: python3 tests/pam_live.py
         if: matrix.os != 'ubuntu-24.04'
       - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acp-slack-adapter-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: target/release/acp-slack-adapter
+          if-no-files-found: error
   browser:
     runs-on: ubuntu-24.04
     steps:

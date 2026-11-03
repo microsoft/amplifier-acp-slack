@@ -223,3 +223,29 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+## Agent questions and sign-in
+
+With `acp.client.approval_users` configured, ordinary ACP form and URL questions
+appear as a **Respond privately** control. Only the initiating allowed human can
+open its Slack dialog. Other channel members see no question contents or answers.
+The operator may also inspect `GET /api/v1/questions` and explicitly answer via
+`POST /api/v1/questions/{id}/decision` with `{action, content?}` using the separate
+admin credential. That is recorded as an operator decision, not impersonation.
+
+Supported agent login methods run on the same ACP connection and retry session
+setup once after explicit choice. Provider pages open only on a click; opening a
+page is consent, not proof of completed authentication. Terminal-only methods
+remain a host sign-in step. Prompts are never retried for authentication.
+
+Question bodies and responses are memory-only. Cancellation, source edits,
+config changes, timeout, or process exit invalidate them. Controls are bound to
+the workspace, app, initiating person, message, and opened dialog. Slack limits
+on fields, choices, and URL length are enforced before display; unsupported
+schemas are rejected instead of silently dropping constraints. Secret inputs
+belong on the provider's page. Setup callbacks must use the current request ID
+or an already established session ID; tool-scoped questions require a known tool.
+
+Validation uses independent ACP peers and a local Socket Mode service, including
+login, URL opening, typed answers, wrong-user/view rejection, invalid input and
+transcript isolation. Live Slack UI confirmation is a separate check.

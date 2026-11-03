@@ -1,6 +1,6 @@
 [package]
 name = "acp-slack-adapter"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -29,7 +29,7 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-time = "0.3"
+time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
