@@ -71,6 +71,22 @@ def policy(home, config, agent=False):
         raise RuntimeError('agent_updates_disabled')
     return p
 
+def current_socket_healthy(home, status, started_at, revision):
+    runtime = status.get('runtime', {})
+    updated = runtime.get('updated_at')
+    if (runtime.get('state') != 'running' or runtime.get('config_revision') != revision
+            or not isinstance(updated, int) or updated < started_at):
+        return False
+    # The socket records hello/disconnect in the audit store. runtime.json's
+    # connections array is a placeholder and does not describe socket health.
+    # Match the management connection check: the latest audit must belong to
+    # this process/configuration, not a previous successful connection.
+    with sqlite3.connect('file:'+str(home/'state.sqlite3')+'?mode=ro', uri=True, timeout=5) as db:
+        observed = db.execute("SELECT time,data FROM audit WHERE kind='connection' ORDER BY seq DESC LIMIT 1").fetchone()
+    if not observed or observed[0] < updated:
+        return False
+    return json.loads(observed[1]).get('state') == 'connected'
+
 class Controller:
     def __init__(self, home, identifier):
         self.home = home.resolve(); self.identifier = str(uuid.UUID(identifier))
@@ -153,7 +169,7 @@ class Controller:
                 with urllib.request.urlopen(request,context=ctx,timeout=3) as response: status=json.load(response)
                 if status['id']!=self.config['id'] or endpoints['pid']!=int(run('/usr/bin/systemctl','--user','show',self.unit,'-p','MainPID','--value')): raise RuntimeError('wrong_service')
                 cfg=read(self.home/'adapter.json')
-                if cfg['enabled'] and (status['runtime']['state']!='running' or status['runtime'].get('updated_at',0)<endpoints['started_at'] or status['runtime'].get('config_revision')!=cfg['revision'] or not any(c.get('state')=='connected' for c in status['connections'])): raise RuntimeError('connection_not_ready')
+                if cfg['enabled'] and not current_socket_healthy(self.home,status,endpoints['started_at'],cfg['revision']): raise RuntimeError('connection_not_ready')
                 return
             except Exception: time.sleep(.5)
         raise RuntimeError('health_check_failed')
