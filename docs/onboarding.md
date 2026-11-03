@@ -41,33 +41,47 @@ References: [token types](https://docs.slack.dev/authentication/tokens/),
 
 ## Target teammate experience
 
-After the workspace/app owner has prepared access, the target is:
+The connector must own a self-contained setup and management lifecycle. A shared
+Constellation provisioning, enrollment, credential, or identity service is not
+required, including for image updates and recovery after initial setup. This
+follows the [family contract's installation baseline](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/family.v1-candidate.md#self-contained-installation-baseline).
+
+Starting from a fresh installation, the target is:
 
 1. Connect the selected agent to Slack.
-2. Approve the intended workspace/app association, when required.
+2. Complete the owner's authorization and any required workspace/app approval.
 3. Open the agent's DM or choose a conversation.
 
-The connector should receive credentials privately, discover the workspace and
-app identity, check connectivity, and synchronize supported identity information.
-An already connected agent needs no separate image setup. OAuth redirects and
-short-lived, single-use installation handoffs can remove manual key transfer.
-Workspace preparation is separately measured work; it must not be hidden from
-the interaction budget or repeated by every teammate.
+The local setup tooling should provision access where Slack permits it, receive
+credentials privately, discover the workspace and app identity, check
+connectivity, and synchronize supported identity information. The target is no
+separate image-authorization exercise after connection. Reuse valid authorization
+within an installation, with one owner responsible for any rotating credential;
+do not copy one rotating refresh token into independent installations. Different
+owners or machines may need their own authorization. Count those steps rather
+than hiding them behind an administrator's preparation work.
 
-This is a target, not implemented OAuth or provisioning support. Ordinary manifest
-APIs can create apps with configuration access, but the full managed-app installation
-path is restricted to approved Slack partners. See
+This is a target, not implemented OAuth or provisioning support. Slack's official
+CLI is a candidate local setup helper: its installation flow creates apps,
+obtains bot and Socket Mode credentials, and applies app icons using the owner's
+workspace authorization. Its [deployment hooks](https://docs.slack.dev/tools/slack-cli/reference/hooks/#deploy-optional)
+can hand credentials to an installation without manual token copying. Validate
+that path end to end with this connector before advertising it as supported.
+
+Ordinary app-install OAuth does not itself authorize creating arbitrary apps.
+Slack's separate managed-app installation path is restricted to approved Slack
+partners. See
 [`managed_apps:install`](https://docs.slack.dev/reference/scopes/managed_apps.install/).
 Do not advertise an ordinary OAuth button as sufficient to create and install an
 arbitrary fleet of separately named bots. A single shared bot would also change
 the individual agent identity and DM experience, so it is not a substitute here.
 
-An optional workspace setup service could own the app-management credential and
-rotate it once, serving narrowly authorized per-app operations to connectors.
-Do not copy one rotating refresh token into independent connector installations.
-Keep such a service outside the ACP agent implementation: it provisions access,
-while each installed adapter continues communicating with Slack and its own ACP
-endpoint. The standalone route remains available without that service.
+Each installation must retain its own state and standalone controls for renewal,
+image changes, reconnection, and removal. Owners can run different connector
+versions and implementations on different machines without coordinated updates.
+A future fleet UI may invoke those controls; it must not own the only usable
+setup path. A shared provisioning service would require a separate proposal and
+must remain optional. Standard ACP and declared optional interfaces still apply.
 
 ## Automation and recovery
 
