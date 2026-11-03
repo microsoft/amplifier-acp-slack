@@ -206,8 +206,8 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 
 ## Agent questions and sign-in
 
-With `acp.client.approval_users` configured, ordinary ACP form and URL questions
-appear as a **Respond privately** control. Only the initiating allowed human can
+Ordinary ACP form and URL questions appear as a **Respond privately** control,
+independent of the `acp.client.approvals_required` setting. Only the initiating human can
 open its Slack dialog. Other channel members see no question contents or answers.
 The operator may also inspect `GET /api/v1/questions` and explicitly answer via
 `POST /api/v1/questions/{id}/decision` with `{action, content?}` using the separate

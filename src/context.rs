@@ -58,6 +58,7 @@ struct Query {
     thread_id: Option<String>,
     limit: Option<usize>,
     cursor: Option<String>,
+    query: Option<String>,
 }
 
 #[derive(Clone)]
@@ -627,7 +628,7 @@ async fn orientation(
 fn parse_query(value: Value) -> ApiResult<Query> {
     let query: Query =
         serde_json::from_value(value).map_err(|_| ApiError::bad("Invalid context request"))?;
-    if !["authorize", "list", "read", "orientation"].contains(&query.operation.as_str())
+    if !["authorize", "list", "read", "orientation", "search"].contains(&query.operation.as_str())
         || query
             .conversation_id
             .as_deref()
@@ -635,6 +636,12 @@ fn parse_query(value: Value) -> ApiResult<Query> {
         || query.thread_id.as_deref().is_some_and(|s| !timestamp(s))
         || query.cursor.as_ref().is_some_and(|s| s.len() > 2000)
         || query.limit.is_some_and(|n| n == 0 || n > 200)
+        || query
+            .query
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.chars().count() > 200)
+        || (query.operation == "search" && query.query.is_none())
+        || (query.operation != "search" && query.query.is_some())
     {
         return Err(ApiError::bad("Invalid context operation or bounds"));
     }
@@ -657,7 +664,7 @@ async fn dispatch(
     match request.operation.as_str() {
         "authorize" => Ok(authorized_value(c, auth)),
         "list" => list(c, slack, auth, &request).await,
-        "read" | "orientation" => {
+        "read" | "orientation" | "search" => {
             let conversation = target(c, slack, auth, request.conversation_id.as_deref()).await?;
             let thread = request.thread_id.as_deref().or_else(|| {
                 (request.conversation_id.is_none() && !auth.thread.is_empty())
@@ -666,7 +673,7 @@ async fn dispatch(
             if request.operation == "orientation" {
                 orientation(c, slack, auth, &conversation, thread).await
             } else {
-                read_page(
+                let mut page = read_page(
                     c,
                     slack,
                     &conversation,
@@ -675,7 +682,32 @@ async fn dispatch(
                     request.cursor.as_deref(),
                     None,
                 )
-                .await
+                .await?;
+                if let Some(query) = request.query {
+                    let needle = query.to_lowercase();
+                    let messages = page["messages"].as_array().ok_or_else(unavailable)?;
+                    let scanned = messages.len();
+                    let matches: Vec<_> = messages
+                        .iter()
+                        .filter(|message| {
+                            message["text"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(&needle)
+                        })
+                        .cloned()
+                        .collect();
+                    page["messages"] = json!(matches);
+                    // Keep the source cursor and truncation evidence: an empty
+                    // match set is not proof that the whole archive was searched.
+                    page["coverage"]["search"] = json!({
+                        "mode":"literal_case_insensitive", "scanned_messages":scanned,
+                        "bounded_window":true, "exhaustive_archive":false,
+                        "matches_returned_text_only":true
+                    });
+                }
+                Ok(page)
             }
         }
         _ => Err(ApiError::bad("Unknown context operation")),
@@ -737,9 +769,17 @@ fn mcp_tools() -> Value {
         ("slack_context_list","Find conversations this identity and audience may access; never publishes messages."),
         ("slack_context_read","Read a bounded conversation or thread with source references; never publishes messages."),
         ("slack_context_orientation","Inspect the relationship between this thread and its surrounding conversation."),
-    ].iter().map(|(name,description)|json!({"name":name,"description":description,
-        "inputSchema":{"type":"object","properties":properties,"additionalProperties":false},
-        "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":true}})).collect();
+        ("slack_context_search","Find case-insensitive literal text in one authorized conversation or thread window. Follow next_cursor for older windows; no exhaustive archive search is assumed."),
+    ].iter().map(|(name,description)| {
+        let mut schema = json!({"type":"object","properties":properties,"additionalProperties":false});
+        if *name == "slack_context_search" {
+            schema["properties"]["query"] = json!({"type":"string","minLength":1,"maxLength":200,
+                "description":"Literal text to match, case-insensitively; no regular expressions or Slack search operators"});
+            schema["required"] = json!(["query"]);
+        }
+        json!({"name":name,"description":description,"inputSchema":schema,
+            "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":true}})
+    }).collect();
     json!({"tools":tools})
 }
 
@@ -805,6 +845,7 @@ pub async fn mcp(
                 Some("slack_context_list") => "list",
                 Some("slack_context_read") => "read",
                 Some("slack_context_orientation") => "orientation",
+                Some("slack_context_search") => "search",
                 _ => return Ok(rpc_error(id, -32602, "Unknown context tool")),
             };
             let mut args = body["params"]
@@ -815,7 +856,8 @@ pub async fn mcp(
                 return Ok(rpc_error(id, -32602, "Invalid tool arguments"));
             };
             if object.keys().any(|key| {
-                !["conversation_id", "thread_id", "limit", "cursor"].contains(&key.as_str())
+                !["conversation_id", "thread_id", "limit", "cursor", "query"]
+                    .contains(&key.as_str())
             }) {
                 return Ok(rpc_error(id, -32602, "Invalid tool arguments"));
             }

@@ -74,6 +74,9 @@ pub struct ClientCapabilities {
     pub write_text_file: bool,
     pub terminal: bool,
     pub workspace_roots: Vec<String>,
+    /// Require a human decision for ACP tool permission requests.
+    pub approvals_required: bool,
+    /// Deprecated compatibility field; the initiating human can approve their own work.
     pub approval_users: Vec<String>,
     pub permission_timeout_seconds: u64,
     pub max_file_bytes: usize,
@@ -87,6 +90,7 @@ impl Default for ClientCapabilities {
             write_text_file: false,
             terminal: false,
             workspace_roots: vec![],
+            approvals_required: true,
             approval_users: vec![],
             permission_timeout_seconds: 900,
             max_file_bytes: 1024 * 1024,

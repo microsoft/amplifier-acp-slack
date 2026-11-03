@@ -498,7 +498,15 @@ async fn mcp_requires_grant_and_exposes_only_read_tools_with_current_permissions
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 4);
+    let search = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_context_search")
+        .unwrap();
+    assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+    assert_eq!(search["annotations"]["readOnlyHint"], true);
     assert!(!tools.to_string().contains(&grant));
     let (_,read) = f.call("/context/mcp",Some(&grant),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slack_context_read","arguments":{"conversation_id":"CSHARED"}}})).await;
     assert_eq!(read["result"]["isError"], false);
@@ -506,6 +514,14 @@ async fn mcp_requires_grant_and_exposes_only_read_tools_with_current_permissions
     let (_,denied) = f.call("/context/mcp",Some(&grant),json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"slack_context_read","arguments":{"conversation_id":"DOWNER"}}})).await;
     assert_eq!(denied["result"]["isError"], true);
     assert!(!denied.to_string().contains("History of DOWNER"));
+    let (_, searched) = f.call("/context/mcp", Some(&grant), json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"slack_context_search","arguments":{"query":"history"}}})).await;
+    assert_eq!(searched["result"]["isError"], false);
+    assert_eq!(
+        searched["result"]["structuredContent"]["messages"][0]["text"],
+        "History of CSHARED"
+    );
+    let (_, missing_query) = f.call("/context/mcp", Some(&grant), json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"slack_context_search","arguments":{}}})).await;
+    assert_eq!(missing_query["error"]["code"], -32602);
     f.fake
         .lock()
         .unwrap()
@@ -523,6 +539,145 @@ async fn mcp_requires_grant_and_exposes_only_read_tools_with_current_permissions
         .0,
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn search_preserves_pagination_and_unchanged_source_messages() {
+    let f = Fixture::new().await;
+    f.fake.lock().unwrap().history.insert(
+        "CSHARED".into(),
+        vec![
+            message("1000.000001", "UOWNER", "Older NEEDLE."),
+            message("1000.000002", "UPEER", "No match in the newest window"),
+        ],
+    );
+    let request = json!({"operation":"search","access":{"mode":"owner"},"conversation_id":"CSHARED","query":"needle","limit":1});
+    let (status, first) = f.query(request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["messages"], json!([]));
+    assert_eq!(first["complete"], false);
+    assert_eq!(first["next_cursor"], "page:1");
+    assert_eq!(first["coverage"]["search"]["scanned_messages"], 1);
+    assert_eq!(first["coverage"]["search"]["exhaustive_archive"], false);
+    let mut next = request;
+    next["cursor"] = first["next_cursor"].clone();
+    let (_, second) = f.query(next).await;
+    assert_eq!(second["messages"][0]["text"], "Older NEEDLE.");
+    assert_eq!(second["messages"][0]["message_id"], "1000.000001");
+    assert!(
+        second["messages"][0]["url"]
+            .as_str()
+            .unwrap()
+            .contains("TTEST/CSHARED")
+    );
+    assert_eq!(second["complete"], true);
+    assert!(second["next_cursor"].is_null());
+    let (_, read) = f
+        .query(json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED"}))
+        .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(second["messages"][0], read["messages"][0]);
+}
+
+#[tokio::test]
+async fn search_is_literal_and_does_not_claim_to_search_truncated_text_or_other_threads() {
+    let f = Fixture::new().await;
+    {
+        let mut fake = f.fake.lock().unwrap();
+        fake.replies.insert(
+            ("CSHARED".into(), "1000.000001".into()),
+            vec![
+                message(
+                    "1000.000001",
+                    "UPEER",
+                    "Use [a-z]+ literally; NEEDLE is the example.",
+                ),
+                message(
+                    "1000.000002",
+                    "UPEER",
+                    &format!("{}hidden-needle", "x".repeat(2000)),
+                ),
+            ],
+        );
+        fake.replies.insert(
+            ("CSHARED".into(), "1000.000003".into()),
+            vec![message(
+                "1000.000003",
+                "UOWNER",
+                "[a-z]+ from another thread",
+            )],
+        );
+    }
+    let grant = f.grant("CSHARED", "1000.000001", "UPEER", false);
+    let request =
+        json!({"operation":"search","access":{"mode":"grant","grant":grant},"query":"[a-z]+"});
+    let (status, found) = f.query(request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found["thread_id"], "1000.000001");
+    assert_eq!(found["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        found["messages"][0]["text"],
+        "Use [a-z]+ literally; NEEDLE is the example."
+    );
+    assert_eq!(found["complete"], false);
+    assert_eq!(found["coverage"]["scope"], "thread");
+    assert_eq!(found["coverage"]["text_truncated"], true);
+    assert_eq!(
+        found["coverage"]["search"]["matches_returned_text_only"],
+        true
+    );
+    let mut hidden = request;
+    hidden["query"] = "hidden-needle".into();
+    let (_, hidden) = f.query(hidden).await;
+    assert_eq!(hidden["messages"], json!([]));
+    assert_eq!(hidden["complete"], false);
+    assert_eq!(hidden["coverage"]["search"]["scanned_messages"], 2);
+}
+
+#[tokio::test]
+async fn search_cannot_bypass_room_scope_or_revoked_membership() {
+    let f = Fixture::new().await;
+    let grant = f.grant("CSHARED", "", "UOWNER", false);
+    let access = json!({"mode":"grant","grant":grant});
+    for conversation in ["DOWNER", "DOTHER", "CPRIVATE"] {
+        let request = json!({"operation":"search","access":access,"conversation_id":conversation,"query":"History"});
+        assert_eq!(f.query(request).await.0, StatusCode::FORBIDDEN);
+    }
+    assert!(
+        !f.fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(method, _)| method == "conversations.history")
+    );
+    let request = json!({"operation":"search","access":access,"query":"History"});
+    assert_eq!(f.query(request.clone()).await.0, StatusCode::OK);
+    f.fake
+        .lock()
+        .unwrap()
+        .members
+        .get_mut("CSHARED")
+        .unwrap()
+        .retain(|id| id != "UBOT");
+    assert_eq!(f.query(request).await.0, StatusCode::FORBIDDEN);
+    let (status, _) = f.call("/context/mcp", Some(&grant), json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slack_context_search","arguments":{"query":"History"}}})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn search_rejects_missing_blank_or_oversized_query_before_retrieval() {
+    let f = Fixture::new().await;
+    for query in [
+        Value::Null,
+        json!(""),
+        json!("  \n"),
+        json!("x".repeat(201)),
+    ] {
+        assert_eq!(f.query(json!({"operation":"search","access":{"mode":"owner"},"conversation_id":"CSHARED","query":query})).await.0, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(f.query(json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED","query":"ignored?"})).await.0, StatusCode::BAD_REQUEST);
+    assert!(f.fake.lock().unwrap().calls.is_empty());
 }
 
 #[tokio::test]

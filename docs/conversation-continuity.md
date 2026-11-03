@@ -40,17 +40,32 @@ or unsent draft.
 
 When conversation context is enabled and the ACP peer advertises HTTP MCP, normal
 session setup/load supplies a short-lived HTTP MCP descriptor. The adapter exposes
-`slack_context_list`, `slack_context_read` and `slack_context_orientation` at
+`slack_context_list`, `slack_context_read`, `slack_context_search` and
+`slack_context_orientation` at
 `/context/mcp`. These tools cannot post messages or change Slack configuration.
 Generic ACP agents can use them without adopting Agent Instance's management API.
 
 For cross-experience retrieval, the optional `agent-instance.context/1` provider
 uses `/context/v1/query`, authenticated with a dedicated token carrying `context`
 access. Register provider `slack:<adapter-id>` in the agent's context registry.
-The operations are `authorize`, `list`, `read` and `orientation`; outputs identify
+The operations are `authorize`, `list`, `read`, `search` and `orientation`; outputs identify
 the source, freshness and completeness. Listings and message windows are bounded;
 this release does not promise exhaustive archive search or automatic pagination
 through all history.
+
+`search` matches case-insensitive literal text in one authorized conversation or
+thread window. Supply `query` (1–200 characters), then follow `next_cursor` to
+inspect another window. An empty result can still have a continuation. Matching
+uses only the bounded text that `read` would return; coverage retains truncation,
+the number of scanned messages, and the original message IDs and source links.
+Conversation-root searches do not implicitly search thread replies. Search does
+not alter the audience rules or invoke Slack's workspace-wide search API.
+
+Each prompt and the `context_tools_setup` activity record distinguish disabled
+context, a peer without HTTP MCP, and a supplied descriptor. Supplying a descriptor
+does not verify that the peer registered the tools or successfully authenticated
+to the provider; that requires an actual tool result. A resumed session reports
+the same distinction rather than assuming its old tools are still usable.
 
 The optional ACP metadata `io.github.bkrabach.conversation` carries a provider ID
 and temporary audience grant. It never includes Slack credentials or an adapter

@@ -4,7 +4,7 @@ use crate::{config::Config, elicitation::Elicitations, slack::Slack, store::Stor
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -28,17 +28,18 @@ fn registry() -> &'static Questions {
     static Q: OnceLock<Questions> = OnceLock::new();
     Q.get_or_init(Questions::default)
 }
-struct Guard(String);
+struct Guard(String, PathBuf);
 impl Drop for Guard {
     fn drop(&mut self) {
         registry().bindings.lock().unwrap().remove(&self.0);
+        crate::work_status::changed(&self.1);
     }
 }
 fn live(c: &Config, b: &Binding) -> Result<bool> {
-    if !c.enabled || c.revision != b.revision || !c.acp.client.approval_users.contains(&b.actor) {
+    if !c.enabled || c.revision != b.revision {
         return Ok(false);
     }
-    Ok(Store::open(&b.home)?.db.query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))",[&b.job],|r|r.get(0))?)
+    Ok(Store::open(&b.home)?.db.query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND json_extract(j.trigger,'$.sender')=?2 AND NOT json_extract(j.trigger,'$.bot') AND json_extract(m.body,'$.sender')=?2 AND NOT json_extract(m.body,'$.bot') AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))",[&b.job, &b.actor],|r|r.get(0))?)
 }
 fn current(home: &Path, c: &Config, id: &str) -> Result<(Binding, Value)> {
     let b = registry()
@@ -62,7 +63,10 @@ fn current(home: &Path, c: &Config, id: &str) -> Result<(Binding, Value)> {
 }
 pub async fn request(c: &Config, home: &Path, input: &Value, params: &Value) -> Result<Value> {
     let actor = input["trigger"]["sender"].as_str().unwrap_or("");
-    if input["trigger"]["bot"] != false || !c.acp.client.approval_users.iter().any(|u| u == actor) {
+    if input["trigger"]["bot"] != false
+        || actor.is_empty()
+        || !crate::permissions::live_turn(&Store::open(home)?.db, c, input)?
+    {
         return Ok(crate::elicitation::cancelled());
     }
     let job = input["job_id"]
@@ -104,7 +108,8 @@ pub async fn request(c: &Config, home: &Path, input: &Value, params: &Value) -> 
         .lock()
         .unwrap()
         .insert(id.clone(), b.clone());
-    let _guard = Guard(id.clone());
+    let _guard = Guard(id.clone(), home.to_owned());
+    crate::work_status::changed(home);
     let slack = Slack::new(c, c.secrets(home)?)?;
     let mut post = json!({"channel":channel,"text":"The agent needs a private response from the person who started this turn.","client_msg_id":id,"blocks":[{"type":"section","text":{"type":"plain_text","text":"The agent needs your input. Only the person who started this turn can open this question."},"accessory":{"type":"button","action_id":"acp_question_open","text":{"type":"plain_text","text":"Respond privately"},"value":id}}],"metadata":{"event_type":"acp_question","event_payload":{"id":id}},"unfurl_links":false,"unfurl_media":false});
     if let Some(thread) = input["conversation"]["thread"]
@@ -342,6 +347,21 @@ pub fn list(home: &Path, c: &Config) -> Result<Vec<Value>> {
                 q
             })
         })
+        .collect())
+}
+/// Jobs waiting on a live question, without exposing its private content.
+pub fn waiting_job_ids(home: &Path, c: &Config) -> Result<HashSet<String>> {
+    let ids: Vec<String> = registry()
+        .bindings
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, b)| b.home == home)
+        .map(|(id, _)| id.clone())
+        .collect();
+    Ok(ids
+        .iter()
+        .filter_map(|id| current(home, c, id).ok().map(|(b, _)| b.job))
         .collect())
 }
 pub fn decide(

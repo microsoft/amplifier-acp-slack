@@ -1,16 +1,31 @@
 # ACP permissions and local client tools
 
-Version 0.3.0 adds client-side capabilities without depending on an agent brand,
+Client-side capabilities do not depend on an agent brand,
 Agent Instance, persona files, or an agent management API. The default remains
 text chat with no connector filesystem or terminal access and no automatic
 permission grants.
 
-## A deliberate human decision
+## One approval setting
 
-Set `acp.client.approval_users` to the Slack member IDs authorized to approve work.
-An ACP `session/request_permission` during a live turn creates a request in the
-originating Slack conversation/thread. Only the listed human who initiated that
-turn may use its buttons. A different group member, bot, workspace, app, message,
+`acp.client.approvals_required` defaults to `true`, including when upgrading an
+existing configuration. Turn it off to let this connector automatically approve
+the agent's individual ACP tool requests. Each automatic decision selects only
+an advertised `allow_once`, is recorded in Activity and permission history as
+`policy:automatic`, and posts no approval card. Unknown, ambiguous, denial-only,
+or persistent-only choices are never treated as permission. Hard restrictions
+in the agent, tool, filesystem, network, or connected service remain in force.
+This setting does not supply credentials or enable client tools.
+
+The policy applies to admitted human and bot turns; it does not admit new channels,
+users, or bot traffic. Every automatic decision still requires a live, unchanged
+source/job/conversation binding and the correct ACP session. Ordinary questions
+and sign-in prompts remain interactive; the connector never invents answers.
+
+With approvals required, an ACP `session/request_permission` during a live
+human-initiated turn creates a request in the originating Slack conversation or
+thread. The human who initiated that turn may use its buttons, without a separate
+list of approvers. The legacy `approval_users` field remains readable for old
+configurations but is deprecated and no longer restricts requesting humans. A different group member, bot, workspace, app, message,
 stale request, or replay cannot grant permission.
 
 The card offers the endpoint's single-use allow/reject options and cancellation.
@@ -53,9 +68,9 @@ or `ui` credential cannot read private tool arguments or approve work.
 
 ## Configuration
 
-All settings below live under `acp.client` and appear in **Connection settings →
-Advanced settings → Permissions and client tools**. The existing revision-safe
-config API and CLI use exactly the same fields.
+All settings below live under `acp.client`. The approval setting is exposed in
+Connection settings; client tools and limits remain advanced options. The
+revision-safe config API and CLI use exactly the same fields.
 
 ```json
 {
@@ -63,7 +78,7 @@ config API and CLI use exactly the same fields.
   "write_text_file": true,
   "terminal": true,
   "workspace_roots": ["/home/example/agents/alpha/workspace"],
-  "approval_users": ["U0123456789"],
+  "approvals_required": true,
   "permission_timeout_seconds": 900,
   "max_file_bytes": 1048576,
   "terminal_output_bytes": 262144,
@@ -93,9 +108,9 @@ that the endpoint implements itself.
 
 The handshake advertises only enabled capabilities supported on this platform.
 Client callbacks are accepted for the established session during a prompt turn;
-requests during initialize/session creation/loading have no live human work
-binding and are refused. Agents requiring callbacks during session restoration
-need further interoperability work. Agent-owned tools remain subject to the
+session creation/loading callbacks are bound to the initiating live turn and
+the candidate session ID. Operator probes and mode-management requests do not
+permit tool callbacks. Agent-owned tools remain subject to the
 agent's policy: configuring connector roots does **not** constrain an endpoint
 that already executes its own commands under the same OS account.
 
@@ -126,6 +141,12 @@ private detail views, wrong users/rooms/workspaces/apps, replay, denial, expiry,
 management decisions, source edits, restart, and exclusion of control messages
 from history. This fixture does not establish that any particular model asks for
 permission at the right time.
+
+`tests/approval_policy.rs` also exercises a separate ACP peer with automatic
+approval: no Slack credential/card is needed, only single-use choices are selected,
+source/session changes cannot gain authority, and bot turns follow the configured
+policy. The Slack fixtures verify requesting humans can decide without a separate
+approver list and ordinary questions still require their answers.
 
 Rust checks additionally enforce readonly terminal mounts, terminal lifetime,
 unsupported/default-disabled capabilities, and management authorization. Browser
