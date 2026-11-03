@@ -34,6 +34,13 @@ enum Action {
         agent_home: Option<PathBuf>,
     },
     Serve,
+    /// Inspect, prepare or queue a verified update of this connector only.
+    Update {
+        #[arg(default_value = "status")]
+        action: String,
+        #[arg(long)]
+        plan_id: Option<String>,
+    },
     Status,
     Start,
     Stop,
@@ -154,6 +161,21 @@ async fn main() -> Result<()> {
             print(
                 json!({"id":c.id,"home":home,"configured_acp":!c.acp.command.is_empty(),"next":"Start the service, then open its setup URL"}),
             )?;
+        }
+        Action::Update { action, plan_id } => {
+            if action == "status" {
+                print(api(&home, "GET", "updates", None).await?)?;
+            } else {
+                print(
+                    api(
+                        &home,
+                        "POST",
+                        "updates",
+                        Some(json!({"action":action,"plan_id":plan_id})),
+                    )
+                    .await?,
+                )?;
+            }
         }
         Action::Serve => acp_slack_adapter::server::serve(home).await?,
         Action::Status => print(api(&home, "GET", "status", None).await?)?,

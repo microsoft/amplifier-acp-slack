@@ -231,3 +231,7 @@ login, URL opening, typed answers, wrong-user/view rejection, invalid input and
 transcript isolation. Live Slack UI confirmation is a separate check.
 
 Automatic Slack app portraits from compatible agents: [agent images](docs/agent-images.md).
+
+Verified, installation-local updates are available for Linux systemd installations.
+See [Updating one Slack connector](docs/updates.md) for the CLI, management API,
+and optional owner-DM agent controls.

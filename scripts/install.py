@@ -88,6 +88,7 @@ def main():
     (units/unit).write_text(service)
     (install_home/'adapter.service').write_text(service)
     run('systemctl','--user','daemon-reload')
+    (install_home/'installation.json').write_text(json.dumps({'schema':1,'repository':'microsoft/amplifier-acp-slack','service_kind':'systemd-user','service':unit,'binary':'bin/acp-slack-adapter'},indent=2)+'\n')
     run('systemctl','--user','enable','--now',unit)
     endpoints = install_home/'endpoints.json'
     for _ in range(100):
