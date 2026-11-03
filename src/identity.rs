@@ -48,10 +48,15 @@ fn lock(home: &Path) -> Result<std::fs::File> {
 pub fn status(home: &Path) -> Value {
     let saved = std::fs::read(home.join(STATUS)).ok().and_then(|v|serde_json::from_slice::<Value>(&v).ok()).unwrap_or(json!({"state":"not_connected","message":"Connect app configuration access to keep the Slack icon in sync."}));
     let mut value = saved;
-    value["credential_configured"] = home.join(SECRET).exists().into();
+    value["credential_configured"] = enabled(home).into();
+    value["managed_access"] = crate::provisioning::configured(home).into();
     value["profile"] = "agent-identity/1".into();
     value["poll_seconds"] = 120.into();
     value
+}
+fn enabled(home: &Path) -> bool {
+    !home.join("secrets/portrait-disabled").exists()
+        && (home.join(SECRET).exists() || crate::provisioning::configured(home))
 }
 fn record(home: &Path, mut value: Value, state: &str, message: &str) -> Result<Value> {
     value["state"] = state.into();
@@ -87,6 +92,7 @@ pub async fn credential(
         &state.home.join(SECRET),
         &serde_json::to_vec(&body).map_err(anyhow::Error::from)?,
     )?;
+    let _ = std::fs::remove_file(state.home.join("secrets/portrait-disabled"));
     record(
         &state.home,
         status(&state.home),
@@ -105,6 +111,7 @@ pub async fn disconnect(
     if state.home.join(SECRET).exists() {
         std::fs::remove_file(state.home.join(SECRET))?;
     }
+    private_write(&state.home.join("secrets/portrait-disabled"), b"disabled")?;
     record(
         &state.home,
         status(&state.home),
@@ -223,7 +230,7 @@ fn error_code(value: &Value) -> String {
 pub async fn sync(home: &Path, c: &Config) -> Result<Value> {
     let _guard = lock(home)?;
     let mut saved = status(home);
-    if !home.join(SECRET).exists() {
+    if !enabled(home) {
         return record(
             home,
             saved,
@@ -289,8 +296,21 @@ async fn sync_inner(home: &Path, c: &Config, saved: &mut Value) -> Result<(Strin
             "Upload an image in the agent’s settings. It will appear here automatically.".into(),
         ));
     }
-    check_private(&home.join(SECRET))?;
-    let mut secret: Credential = serde_json::from_slice(&std::fs::read(home.join(SECRET))?)?;
+    let mut secret: Credential = if crate::provisioning::configured(home) {
+        let result =
+            crate::provisioning::helper(home, "token", json!({"team_id":c.slack.team_id})).await?;
+        Credential {
+            token: result["token"]
+                .as_str()
+                .context("Missing Slack access")?
+                .into(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        }
+    } else {
+        check_private(&home.join(SECRET))?;
+        serde_json::from_slice(&std::fs::read(home.join(SECRET))?)?
+    };
     validate_transport_credential(c, &secret)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -429,7 +449,7 @@ pub async fn run(home: PathBuf, c: Config) {
         } else {
             break;
         }
-        if home.join(SECRET).exists() {
+        if enabled(&home) {
             let _ = sync(&home, &c).await;
         }
         tokio::time::sleep(Duration::from_secs(120)).await;

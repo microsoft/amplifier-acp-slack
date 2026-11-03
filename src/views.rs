@@ -51,6 +51,8 @@ fn sensitive(v: &Value) -> bool {
         Value::Object(m) => m.iter().any(|(k, v)| {
             [
                 "password",
+                "challenge",
+                "ticket",
                 "token",
                 "app_token",
                 "bot_token",

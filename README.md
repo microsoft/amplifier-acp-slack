@@ -65,44 +65,23 @@ Supported Slack attachments now become capability-checked ACP content, and nativ
 
 ## Connect Slack
 
-1. Open the printed URL and sign in. Confirm the prefilled agent connection.
-2. Use **Create app in Slack**. If Slack shows app choices, select **From a manifest → Continue**. Choose the workspace and create the prepared app.
-3. In Slack's **Basic Information → App-Level Tokens**, create a token with
-   `connections:write`. In **OAuth & Permissions**, install the app and copy its
-   bot token. Paste both into the connector's two private credential fields.
-4. Verify and start. In Slack, add the app to a channel, or open its direct message.
+1. Open the printed URL and sign in. The installed agent is already selected.
+2. Choose **Authorize Slack**. Copy the short command into a conversation in your
+   Slack workspace, approve Slack’s request, and enter its confirmation code here.
+3. The connector creates the agent’s app, obtains its message credentials, checks
+   the ACP connection, and starts listening. Image updates use the same authorization.
+4. Invite the agent into a channel or open its direct messages.
 
-The setup derives app/workspace IDs and checks that the two credentials belong to
-the same app. A separate app per agent gives each its own visible identity and
-event stream. Do not start two connector installations with the same app tokens.
+Workspace app approval policies still apply. An administrator may need to approve
+installation. Each connector keeps its own authorization and renewal state; no
+shared Constellation service is involved. The first authorization downloads a
+checksum-verified Slack CLI into this installation. Python 3 and access to GitHub
+and Slack are required. The installed agent remains a standard ACP endpoint.
 
-**When addressed** is the default: DMs and explicit mentions invite a reply.
-Ordinary unmentioned messages still update that conversation's context.
-**When useful** asks the agent to decide whether to speak or remain silent for
-ordinary group messages too. One-to-one DMs and explicit @mentions still expect
-a reply; the user can explicitly ask for silence. Group mode requests a speak/pass JSON decision through a
-normal prompt; it is an optional behavior convention, not a standard ACP feature.
-Malformed ambient decisions are withheld and recorded, not published as JSON.
-
-Invite the same app into more channels to use the same individual in more places.
-A channel allowlist can narrow its joined rooms. Every channel's main discussion
-and every thread have separate session bindings; nothing automatically merges
-their transcripts. The agent may intentionally share its own higher-level state.
-
-### Message formatting
-
-Agents return ordinary Markdown over ACP. At delivery, this connector uses
-[Slack's `markdown_text` field](https://docs.slack.dev/reference/methods/chat.postMessage/)
-so Slack renders bold, links, lists, headings, quotes, code, and tables as rich
-content. The connector does not send Markdown through Slack's older `text`/mrkdwn
-field or ask the agent to adopt a Slack-specific writing format. Code and URLs
-reach the renderer unchanged, and the outbox retains the original Markdown.
-
-Replies retain their destination, thread, and delivery ID; link and media previews
-remain disabled. The existing 3,800-character contribution limit is below Slack's
-12,000-character Markdown limit. Delivery failures follow the same retry policy;
-an uncertain response is never retried in another format. This affects new replies;
-previously posted messages are not rewritten.
+**Advanced: use existing app credentials** retains the manual manifest/token path.
+Existing connections keep their apps, credentials, and conversations. They can
+optionally authorize Slack from **Connection settings → Agent image** without
+reinstalling the app. See [onboarding](docs/onboarding.md) for the flow and boundaries.
 
 ## Connected conversation context
 

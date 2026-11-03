@@ -11,6 +11,7 @@ pub mod media;
 pub mod model;
 pub mod permissions;
 pub mod process;
+pub mod provisioning;
 pub mod questions;
 pub mod relocation;
 pub mod runtime;

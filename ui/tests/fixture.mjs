@@ -11,10 +11,10 @@ const artifacts=process.env.UI_ARTIFACTS||"/tmp/acp-slack-adapter-ui";
 await fs.mkdir(artifacts,{recursive:true});
 const prefix="/embedded/connector/";
 let privateSecrets={},loggedIn=false,credentials=false,socketState="connected",views=new Map(),savedTokens=[],checks=[],savedCredentialCount=0,configWrites=0;
-let dropSessionCookie=true,failConfig=false,failView=false;
+let dropSessionCookie=true,failConfig=false,failView=false,failAcp=false,failImage=false,imageWrites=0;
 const viewBodies=[];
 let config={schema:1,id:"fixture-connector",label:"Helper in Slack",revision:1,enabled:false,setup_complete:false,participation:"mentions",context:{enabled:false,owner_slack_user_id:""},media:{incoming:false,outgoing:false,max_files:4,max_file_bytes:2097152},acp:{command:"/installed/agent-instance",args:["acp","--home","/installed/helper"],env:{},secret_env:{},cwd:"/installed/helper/workspace",timeout_seconds:180,client:{read_text_file:false,write_text_file:false,terminal:false,workspace_roots:[],approval_users:[],permission_timeout_seconds:180,max_file_bytes:1048576,terminal_output_bytes:262144,terminal_timeout_seconds:120}},slack:{team_id:"",app_id:"",bot_user_id:"",bot_id:"",channels:[],allow_dms:true,api_base:"https://slack.com/api/",loopback_test:false},attention:{settle_ms:1500,max_replies_per_agent_per_hour:30,max_replies_per_context_per_hour:12,max_bot_replies_without_human:2,max_decisions_per_agent_per_hour:120,minimum_reply_interval_seconds:6},server:{bind:"0.0.0.0",port:41337,owner:"fixture-owner",pam_service:"login",public_url:null,embed_origins:[]}};
-let permissions=[],mediaChecked=null,fileScopes=false,portrait={};
+let permissions=[],mediaChecked=null,fileScopes=false,portrait={},guidedAuthorized=false;
 const mediaResult=()=>({verified:true,checked_at:Date.now(),ready:fileScopes,granted_scopes:fileScopes?["files:read","files:write"]:[],missing_scopes:fileScopes?[]:["files:read","files:write"],settings_url:"https://api.slack.com/apps/A_FIXTURE/oauth",note:fileScopes?"Slack file permissions are installed.":"Add the missing Bot Token Scopes and reinstall this existing app."});
 const events=[{id:5,time:Date.now(),kind:"decision",data:{decision:"pass",reason:"The humans are already working through the question."}},{id:4,time:Date.now(),kind:"delivery",data:{status:"sent",note:""}},{id:3,time:Date.now(),kind:"delivery",data:{status:"uncertain",note:"Inspect Slack before resending."}},{id:2,time:Date.now(),kind:"connection",data:{state:"connected"}},{id:1,time:Date.now(),kind:"view.ack",data:{}}];
 const conversations=[{id:"context-one",channel:"C_FIRST",thread:"",session_id:"session-one",resumable:true,updated_at:Date.now(),turns:3,last_outcome:"pass"},{id:"context-two",channel:"C_SECOND",thread:"1234.1",session_id:"session-two",resumable:true,updated_at:Date.now(),turns:2,last_outcome:"speak"}];
@@ -35,6 +35,12 @@ const server=http.createServer(async(req,res)=>{
   if(req.method!=="GET"&&req.headers["x-csrf-token"]!=="fixture-csrf")return send({error:"CSRF missing"},403);
   if(endpoint==="auth/logout"){loggedIn=false;return send({ok:true});}
   if(endpoint==="config"){if(failConfig)return send({error:"Temporary configuration outage"},503);if(req.method==="PUT"){if(data.expected_revision!==config.revision)return send({error:"Configuration changed"},409);config={...data.config,revision:config.revision+1};configWrites++;}return send(config);}
+  if(endpoint==="setup/slack"){
+    if(data.action==="authorize")return send({command:"/slackauthticket private-ticket"});
+    if(data.action==="confirm"){assert.equal(data.challenge,"private-challenge");guidedAuthorized=true;}
+    if(data.action==="connect"){assert(guidedAuthorized);credentials=true;config.setup_complete=true;config.enabled=true;config.revision++;}
+    return send({authorized:guidedAuthorized,workspace:"test-workspace"});
+  }
   if(endpoint==="status")return send(status());
   if(endpoint==="media/readiness"){mediaChecked=mediaResult();return send(mediaChecked);}
   if(endpoint==="media/enable"){if(!fileScopes)return send({error:"File access is not ready"},400);config.media.incoming=config.media.outgoing=true;config.revision++;return send({config,media:mediaResult()});}
@@ -43,8 +49,10 @@ const server=http.createServer(async(req,res)=>{
   if(endpoint==="activity")return send({items:events});
   if(endpoint==="conversations")return send({items:conversations});
   if(endpoint==="manifest")return send({display_information:{name:config.label},settings:{socket_mode_enabled:true}});
-  if(endpoint==="check"){checks.push(data.target);return send({ok:true,...(["all","acp"].includes(data.target)?{acp:{ok:true,result:{protocolVersion:1}}}:{}),...(["all","slack"].includes(data.target)?{slack:{ok:true,result:{team_id:"T_WORKSHOP"}}}:{})});}
+  if(endpoint==="check"){checks.push(data.target);if(failAcp)return send({ok:false,acp:{ok:false,error:"Agent is temporarily unavailable"}});return send({ok:true,...(["all","acp"].includes(data.target)?{acp:{ok:true,result:{protocolVersion:1}}}:{}),...(["all","slack"].includes(data.target)?{slack:{ok:true,result:{team_id:"T_WORKSHOP"}}}:{})});}
   if(endpoint==="credentials/slack"){assert.equal(config.enabled,false);assert(data.app_token.startsWith("xapp-")&&data.bot_token.startsWith("xoxb-"));assert.equal(data.app_id,undefined);credentials=true;savedCredentialCount++;config.slack={...config.slack,team_id:"T_WORKSHOP",app_id:"A_FIXTURE",bot_user_id:"U_FIXTURE",bot_id:"B_FIXTURE"};config.revision++;return send({connected:true,identity:config.slack,config_revision:config.revision});}
+  if(endpoint==="identity/credential"){if(failImage)return send({error:"Image access unavailable"},503);assert(data.token.startsWith("xoxe.xoxp-"));imageWrites++;portrait={state:"waiting",credential_configured:true,message:"Image updates will start automatically"};return send(portrait);}
+  if(endpoint==="identity"&&req.method==="POST"){portrait={...portrait,state:"synced",synced_at:Date.now(),message:"Slack is using the current image"};return send(portrait);}
   if(endpoint==="setup/complete"){assert(credentials);config.setup_complete=true;config.enabled=true;config.revision++;return send(config);}
   if(endpoint==="lifecycle"){config.enabled=data.action==="start";config.revision++;return send(status());}
   if(endpoint==="secrets")return send({items:Object.keys(privateSecrets)});
@@ -70,13 +78,76 @@ try{
   dropSessionCookie=false;failConfig=true;await page.locator('[data-control="auth.password"]').fill("test-password");await page.locator('[data-action="auth.login"]').click();
   await page.waitForFunction(()=>document.querySelector('[data-control="auth.opening"]')?.textContent.includes("Temporary configuration outage"));await waitIdle();ok("Configuration load failure is visible after successful sign-in");
   failConfig=false;failView=true;await page.locator('[data-action="auth.resume"]').click();await page.waitForFunction(()=>document.querySelector('[data-control="auth.opening"]')?.textContent.includes("Temporary display outage"));await waitIdle();ok("Display initialization failure offers a working retry without another password");
-  failView=false;assert(await page.evaluate(()=>window.slackConnector.actions().includes("auth.resume")));await page.evaluate(()=>window.slackConnector.act("auth.resume"));await page.locator('[data-control="setup.step.0"]').waitFor();
-  const view=views.get("view-1");assert.equal(await page.locator('[data-draft="config.acp.command"]').count(),0);assert.equal(await page.locator('[data-draft="config.label"]').inputValue(),"Helper in Slack");assert((await page.locator(".endpoint-summary").innerText()).includes("filled in"));await page.screenshot({path:path.join(artifacts,"setup-agent.png"),fullPage:true});ok("Known endpoint prefilled; technical details hidden");
-  await page.locator('[data-action="check.acp"]').click();await page.waitForFunction(()=>document.querySelector('[data-control="checks.results"]')?.textContent.includes("passed"));assert.deepEqual(checks,["acp"]);assert.equal(configWrites,0);ok("Readiness check does not rewrite a configured connection");
-  await page.locator('[data-action="setup.next"]').click();await page.locator('[data-control="credentials.app_token"]').waitFor();assert.equal(await page.getByText("App ID (optional)").count(),0);const createUrl=new URL(await page.locator('[data-control="slack.app.create"]').getAttribute("href"));assert.equal(JSON.parse(createUrl.searchParams.get("manifest_json")).display_information.name,"Helper in Slack");assert((await page.locator(".instructions").innerText()).includes("connections:write"));
-  const downloadEvent=page.waitForEvent("download");await page.locator('[data-action="manifest.download"]').click();const download=await downloadEvent;const downloaded=JSON.parse(await fs.readFile(await download.path(),"utf8"));assert(downloaded.settings.socket_mode_enabled);await page.screenshot({path:path.join(artifacts,"setup-slack.png"),fullPage:true});ok("Slack app manifest downloads; exact two-token instructions");
-  await page.locator('[data-control="credentials.app_token"]').fill("xapp-fixture-private");await page.locator('[data-control="credentials.bot_token"]').fill("xoxb-fixture-private");await page.waitForTimeout(400);assert(!JSON.stringify(view).includes("xapp-"));assert(!JSON.stringify(viewBodies).includes("xoxb-"));await page.locator('[data-action="credentials.save"]').click();await page.waitForFunction(()=>document.querySelector(".banner")?.textContent.includes("verified and saved"));assert.equal(savedCredentialCount,1);assert.equal(await page.locator('[data-control="credentials.app_token"]').inputValue(),"");assert.equal(await page.locator('[data-control="credentials.bot_token"]').inputValue(),"");assert(!JSON.stringify(view).includes("fixture-private"));ok("Write-only credentials never enter view drafts and clear after submission");
-  await page.locator('[data-action="setup.next"]').click();await page.locator('[data-control="participation.ambient"]').check();await page.locator('[data-action="setup.finish"]').click();await page.locator('[data-control="nav.dashboard"][aria-current="page"]').waitFor();assert.equal(config.participation,"ambient");assert(config.enabled&&config.setup_complete);assert(checks.includes("all"));await page.screenshot({path:path.join(artifacts,"dashboard.png"),fullPage:true});ok("Setup verifies both connections, saves participation, and starts");
+  failView=false;assert(await page.evaluate(()=>window.slackConnector.actions().includes("auth.resume")));await page.evaluate(()=>window.slackConnector.act("auth.resume"));await page.locator('[data-control="setup.connect-screen"]').waitFor();
+  assert(await page.locator('[data-action="slack.setup.authorize"]').isVisible());
+  assert.equal(await page.locator('[data-control="credentials.app_token"]').count(),0);
+  assert.equal(await page.title(), "Helper in Slack: Slack Connector");
+  await page.evaluate(()=>window.slackConnector.act("setup.manual"));
+  const view=views.get("view-1");
+  assert.equal(await page.locator('[data-draft="config.acp.command"]').count(),0);
+  assert.equal(await page.locator('[data-draft="config.label"]').count(),0);
+  assert.equal(await page.locator('[data-action="setup.next"]').count(),0);
+  assert.equal(await page.locator('[data-action="check.acp"]').count(),0);
+  assert((await page.locator(".endpoint-summary").innerText()).includes("filled in"));
+  assert.equal(await page.locator('[data-action="manifest.download"]').count(),0);
+  await page.screenshot({path:path.join(artifacts,"setup-simple.png"),fullPage:true});
+  ok("One setup screen uses the installed agent and defaults without mandatory wizard or check buttons");
+  const priorSize=page.viewportSize();await page.setViewportSize({width:390,height:844});
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));
+  await page.screenshot({path:path.join(artifacts,"setup-mobile.png"),fullPage:true});await page.setViewportSize(priorSize);
+  ok("Setup fits a phone-sized screen without horizontal scrolling");
+  const installedCommand=config.acp.command;config.acp.command="";config.revision++;
+  await page.evaluate(()=>window.slackConnector.act("refresh"));
+  assert(await page.locator('[data-action="setup.connect"]').isEnabled());
+  const missing=await page.evaluate(()=>window.slackConnector.act("setup.connect",{}).catch(e=>e.message));
+  assert(missing.includes("Choose an agent connection"));assert.equal(savedCredentialCount,0);
+  config.acp.command=installedCommand;config.revision++;await page.evaluate(()=>window.slackConnector.act("refresh"));
+  ok("A missing agent points to Advanced settings before requesting Slack credentials");
+  const createUrl=new URL(await page.locator('[data-control="slack.app.create"]').getAttribute("href"));
+  assert.equal(JSON.parse(createUrl.searchParams.get("manifest_json")).display_information.name,"Helper in Slack");
+  assert((await page.locator("#setup-connect-form").innerText()).includes("connections:write"));
+  await page.locator('[data-action="setup.manifest-help"]').click();
+  const downloadEvent=page.waitForEvent("download");await page.locator('[data-action="manifest.download"]').click();const download=await downloadEvent;
+  assert(JSON.parse(await fs.readFile(await download.path(),"utf8")).settings.socket_mode_enabled);
+  await page.locator('[data-action="setup.manifest-help"]').click();
+  ok("Prepared Slack settings open directly; copy/download recovery is available on demand");
+  await page.locator('[data-control="credentials.app_token"]').fill("xapp-fixture-private");await page.locator('[data-control="credentials.bot_token"]').fill("xoxb-fixture-private");
+  await page.locator('[data-control="setup.preferences"]').click();
+  assert.equal(await page.locator('[data-control="credentials.app_token"]').inputValue(),"xapp-fixture-private");
+  await page.locator('[data-control="participation.ambient"]').check();
+  await page.locator('[data-control="setup.preferences"]').click();
+  await page.locator('[data-control="setup.images"]').check();
+  await page.locator('[data-control="setup.identity.token"]').fill("xoxe.xoxp-image-fixture-private");
+  await page.locator('[data-control="setup.identity.refresh"]').fill("xoxe-refresh-fixture-private");
+  await page.locator('[data-control="setup.preferences"]').click();
+  assert.equal(await page.locator('[data-control="setup.identity.refresh"]').inputValue(),"xoxe-refresh-fixture-private");
+  await page.locator('[data-control="setup.preferences"]').click();
+  assert(!JSON.stringify(viewBodies).includes("fixture-private"));
+  ok("Optional preferences and image access share the setup flow without leaking or losing typed secrets");
+  failAcp=true;await page.locator('[data-action="setup.connect"]').click();
+  await page.waitForFunction(()=>document.querySelector('.banner.error')?.textContent.includes("saved Slack access is kept"));await waitIdle();
+  assert.equal(savedCredentialCount,1);assert.equal(imageWrites,1);assert.equal(config.enabled,false);
+  assert.equal(await page.locator('[data-control="credentials.app_token"]').count(),0);
+  assert.equal(await page.locator('[data-control="setup.identity.token"]').count(),0);
+  assert.equal(await page.locator('[data-control="slack.app.create"]').count(),0);
+  assert((await page.locator('[data-control="checks.results"]').innerText()).includes("temporarily unavailable"));
+  failAcp=false;await page.locator('[data-action="setup.connect"]').click();
+  await page.locator('[data-control="nav.dashboard"][aria-current="page"]').waitFor();
+  assert.equal(savedCredentialCount,1);assert.equal(imageWrites,1);assert.equal(config.participation,"ambient");
+  assert(config.enabled&&config.setup_complete);assert(checks.includes("acp")&&checks.includes("all"));
+  assert(!JSON.stringify(view).includes("fixture-private"));
+  assert.equal(await page.locator('[data-control="slack.agent.open"]').getAttribute("href"),"https://slack.com/app_redirect?app=A_FIXTURE&team=T_WORKSHOP");
+  await page.screenshot({path:path.join(artifacts,"dashboard.png"),fullPage:true});
+  ok("Connect verifies and starts; a failed agent check retries without new token copies or app creation");
+  // An optional image failure cannot strand an otherwise working connection.
+  config={...config,enabled:false,setup_complete:false,revision:config.revision+1};credentials=false;portrait={};failImage=true;
+  await page.evaluate(()=>window.slackConnector.act("refresh"));await page.evaluate(()=>window.slackConnector.act("navigate",{route:"setup"}));
+  assert(await page.evaluate(()=>window.slackConnector.actions().includes("setup.connect")));
+  await page.evaluate(()=>window.slackConnector.act("setup.connect",{app_token:"xapp-fixture-private",bot_token:"xoxb-fixture-private",image_token:"xoxe.xoxp-image-fixture-private",image_refresh_token:"xoxe-refresh-fixture-private"}));
+  assert(config.enabled&&config.setup_complete);assert((await page.locator('.banner[role="status"]').innerText()).includes("Image access wasn’t saved"));
+  assert.equal(savedCredentialCount,2);failImage=false;
+  assert(!JSON.stringify(viewBodies).includes("fixture-private"));
+  ok("The same one-action setup is available to agents; optional image failures do not block messaging");
   socketState="reconnecting";await page.locator('[data-action="refresh"]').click();await page.waitForFunction(()=>document.querySelector(".hero")?.textContent.includes("Connecting to Slack"));assert((await page.locator(".health-row").nth(1).innerText()).includes("Reconnecting"));socketState="connected";await page.locator('[data-action="refresh"]').click();await page.waitForFunction(()=>document.querySelector(".hero")?.textContent.includes("Ready for the conversation"));ok("Actual Slack socket health drives status, not runtime process alone");
   apply(view,[{type:"navigate",route:"configuration"},{type:"set_filter",key:"advanced",value:true},{type:"set_draft",path:"config.label",value:"Helper · team conversations"}]);await page.locator('[data-draft="config.acp.command"]').waitFor();await page.waitForFunction(()=>document.querySelector('[data-draft="config.label"]')?.value==="Helper · team conversations");assert.equal(await page.locator('[data-action="advanced.toggle"]').getAttribute("aria-expanded"),"true");apply(view,[{type:"focus",target:"config.acp.cwd"},{type:"scroll",x:0,y:450}]);await page.waitForFunction(()=>document.activeElement?.dataset.control==="config.acp.cwd");await page.waitForFunction(()=>window.scrollY>400);assert.equal(view.ack?.status,"applied");await page.locator('[data-action="config.save"]').first().click();await page.waitForFunction(()=>document.querySelector(".banner")?.textContent.includes("settings saved"));assert.equal(config.label,"Helper · team conversations");ok("External controller drives route, advanced section, drafts, focus, scroll, and acknowledgement");
   portrait={agent_name:"Test teammate",state:"needs_attention",message:"The connector could not refresh image access (invalid_arguments).",credential_configured:true};
@@ -85,9 +156,21 @@ try{
   assert(imageStatus.includes("Image not yet synced"));assert(!imageStatus.includes("Waiting for an image"));
   portrait={...portrait,state:"waiting_for_image"};await page.evaluate(()=>window.slackConnector.act("refresh"));
   assert((await page.locator('[data-control="identity.status"]').innerText()).includes("Waiting for an image"));
-  portrait={...portrait,state:"synced",synced_at:Date.now()};await page.evaluate(()=>window.slackConnector.act("refresh"));
+  portrait={...portrait,state:"synced",synced_at:Date.now()};await page.waitForFunction(()=>document.querySelector('[data-control="identity.status"]')?.textContent.includes("Last updated"));
   assert((await page.locator('[data-control="identity.status"]').innerText()).includes("Last updated"));
   ok("Image sync failures do not imply the agent is missing its image");
+  await page.locator('[data-action="identity.open"]').click();
+  await page.locator('[data-control="identity.token"]').fill("xoxe.xoxp-image-fixture-private");
+  await page.locator('[data-control="identity.refresh"]').fill("xoxe-refresh-fixture-private");
+  await page.evaluate(()=>window.slackConnector.command([{type:"focus",target:"identity.token"}]));
+  assert.equal(await page.locator('[data-control="identity.token"]').inputValue(),"xoxe.xoxp-image-fixture-private");
+  assert.equal(await page.locator('[data-control="identity.refresh"]').inputValue(),"xoxe-refresh-fixture-private");
+  await page.getByRole("button",{name:"Enable image updates",exact:true}).click();
+  await page.getByRole("dialog").waitFor({state:"hidden"});await waitIdle();
+  assert((await page.locator('[data-control="identity.status"]').innerText()).includes("current image"));
+  assert(!JSON.stringify(viewBodies).includes("fixture-private"));
+  ok("Existing connections can replace image access without mixing private input values");
+
   await page.locator('[data-action="media.check"]').click();await waitIdle();assert((await page.locator('[data-control="media.readiness"]').innerText()).includes("files:read, files:write"));assert.equal(await page.locator('[data-action="media.enable"]').count(),0);assert.equal(await page.locator('[data-control="media.readiness"] a').getAttribute("href"),"https://api.slack.com/apps/A_FIXTURE/oauth");fileScopes=true;await page.locator('[data-action="media.check"]').click();await waitIdle();await page.locator('[data-action="media.enable"]').click();await waitIdle();assert(config.media.incoming&&config.media.outgoing);assert(await page.locator('[data-action="media.enable"]').isDisabled());ok("File access shows installed scopes and only enables after rechecking grants");
   apply(view,[{type:"navigate",route:"conversations"},{type:"select_conversation",conversation_id:"context-two"}]);await page.locator('[data-control="conversation.detail"]').waitFor();assert((await page.locator('[data-control="conversation.detail"]').innerText()).includes("session-two"));assert.equal(await page.locator("tbody tr").count(),2);await page.locator('[data-control="conversations.search"]').fill("C_FIRST");await page.waitForFunction(()=>document.querySelectorAll("tbody tr").length===1);assert.equal(view.state.filters.conversation_search,"C_FIRST");ok("Conversation contexts remain independently inspectable and searchable");
   apply(view,[{type:"navigate",route:"activity"}]);await page.locator('[data-control="activity.results"]').waitFor();assert(!(await page.locator('[data-control="activity.results"]').innerText()).includes("View Ack"));assert((await page.locator('[data-control="activity.results"]').innerText()).includes("Listened without replying"));await page.locator('[data-control="activity.category"]').selectOption("problems");await page.waitForFunction(()=>document.querySelectorAll(".timeline-item").length===1);assert((await page.locator(".timeline-item").innerText()).includes("needs checking"));await page.locator('[data-action="activity.inspect"]').click();await page.getByRole("dialog").waitFor();await page.keyboard.press("Escape");await page.getByRole("dialog").waitFor({state:"hidden"});await page.screenshot({path:path.join(artifacts,"activity.png"),fullPage:true});ok("Activity highlights participation and delivery problems without display noise");
@@ -120,6 +203,18 @@ try{
   assert.equal(await page.locator('[data-control="auth.password"]').count(),0);
   assert(await page.locator('[data-control="nav.dashboard"]').isVisible());
   ok("Late requests from a logged-out session cannot erase a fresh sign-in");
+  config.setup_complete=false;config.enabled=false;config.revision++;
+  await page.evaluate(()=>window.slackConnector.act("refresh"));
+  await page.evaluate(()=>window.slackConnector.command([{type:"set_filter",key:"manual_setup",value:false},{type:"navigate",route:"setup"}]));
+  await page.locator('[data-action="slack.setup.authorize"]').click();await waitIdle();
+  assert((await page.locator('[data-sensitive-display]').innerText()).includes("private-ticket"));
+  await page.locator('[data-control="slack.setup.challenge"]').fill("private-challenge");
+  await page.locator('[data-control="slack.setup.confirm"]').click();
+  await page.locator('[data-control="nav.dashboard"][aria-current="page"]').waitFor();await waitIdle();
+  assert(config.enabled&&config.setup_complete);
+  assert(!JSON.stringify(viewBodies).includes("private-ticket"));assert(!JSON.stringify(viewBodies).includes("private-challenge"));
+  assert(!(await page.locator('body').innerText()).includes("private-ticket"));
+  ok("Guided authorization provisions and starts without token fields; private codes stay out of view state");
   assert.deepEqual(errors,[]);assert(!JSON.stringify(viewBodies).includes("test-password"));assert(!JSON.stringify(viewBodies).includes("one-time-management-secret"));assert(!JSON.stringify(viewBodies).includes("private-agent-value"));ok("No browser errors or secrets in semantic view traffic");
   process.stdout.write(`${passed} browser checks passed. Screenshots: ${artifacts}\n`);
 }finally{await browser.close();await new Promise(r=>server.close(r));}

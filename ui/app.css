@@ -8,3 +8,15 @@
 .session-card{width:min(480px,calc(100% - 32px));color:var(--ink)}
 
 .check .field-help{display:block;margin-top:4px}
+
+/* A single setup page keeps ordinary connection choices close together. */
+.connect-layout{max-width:900px}.connect-layout>.card+.card{margin-top:18px}
+.connect-layout h2{font-size:20px}.connect-layout p{font-size:14px;line-height:1.65}
+.connect-layout .field-help{font-size:12px;line-height:1.65}.connect-layout .endpoint-summary{margin:0 0 24px}
+.connect-layout .form-footer{gap:16px}.connect-layout .form-footer>span{max-width:340px;font-size:12px}
+.connect-layout .field-grid{align-items:start}.setup-create>.field-help{margin-bottom:0}
+.preferences-toggle{display:flex;align-items:center;gap:10px;width:100%;border:0;background:none;text-align:left;padding:10px 0;color:var(--ink)}
+.preferences-toggle svg,.setup-options>p svg{width:18px;height:18px;vertical-align:middle;flex-shrink:0}
+.preferences-toggle .muted{margin-left:auto;font-size:12px}.setup-preferences{padding-top:12px}
+.portrait-access-fields{margin:14px 0 22px;padding:16px;background:#f5f7f2;border-radius:9px}
+@media(max-width:760px){.connect-layout .field-grid{grid-template-columns:1fr}.preferences-toggle{flex-wrap:wrap}.preferences-toggle .muted{margin-left:28px;width:100%}.connect-layout .form-footer{align-items:stretch}.connect-layout .form-footer>button{width:100%}}
