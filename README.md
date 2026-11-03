@@ -66,7 +66,7 @@ Supported Slack attachments now become capability-checked ACP content, and nativ
 ## Connect Slack
 
 1. Open the printed URL and sign in. The installed agent is already selected.
-2. Choose **Authorize Slack**. Copy the short command into a conversation in your
+2. Choose **Connect to Slack**. Copy the short command into a conversation in your
    Slack workspace, approve Slack’s request, and enter its confirmation code here.
 3. The connector creates the agent’s app, obtains its message credentials, checks
    the ACP connection, and starts listening. Image updates use the same authorization.
@@ -80,12 +80,13 @@ and Slack are required. The installed agent remains a standard ACP endpoint.
 
 **Advanced: use existing app credentials** retains the manual manifest/token path.
 Existing connections keep their apps, credentials, and conversations. They can
-optionally authorize Slack from **Connection settings → Agent image** without
-reinstalling the app. See [onboarding](docs/onboarding.md) for the flow and boundaries.
+use **Connect image updates** when image access is missing, without
+reinstalling the app. Healthy connections show status and **Open in Slack**;
+additional controls live under **Settings → Advanced**. See [onboarding](docs/onboarding.md) for the flow and boundaries.
 
 ## Connected conversation context
 
-Enable **Conversation context tools** in Connection settings to give an agent
+Enable **Conversation context tools** under **Settings → Advanced** to give an agent
 read-only navigation between a conversation, its parent messages, and thread
 replies. The connector supplies a small orientation on each turn and standard
 HTTP MCP tools when the ACP agent advertises support. A reachable, trusted HTTPS

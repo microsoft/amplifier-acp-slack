@@ -380,33 +380,120 @@ pub async fn check(c: &Config, home: &Path) -> Result<Value> {
         Ok(json!({"ok":true,"protocol_version":1,"agent_info":init["agentInfo"],"load_session":init["agentCapabilities"]["loadSession"]==true,"authentication":crate::acp_auth::authentication(&init),"note":"ACP handshake and session creation succeeded. No prompt or Slack message was sent."}))
     }).await.context("ACP connection check timed out")?
 }
-/// Optional presentation extension. No session, model prompt, or remote URL fetch.
+const IDENTITY_NAMESPACE: &str = "com.microsoft.amplifier.identity";
+const IDENTITY_GET: &str = "_amplifier/identity/get";
+const IDENTITY_SUBSCRIBE: &str = "_amplifier/identity/subscribe";
+const IDENTITY_CHANGED: &str = "_amplifier/identity/changed";
+
+#[derive(Clone)]
+pub struct IdentityUpdate {
+    pub document: Option<Value>,
+    pub automatic: bool,
+}
+
+async fn identity_client(c: &Config, home: &Path) -> Result<(Client, Value)> {
+    let mut config = c.clone();
+    config.acp.client = Default::default();
+    let mut client = Client::start(&config, home).await?;
+    let init = client.peer.request("initialize", json!({
+        "protocolVersion":1,"clientInfo":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},
+        "clientCapabilities":{},"_meta":{IDENTITY_NAMESPACE:{"mode":"observe"}}
+    })).await?;
+    ensure!(init["protocolVersion"] == 1, "ACP version mismatch");
+    Ok((client, init))
+}
+
+fn has_identity(init: &Value) -> bool {
+    let capability = &init["_meta"][IDENTITY_NAMESPACE];
+    capability["schema"] == "agent-identity/1" && capability["method"] == IDENTITY_GET
+}
+
+/// Optional presentation extension, using the existing ACP launch/credential.
+/// An observation-capable instance avoids starting the agent's model backend.
 pub async fn identity(c: &Config, home: &Path) -> Result<Option<Value>> {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut config = c.clone();
-        config.acp.client = Default::default();
-        let (mut client, init) = Client::connect(&config, home).await?;
-        let capability = &init["_meta"]["com.microsoft.amplifier.identity"];
-        if capability["schema"] != "agent-identity/1"
-            || capability["method"] != "_amplifier/identity/get"
-        {
+        let (mut client, init) = identity_client(c, home).await?;
+        if !has_identity(&init) {
             return Ok(None);
         }
-        Ok(Some(
-            client
-                .peer
-                .request("_amplifier/identity/get", json!({}))
-                .await?,
-        ))
+        Ok(Some(client.peer.request(IDENTITY_GET, json!({})).await?))
     })
     .await
     .context("Agent identity check timed out")?
 }
+
+/// The watch channel coalesces image changes while Slack is rate limited.
+/// Keep a peer open only when it explicitly negotiated observation-only mode;
+/// older or third-party agents get one snapshot and are immediately released.
+pub async fn watch_identity(
+    c: &Config,
+    home: &Path,
+    updates: tokio::sync::watch::Sender<Option<IdentityUpdate>>,
+) -> Result<()> {
+    let (mut client, automatic, doc) = tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut client, init) = identity_client(c, home).await?;
+        if !has_identity(&init) {
+            return Ok((client, false, None));
+        }
+        let capability = &init["_meta"][IDENTITY_NAMESPACE];
+        let automatic = capability["observation_only"] == true
+            && capability["observation"]["subscribe"] == IDENTITY_SUBSCRIBE
+            && capability["observation"]["changed"] == IDENTITY_CHANGED;
+        let doc = client
+            .peer
+            .request(
+                if automatic {
+                    IDENTITY_SUBSCRIBE
+                } else {
+                    IDENTITY_GET
+                },
+                json!({}),
+            )
+            .await?;
+        Ok::<_, anyhow::Error>((client, automatic, Some(doc)))
+    })
+    .await
+    .context("Agent identity observation timed out")??;
+    updates.send_replace(Some(IdentityUpdate {
+        document: doc,
+        automatic,
+    }));
+    if !automatic {
+        return Ok(());
+    }
+    loop {
+        let value = client.peer.read().await?;
+        if value["method"] == IDENTITY_CHANGED && value.get("id").is_none() {
+            updates.send_replace(Some(IdentityUpdate {
+                document: Some(value["params"].clone()),
+                automatic: true,
+            }));
+        } else if value.get("id").is_some() && value.get("method").is_some() {
+            client.peer.reject(&value).await?;
+        }
+    }
+}
 pub async fn decide(c: Config, home: PathBuf, input: Value) -> Result<Decision> {
-    let timeout = c.acp.timeout_seconds;
-    tokio::time::timeout(Duration::from_secs(timeout), turn(&c, &home, &input))
-        .await
-        .context("ACP turn timed out")?
+    let start = tokio::time::Instant::now();
+    let execution = Duration::from_secs(c.acp.timeout_seconds);
+    let human_budget = Duration::from_secs(c.acp.client.permission_timeout_seconds);
+    let job = input["job_id"].as_str().unwrap_or("");
+    let work = turn(&c, &home, &input);
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result=&mut work => return result,
+            _=tokio::time::sleep(Duration::from_millis(100)) => {
+                let elapsed=start.elapsed();
+                let waited=if job.is_empty(){Duration::ZERO}else{
+                    let store=Store::open(&home)?;
+                    Duration::from_millis(crate::permissions::waiting_ms(&store,job,crate::model::now_ms())?.max(0) as u64).min(human_budget)
+                };
+                ensure!(elapsed.saturating_sub(waited) < execution, "ACP execution timed out");
+                ensure!(elapsed < execution + human_budget, "ACP turn exceeded its execution and approval budgets");
+            }
+        }
+    }
 }
 pub(crate) fn endpoint_key(c: &Config) -> String {
     let v = json!({"command":c.acp.command,"args":c.acp.args,"cwd":c.acp.cwd,"env":c.acp.env,"secret_env":c.acp.secret_env});
@@ -416,6 +503,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let ctx = input["conversation"]["context"]
         .as_str()
         .context("Missing conversation")?;
+    let _mode_guard = crate::conversation_mode::turn_lock(home, ctx).await?;
     let endpoint = endpoint_key(c);
     let (mut client, init) = Client::connect(c, home).await?;
     let can_load = init["agentCapabilities"]["loadSession"] == true;
@@ -494,9 +582,9 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     )?;
     let ambient = optional_participation(c, input);
     let instruction = if ambient {
-        "Read the room. Contribute only when useful and timely. Silence is normal; do not acknowledge merely to take a turn or repeat a settled point. Return exactly one final JSON object: {\"decision\":\"speak\",\"text\":\"your contribution (up to 3800 characters)\",\"reason\":\"brief operational reason\"} or {\"decision\":\"pass\",\"reason\":\"brief operational reason\"}. This optional participation convention is a prompt contract, not a special ACP capability."
+        "Read the room. Contribute only when useful and timely. Silence is normal; do not acknowledge merely to take a turn or repeat a settled point. Return exactly one final JSON object: {\"decision\":\"speak\",\"text\":\"your concise contribution\",\"reason\":\"brief operational reason\"} or {\"decision\":\"pass\",\"reason\":\"brief operational reason\"}. This optional participation convention is a prompt contract, not a special ACP capability."
     } else {
-        "You have been addressed directly or in a one-to-one direct message. Respond to the user's message, even if it only needs a brief acknowledgment; the group's optional participation rule does not apply. Reply with the final text to send here (up to 3800 characters), without a decision JSON wrapper. Only your final message will be posted; tool output and intermediate reasoning are private. The sole silence exception is an explicit user request not to reply; then return {\"decision\":\"pass\",\"reason\":\"explicit_silence_request\"}."
+        "You have been addressed directly or in a one-to-one direct message. Respond to the user's message, even if it only needs a brief acknowledgment; the group's optional participation rule does not apply. Reply with the final text to send here, without a decision JSON wrapper. Keep it useful and concise; longer replies are delivered in ordered parts. Only your final message will be posted; tool output and intermediate reasoning are private. The sole silence exception is an explicit user request not to reply; then return {\"decision\":\"pass\",\"reason\":\"explicit_silence_request\"}."
     };
     let delivery_instruction = "Your previous assistant output in the ACP session may be a private draft, not a Slack message. Use response_delivery and the actual Slack transcript to distinguish delivered replies from not_delivered, pending, uncertain or unknown outcomes. Only delivered receipts or the visible Slack message establish that others saw a contribution; an omitted receipt establishes nothing. Do not refer to an unpublished proposal as something already shared or agreed. Reconsider any still-useful point against the current conversation, without automatically reposting it or repeating tool work. Pending or uncertain sends require checking, not a blind resend.";
     let prompt = format!(
@@ -550,8 +638,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 // A cancelled turn must not be retried to produce a direct
                 // reply, nor may an earlier partial message imply completion.
                 return Ok(Decision {
-                    decision: "pass".into(),
-                    text: String::new(),
+                    decision: if ambient { "pass" } else { "speak" }.into(),
+                    text: if ambient {
+                        String::new()
+                    } else {
+                        "The agent stopped before finishing this request. Check the action card above if it needed approval; you can ask it to try again when you are ready. No completion is confirmed.".into()
+                    },
                     reason: "ACP turn cancelled".into(),
                     media: vec![],
                 });
@@ -595,7 +687,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 if media_omitted {
                     d.text = format!(
                         "{}\n\n[Some attachment content could not be delivered in Slack.]",
-                        d.text.chars().take(3700).collect::<String>()
+                        d.text
                     );
                 }
             }
@@ -742,14 +834,11 @@ fn direct_reply(text: &str) -> Result<Decision> {
         );
         return Ok(d);
     }
-    let text = if text.chars().count() > 3800 {
-        format!(
-            "{}\n\n[Reply shortened for Slack]",
-            text.chars().take(3760).collect::<String>()
-        )
-    } else {
-        text.to_owned()
-    };
+    ensure!(
+        text.chars().count() <= crate::model::MAX_REPLY_CHARS,
+        "Agent reply exceeds the configured delivery limit"
+    );
+    let text = text.to_owned();
     Ok(Decision {
         decision: "speak".into(),
         text,
@@ -777,9 +866,139 @@ pub fn optional_participation(c: &Config, input: &Value) -> bool {
     !direct && !mentioned
 }
 
+/// Inspect or change one existing session, without sending a model prompt.
+/// All callbacks are rejected: this owner control never runs workspace tools,
+/// approves work, or starts an interactive provider sign-in in the background.
+pub(crate) async fn conversation_mode(
+    c: &Config,
+    home: &Path,
+    sid: &str,
+    input: &Value,
+    selected: Option<&str>,
+) -> Result<Value> {
+    let (mut client, init) = Client::connect(c, home).await?;
+    ensure!(
+        init["agentCapabilities"]["loadSession"] == true,
+        "This agent does not support reopening saved conversations to inspect permissions."
+    );
+    let mut params = json!({"sessionId":sid,"cwd":c.acp.cwd,"mcpServers":[]});
+    if c.context.enabled {
+        let grant = crate::context::issue_grant(c, home, input)?;
+        params["_meta"] = json!({"io.github.bkrabach.conversation":{
+            "provider_id":format!("slack:{}",c.id),"grant":grant
+        }});
+        if init["agentCapabilities"]["mcpCapabilities"]["http"] == true {
+            let base = c
+                .server
+                .public_url
+                .as_deref()
+                .context("Missing context address")?
+                .trim_end_matches('/');
+            params["mcpServers"] = json!([{"type":"http","name":"slack_conversations",
+                "url":format!("{base}/context/mcp"),"headers":[{"name":"Authorization","value":format!("Bearer {grant}")}]}]);
+        }
+    }
+    let loaded = client
+        .peer
+        .request("session/load", params.clone())
+        .await
+        .context(
+            "The agent could not reopen this conversation. Its permissions were not changed.",
+        )?;
+    let current = mode_details(&loaded)?;
+    let Some(selected) = selected else {
+        return Ok(current);
+    };
+    ensure!(
+        current["supported"] == true,
+        "This agent does not advertise conversation permission modes."
+    );
+    ensure!(
+        current["available_modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == selected),
+        "Choose a mode advertised by this agent."
+    );
+    ensure!(
+        Config::load(home)?.revision == c.revision,
+        "Connector settings changed. Reload before changing conversation permissions."
+    );
+    if current["current_mode_id"] == selected {
+        return Ok(current);
+    };
+    client
+        .peer
+        .request(
+            "session/set_mode",
+            json!({"sessionId":sid,"modeId":selected}),
+        )
+        .await
+        .context("The agent did not accept this conversation's permission change.")?;
+    // Reconnect to verify saved state; some ACP agents reject a second load on
+    // the same connection, and notifications alone need not prove persistence.
+    drop(client);
+    let (mut verify, _) = Client::connect(c,home).await
+        .context("The change was accepted but could not be verified. Reload this conversation's permissions before retrying.")?;
+    let loaded=verify.peer.request("session/load",params).await
+        .context("The change was accepted but could not be verified. Reload this conversation's permissions before retrying.")?;
+    let confirmed = mode_details(&loaded)?;
+    ensure!(
+        confirmed["current_mode_id"] == selected,
+        "The agent did not retain the requested mode. Reload this conversation's permissions before retrying."
+    );
+    Ok(confirmed)
+}
+
+fn mode_details(loaded: &Value) -> Result<Value> {
+    let Some(available) = loaded["modes"]["availableModes"].as_array() else {
+        return Ok(json!({"supported":false,"current_mode_id":null,"available_modes":[]}));
+    };
+    ensure!(
+        !available.is_empty() && available.len() <= 50,
+        "The agent returned invalid permission modes."
+    );
+    let current = loaded["modes"]["currentModeId"]
+        .as_str()
+        .context("The agent did not report its current permission mode.")?;
+    let mut modes = Vec::new();
+    for mode in available {
+        let id = mode["id"]
+            .as_str()
+            .context("The agent returned an invalid permission mode.")?;
+        let name = mode["name"]
+            .as_str()
+            .context("The agent returned an invalid permission mode name.")?;
+        let description = mode["description"].as_str().unwrap_or("");
+        ensure!(
+            !id.is_empty()
+                && id.len() <= 256
+                && name.len() <= 200
+                && description.len() <= 2000
+                && !modes.iter().any(|m: &Value| m["id"] == id),
+            "The agent returned invalid or duplicate permission modes."
+        );
+        modes.push(json!({"id":id,"name":name,"description":description}));
+    }
+    ensure!(
+        modes.iter().any(|m| m["id"] == current),
+        "The agent returned an unknown current permission mode."
+    );
+    Ok(json!({"supported":true,"current_mode_id":current,"available_modes":modes}))
+}
+
 #[cfg(test)]
 mod participation_tests {
     use super::*;
+    #[test]
+    fn direct_reply_retains_complete_long_output_with_an_explicit_total_bound() {
+        let text = "Complete result 🌟 with **formatting**.\n".repeat(300);
+        assert!(text.chars().count() > 3800);
+        assert_eq!(direct_reply(&text).unwrap().text, text.trim());
+        assert!(direct_reply(&"x".repeat(crate::model::MAX_REPLY_CHARS + 1)).is_err());
+    }
+
     #[test]
     fn direct_delivery_overrides_group_silence() {
         let mut c = Config::new("test".into(), "owner".into());

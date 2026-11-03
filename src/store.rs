@@ -40,6 +40,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, context TEXT NOT NULL, trigger TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,updated);
             CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, context TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL, available INTEGER NOT NULL, slack_ts TEXT, note TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS outbox_parts(outbox_id TEXT NOT NULL,part INTEGER NOT NULL,client_id TEXT NOT NULL UNIQUE,text TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'ready',slack_ts TEXT,PRIMARY KEY(outbox_id,part));
             CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS session_bindings(context TEXT PRIMARY KEY, endpoint TEXT NOT NULL, session_id TEXT NOT NULL, resumable INTEGER NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, updated INTEGER NOT NULL);
@@ -272,7 +273,7 @@ impl Store {
              WHERE j.context=?1 AND j.id!=?2 AND j.status NOT IN ('pending','running')
              ORDER BY j.updated DESC,j.rowid DESC LIMIT 12",
         )?;
-        let items = stmt
+        let mut items = stmt
             .query_map(params![context, current_job], |row| {
                 let job_status: String = row.get(2)?;
                 let outgoing: Option<String> = row.get(3)?;
@@ -296,6 +297,21 @@ impl Store {
                 "slack_message_id":row.get::<_,Option<String>>(4)?}))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            let job = item["job_id"].as_str().unwrap_or("");
+            let mut parts=self.db.prepare("SELECT p.part,p.status,p.slack_ts,json_extract(j.trigger,'$.team'),o.channel FROM outbox_parts p JOIN outbox o ON o.id=p.outbox_id JOIN jobs j ON j.id=o.job_id WHERE j.id=?1 ORDER BY p.part")?;
+            let receipts=parts.query_map([job],|r|{
+                let ts:Option<String>=r.get(2)?; let team:String=r.get(3)?;let channel:String=r.get(4)?;
+                Ok(json!({"part":r.get::<_,i64>(0)?+1,"status":r.get::<_,String>(1)?,"slack_message_id":ts,"url":ts.as_ref().map(|ts|format!("https://app.slack.com/client/{team}/{channel}?message_ts={ts}"))}))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            if !receipts.is_empty() {
+                let delivered = receipts.iter().filter(|p| p["status"] == "sent").count();
+                if delivered > 0 && delivered < receipts.len() {
+                    item["status"] = json!("partially_delivered");
+                }
+                item["parts"] = json!(receipts);
+            }
+        }
         Ok(
             json!({"scope":"this_agent_in_this_conversation","bounded":true,
             "observed_at":now_ms(),"items":items}),
@@ -453,12 +469,13 @@ impl Store {
     }
     pub fn claim_outgoing(&mut self, c: &Config) -> Result<Option<Outgoing>> {
         let tx = self.db.transaction()?;
-        let candidate:Option<(Outgoing,String,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.version,o.media FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
+        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
             let raw:String=r.get(7)?;
             let media=serde_json::from_str(&raw).map_err(|e|rusqlite::Error::FromSqlConversionFailure(7,rusqlite::types::Type::Text,Box::new(e)))?;
-            Ok((Outgoing{id:r.get(0)?,channel:r.get(1)?,thread:r.get(2)?,text:r.get(3)?,media},r.get(4)?,r.get(5)?,r.get(6)?))
+            Ok((Outgoing{id:r.get(0)?,channel:r.get(1)?,thread:r.get(2)?,text:r.get(3)?,media},r.get(4)?,r.get(5)?,r.get(6)?,r.get(8)?))
         }).optional()?;
-        let Some((out, trigger, original_version, current_version)) = candidate else {
+        let Some((out, trigger, original_version, current_version, delivered_parts)) = candidate
+        else {
             return Ok(None);
         };
         let trigger: Message = serde_json::from_str(&trigger)?;
@@ -477,7 +494,7 @@ impl Store {
             && source
                 .as_ref()
                 .is_some_and(|s| !s.deleted && c.should_wake(&s.channel, &s.text));
-        let unchanged = original_version == current_version
+        let unchanged = (original_version == current_version || delivered_parts > 0)
             && source
                 .as_ref()
                 .is_some_and(|s| s.revision == trigger.revision);
@@ -496,6 +513,28 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(Some(out))
+    }
+    /// Recheck the human source between multipart sends. New messages and our
+    /// own echoes may advance the context, but edits/deletion invalidate a reply.
+    pub fn outgoing_source_current(&self, id: &str) -> Result<bool> {
+        let raw: String = self.db.query_row(
+            "SELECT j.trigger FROM outbox o JOIN jobs j ON j.id=o.job_id WHERE o.id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let trigger: Message = serde_json::from_str(&raw)?;
+        let source: Option<String> = self
+            .db
+            .query_row(
+                "SELECT body FROM messages WHERE channel=?1 AND ts=?2",
+                params![trigger.channel, trigger.ts],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let source = source
+            .map(|raw| serde_json::from_str::<Message>(&raw))
+            .transpose()?;
+        Ok(source.is_some_and(|m| !m.deleted && m.revision == trigger.revision))
     }
     pub fn delivery(
         &self,

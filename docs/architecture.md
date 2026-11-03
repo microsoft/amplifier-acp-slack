@@ -38,10 +38,27 @@ by this mechanism, because work may already have started.
 
 The durable outbox transaction checks conversation version, source revision,
 deletion, and current channel/participation scope before changing ready to sending.
-Retries perform the same check. State already marked sending at a crash becomes
+After a multipart reply has begun, rate-limit retries still check its source and
+connection scope, but its own delivered parts do not invalidate the remainder.
+State already marked sending at a crash becomes
 uncertain. Work interrupted during an ACP turn is not automatically replayed.
 The conversation projection and service observations are private local data;
 they are not a workspace-wide archive or message search service.
+
+### Long replies
+
+ACP replies remain Markdown. Replies up to 100,000 characters are delivered as
+ordered Slack messages of at most 10,000 characters, preserving their conversation
+or thread. Boundaries prefer complete lines and paragraphs; long code blocks close
+and reopen their fence. Links and inline code are not cut in half. An indivisible
+Markdown element larger than one message is rejected with a delivery diagnostic;
+the complete source remains in the local outbox rather than being silently cut.
+
+Every part has a durable client message ID and receipt. A rate-limit retry skips
+confirmed parts. A network ambiguity or process interruption never automatically
+replays an attempted part. Source edits and revoked connection scope can stop the
+remaining delivery. `response_delivery` includes each part's state and Slack link;
+a partly delivered response is not presented as wholly received.
 
 ### Generated responses and actual delivery
 

@@ -94,6 +94,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/activity", get(activity))
         .route("/api/v1/conversations", get(conversations))
+        .route(
+            "/api/v1/conversations/{id}/mode",
+            get(crate::conversation_mode::get).post(crate::conversation_mode::set),
+        )
         .route("/api/v1/questions", get(questions_get))
         .route("/api/v1/questions/{id}/decision", post(question_decision))
         .route("/api/v1/permissions", get(permissions_get))
@@ -818,7 +822,7 @@ async fn token_delete(
 }
 fn operations() -> Value {
     json!([
-        {"path":"identity","methods":["GET"],"scope":"observe"},{"path":"identity","methods":["POST"],"scope":"admin"},{"path":"identity/credential","methods":["PUT","DELETE"],"scope":"admin"},{"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/slack","methods":["GET","POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
+        {"path":"identity","methods":["GET"],"scope":"observe"},{"path":"identity","methods":["POST"],"scope":"admin"},{"path":"identity/credential","methods":["PUT","DELETE"],"scope":"admin"},{"path":"config","methods":["GET","PUT"],"scope":"admin"},{"path":"status","methods":["GET"],"scope":"observe"},{"path":"lifecycle","methods":["POST"],"scope":"admin"},{"path":"credentials/slack","methods":["POST"],"scope":"admin"},{"path":"check","methods":["POST"],"scope":"admin"},{"path":"manifest","methods":["GET"],"scope":"admin"},{"path":"media/readiness","methods":["POST"],"scope":"admin"},{"path":"media/enable","methods":["POST"],"scope":"admin"},{"path":"setup/slack","methods":["GET","POST"],"scope":"admin"},{"path":"setup/complete","methods":["POST"],"scope":"admin"},{"path":"questions","methods":["GET"],"scope":"admin"},{"path":"questions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"permissions","methods":["GET"],"scope":"admin"},{"path":"permissions/{id}/decision","methods":["POST"],"scope":"admin"},{"path":"activity","methods":["GET"],"scope":"observe"},{"path":"conversations","methods":["GET"],"scope":"observe"},{"path":"conversations/{id}/mode","methods":["GET","POST"],"scope":"admin"},{"path":"secrets","methods":["GET"],"scope":"admin"},{"path":"secrets/{name}","methods":["PUT","DELETE"],"scope":"admin"},{"path":"tokens","methods":["GET","POST"],"scope":"admin"},{"path":"tokens/{id}","methods":["DELETE"],"scope":"admin"},{"path":"views","methods":["GET","POST"],"scope":"ui"},{"path":"views/{id}","methods":["GET"],"scope":"ui"},{"path":"views/{id}/commands","methods":["POST"],"scope":"ui"},{"path":"views/{id}/ack","methods":["POST"],"scope":"ui"}
     ])
 }
 async fn descriptor(
@@ -828,7 +832,7 @@ async fn descriptor(
     auth::check(&state, &headers, "observe", false)?;
     let c = state.instance_config();
     Ok(Json(
-        json!({"api_version":"1","id":c.id,"kind":"conversation-adapter","implementation":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},"namespace":"io.github.bkrabach.acp-slack-adapter","interfaces":{"agent":{"protocol":"ACP","role":"client","transport":"stdio"},"conversation":{"protocol":"Slack Socket Mode","role":"app"},"management":{"protocol":"acp-slack-adapter.management/1","base":"api/v1/","standard_acp":false}},"participation":{"profile":"slack-conversation-decision/1","standard_acp":false,"description":"Optional prompt convention requesting speak/pass decisions through standard ACP prompts"},"context_provider":{"id":format!("slack:{}",c.id),"query":"/context/v1/query","mcp":"/context/mcp","enabled":c.context.enabled,"standard_acp":false,"mcp_transport":"streamable-http","owner_linked":!c.context.owner_slack_user_id.is_empty()},"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"capabilities":["config","credentials","secrets","lifecycle","observations","ui-state","conversation-context","interactive-permissions","local-client-tools","agent-identity/1"],"schema":"api/v1/schema","openapi":"api/v1/openapi.json","ui":{"entry":"./","embed_protocol":"acp-slack-adapter.ui/1","embed_origins":c.server.embed_origins,"authentication":"Owner sign-in or authenticated same-origin proxy; iframe embedding does not grant access"},"operations":operations()}),
+        json!({"api_version":"1","id":c.id,"kind":"conversation-adapter","implementation":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},"namespace":"io.github.bkrabach.acp-slack-adapter","interfaces":{"agent":{"protocol":"ACP","role":"client","transport":"stdio"},"conversation":{"protocol":"Slack Socket Mode","role":"app"},"management":{"protocol":"acp-slack-adapter.management/1","base":"api/v1/","standard_acp":false}},"participation":{"profile":"slack-conversation-decision/1","standard_acp":false,"description":"Optional prompt convention requesting speak/pass decisions through standard ACP prompts"},"context_provider":{"id":format!("slack:{}",c.id),"query":"/context/v1/query","mcp":"/context/mcp","enabled":c.context.enabled,"standard_acp":false,"mcp_transport":"streamable-http","owner_linked":!c.context.owner_slack_user_id.is_empty()},"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"capabilities":["config","credentials","secrets","lifecycle","observations","ui-state","conversation-context","interactive-permissions","conversation-modes","local-client-tools","agent-identity/1"],"schema":"api/v1/schema","openapi":"api/v1/openapi.json","ui":{"entry":"./","embed_protocol":"acp-slack-adapter.ui/1","embed_origins":c.server.embed_origins,"authentication":"Owner sign-in or authenticated same-origin proxy; iframe embedding does not grant access"},"operations":operations()}),
     ))
 }
 async fn schema(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -838,6 +842,7 @@ async fn schema(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiRe
 pub fn openapi_value() -> Value {
     let mut schemas = json!({
         "Config":schemars::schema_for!(Config),
+        "ConversationMode":{"type":"object","additionalProperties":false,"required":["mode_id","expected_session_id"],"properties":{"mode_id":{"type":"string","maxLength":256},"expected_session_id":{"type":"string","maxLength":1024}},"description":"Set one existing idle conversation to an advertised ACP mode. Does not change defaults or other sessions."},
         "PermissionDecision":{"type":"object","additionalProperties":false,"properties":{"option_id":{"type":["string","null"]}},"description":"Select an advertised single-use option, or null to cancel. Uses authenticated administrator authority, never a supplied Slack identity."},
         "ConfigUpdate":{"type":"object","required":["expected_revision","config"],"properties":{"expected_revision":{"type":"integer","minimum":0},"config":{"$ref":"#/components/schemas/Config"}}},
         "SecretWrite":{"type":"object","required":["value"],"properties":{"value":{"type":"string","writeOnly":true}}},
@@ -884,6 +889,7 @@ pub fn openapi_value() -> Value {
                 ("POST", "check") => Some("Check"),
                 ("POST", "setup/slack") => Some("SlackSetup"),
                 ("POST", "permissions/{id}/decision") => Some("PermissionDecision"),
+                ("POST", "conversations/{id}/mode") => Some("ConversationMode"),
                 ("POST", "tokens") => Some("Token"),
                 ("POST", "views") => Some("ViewCreate"),
                 ("POST", "views/{id}/commands") => Some("ViewCommands"),

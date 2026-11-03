@@ -20,3 +20,13 @@
 .preferences-toggle .muted{margin-left:auto;font-size:12px}.setup-preferences{padding-top:12px}
 .portrait-access-fields{margin:14px 0 22px;padding:16px;background:#f5f7f2;border-radius:9px}
 @media(max-width:760px){.connect-layout .field-grid{grid-template-columns:1fr}.preferences-toggle{flex-wrap:wrap}.preferences-toggle .muted{margin-left:28px;width:100%}.connect-layout .form-footer{align-items:stretch}.connect-layout .form-footer>button{width:100%}}
+
+/* Everyday use is one connection card; diagnostics are explicit opt-ins. */
+.connection-home{max-width:900px;margin:0 auto}.connection-card.hero{align-items:flex-start;justify-content:flex-start;gap:22px;padding:32px;background:white}
+.connection-avatar{width:64px;height:64px;flex-shrink:0;border-radius:18px;background:var(--pale);color:var(--teal);display:flex;align-items:center;justify-content:center;font-size:30px;font-weight:650}
+.connection-copy{min-width:0}.connection-copy h1{font-size:32px;margin-bottom:10px}.connection-copy .eyebrow{margin-bottom:10px}.connection-copy p{font-size:15px;margin-bottom:20px}.connection-status{padding:12px 26px}
+.connection-status .health-row{padding:17px 0;gap:14px}.connection-status h3{font-size:14px;margin:0}.connection-status .health-row>span{font-size:13px;color:var(--muted);text-align:right}.connection-tip{margin:24px 4px;color:var(--muted);font-size:13px;line-height:1.75}
+.preferences-card .choices{margin-bottom:12px}.preferences-card>h3{display:none}.preferences-card .field-help{font-size:12px}.preferences-card>.check{margin:16px 0}
+.connection-home .card+.card{margin-top:20px}.connection-home .advanced-content p{max-width:680px}.connection-home .advanced-content .subsection{margin-top:20px}
+.connect-authorization{max-width:720px}.connect-authorization>p{font-size:15px;color:var(--muted)}.connect-authorization form{margin-top:24px;max-width:420px}.authorization-command{display:flex;gap:12px;align-items:center}.authorization-command pre{flex:1;min-width:0}.setup-extras{margin-top:14px}.connect-authorization .button.quiet{margin-top:12px}
+@media(max-width:760px){.connection-card.hero{padding:22px;flex-direction:row;gap:14px}.connection-avatar{width:44px;height:44px;border-radius:12px;font-size:23px}.connection-copy h1{font-size:25px}.connection-copy p{font-size:13px}.connection-status{padding:8px 18px}.connection-status .health-row{flex-wrap:wrap}.connection-status .health-row>div{min-width:110px}.connection-status .health-row>span{max-width:170px}.authorization-command{align-items:stretch;flex-direction:column}.connection-home .field-grid{grid-template-columns:1fr}}

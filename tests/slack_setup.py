@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 spec = importlib.util.spec_from_file_location('setup', Path(__file__).resolve().parents[1]/'scripts/slack_setup.py')
 s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
@@ -20,6 +21,7 @@ class SetupTests(unittest.TestCase):
         self.team = 'TONE'
         self.created = 0
         self.calls = []
+        self.real_cli = s.cli
         self.patcher = patch.object(s, 'cli', self.cli)
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
@@ -60,6 +62,30 @@ class SetupTests(unittest.TestCase):
         s.execute(self.home,'authorize',{})
         with self.assertRaises(s.SetupError):s.execute(self.home,'confirm',{'challenge':'code','team_id':'TONE'})
         self.assertEqual(previous,(self.folder/'auth/credentials.json').read_bytes())
+
+    def test_reopening_authorization_preserves_pending_code(self):
+        first=s.execute(self.home,'authorize',{})
+        second=s.execute(self.home,'authorize',{})
+        self.assertEqual(first,second)
+        self.assertEqual(self.calls,[('auth','login','--no-prompt')])
+
+    def test_successful_confirmation_clears_rejected_authorization_state(self):
+        self.auth()
+        s.write(self.folder/'authorization-health.json',{'state':'needs_attention','message':'Reconnect Slack.'})
+        self.assertEqual(s.execute(self.home,'status',{})['authorization'],'needs_attention')
+        result=self.auth()
+        self.assertEqual(result['authorization'],'managed')
+        self.assertNotIn('authorization_issue',result)
+
+    def test_explicit_rejection_is_distinct_from_transient_cli_failure(self):
+        self.auth()
+        for failure, needs_attention in [('token_revoked private-secret',True),('connection timed out private-secret',False)]:
+            (self.folder/'authorization-health.json').unlink(missing_ok=True)
+            with patch.object(s,'ensure_cli',return_value=Path('/unused')), patch.object(s.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr=failure)):
+                with self.assertRaises(s.SetupError):self.real_cli(self.folder,'auth','list')
+            result=s.execute(self.home,'status',{})
+            self.assertEqual(result['authorization']=='needs_attention',needs_attention)
+            self.assertNotIn('private-secret',json.dumps(result))
 
     def test_expired_and_invalid_challenges_never_reach_cli(self):
         with self.assertRaises(s.SetupError):s.execute(self.home,'confirm',{'challenge':'code'})
