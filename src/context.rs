@@ -593,8 +593,115 @@ fn thread_index(pages: &[&Value]) -> Vec<Value> {
     result
 }
 
+// Stored timestamps are discovery hints only. Content is re-read from Slack
+// after the current audience has been authorized, so deleted or edited replies
+// are never resurrected from our local message cache.
+fn observed_thread_hints(
+    c: &Config,
+    home: &Path,
+    channel: &str,
+) -> ApiResult<Vec<(String, String, String)>> {
+    let store = Store::open(home)?;
+    let mut statement = store.db.prepare(
+        "SELECT json_extract(body,'$.thread'),ts FROM messages
+         WHERE channel=?1 AND json_extract(body,'$.team')=?2
+           AND json_extract(body,'$.thread')!='' AND json_extract(body,'$.deleted')=0
+         ORDER BY ts DESC LIMIT 120",
+    )?;
+    let rows = statement.query_map(params![channel, c.slack.team_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut hints: Vec<(String, String, String)> = Vec::new();
+    let mut counts = Vec::new();
+    for row in rows {
+        let (thread, ts) = row?;
+        if !timestamp(&thread) || !timestamp(&ts) {
+            continue;
+        }
+        if let Some(index) = hints.iter().position(|h| h.0 == thread) {
+            if counts[index] < 4 {
+                hints[index].1 = ts;
+                counts[index] += 1;
+            }
+        } else if hints.len() < 3 {
+            hints.push((thread, ts.clone(), ts));
+            counts.push(1);
+        }
+    }
+    Ok(hints)
+}
+
+async fn recent_thread_activity(
+    c: &Config,
+    home: &Path,
+    slack: &SlackReader,
+    conversation: &Conversation,
+    recent: &Value,
+) -> ApiResult<Value> {
+    let mut hints = observed_thread_hints(c, home, &conversation.id)?;
+    for root in thread_index(&[recent]) {
+        let (Some(thread), Some(latest)) =
+            (root["thread_id"].as_str(), root["latest_reply"].as_str())
+        else {
+            continue;
+        };
+        if let Some(hint) = hints.iter_mut().find(|h| h.0 == thread) {
+            // A newer server-side reply may be beyond our observed event window.
+            if latest > hint.2.as_str() {
+                hint.1 = latest.into();
+                hint.2 = latest.into();
+            }
+        } else {
+            hints.push((thread.into(), latest.into(), latest.into()));
+        }
+    }
+    hints.sort_by(|a, b| b.2.cmp(&a.2));
+    hints.truncate(3);
+    let mut windows = Vec::new();
+    let mut budget: usize = 6000;
+    for (thread, oldest, _) in hints {
+        let page = tokio::time::timeout(Duration::from_secs(2), slack.get("conversations.replies", json!({"channel":conversation.id,"ts":thread,"oldest":oldest,"inclusive":true,"limit":4}))).await.unwrap_or_else(|_| Err(unavailable()));
+        let window = match page {
+            Ok(mut page) => {
+                // Slack can include the parent in addition to the requested reply
+                // limit, even when it predates oldest. Do not let that extra root
+                // displace the newest reply from our bounded window.
+                if let Some(raw) = page["messages"].as_array_mut() {
+                    raw.retain(|message| {
+                        message["ts"]
+                            .as_str()
+                            .is_some_and(|ts| ts != thread && ts >= oldest.as_str())
+                    });
+                }
+                let (mut items, mut truncated) = messages(c, &conversation.id, &page, 4)?;
+                for item in &mut items {
+                    let original = item["text"].as_str().unwrap_or("");
+                    let text: String = original.chars().take(budget.min(1000)).collect();
+                    if text.chars().count() < original.chars().count() {
+                        item["truncated"] = true.into();
+                        truncated = true;
+                    }
+                    budget -= text.chars().count();
+                    item["text"] = text.into();
+                }
+                json!({"thread_id":thread,"url":source_url(c,&conversation.id,Some(&thread)),"messages":items,
+                    "complete":false,"next_cursor":next_cursor(&page),"available":true,
+                    "coverage":{"scope":"recent_thread_window","oldest":oldest,"has_more":page["has_more"]==true,"text_truncated":truncated}})
+            }
+            Err(_) => {
+                json!({"thread_id":thread,"available":false,"complete":false,"messages":[],"notice":"Recent thread activity could not be refreshed; no cached content was substituted."})
+            }
+        };
+        windows.push(window);
+    }
+    Ok(
+        json!({"items":windows,"complete":false,"coverage":{"scope":"recent_known_threads_in_this_conversation","max_threads":3,"max_messages_per_thread":4,"max_text_chars":6000,"unknown_older_threads_included":false}}),
+    )
+}
+
 async fn orientation(
     c: &Config,
+    home: &Path,
     slack: &SlackReader,
     auth: &Authority,
     conversation: &Conversation,
@@ -622,6 +729,9 @@ async fn orientation(
         value.as_object_mut().unwrap().remove("recent_messages");
         value["threads"] = json!(thread_index(&[&recent, &around]));
         value["thread"] = replies;
+    } else {
+        value["recent_thread_activity"] =
+            recent_thread_activity(c, home, slack, conversation, &recent).await?;
     }
     Ok(value)
 }
@@ -653,11 +763,12 @@ async fn execute(c: &Config, home: &Path, request: Query) -> ApiResult<Value> {
     enabled(c)?;
     let slack = SlackReader::new(c, home)?;
     let auth = authority(c, home, &slack, &request.access).await?;
-    dispatch(c, &slack, &auth, request).await
+    dispatch(c, home, &slack, &auth, request).await
 }
 
 async fn dispatch(
     c: &Config,
+    home: &Path,
     slack: &SlackReader,
     auth: &Authority,
     request: Query,
@@ -677,7 +788,7 @@ async fn dispatch(
                 return Err(ApiError::forbidden());
             }
             if request.operation == "orientation" && !thread_only {
-                orientation(c, slack, auth, &conversation, thread).await
+                orientation(c, home, slack, auth, &conversation, thread).await
             } else {
                 let mut page = read_page(
                     c,
@@ -753,6 +864,7 @@ pub async fn orientation_for(c: &Config, home: &Path, input: &Value) -> Result<V
         }
         orientation(
             c,
+            home,
             &slack,
             &auth,
             conversation,
@@ -963,7 +1075,7 @@ pub async fn mcp(
             };
             match tokio::time::timeout(
                 Duration::from_secs(45),
-                dispatch(&config, &slack, &authority, request),
+                dispatch(&config, &state.home, &slack, &authority, request),
             )
             .await
             {

@@ -27,6 +27,7 @@ struct FakeSlack {
     replies: HashMap<(String, String), Vec<Value>>,
     calls: Vec<(String, String)>,
     unavailable_members: bool,
+    unavailable_replies: bool,
 }
 
 fn message(ts: &str, actor: &str, text: &str) -> Value {
@@ -80,6 +81,9 @@ async fn slack_api(
             };
             json!({"ok":true,"channels":selected,"response_metadata":{"next_cursor":next}})
         }
+        "conversations.replies" if fake.unavailable_replies => {
+            json!({"ok":false,"error":"ratelimited"})
+        }
         "conversations.history" | "conversations.replies" => {
             let mut messages = if method == "conversations.history" {
                 fake.history.get(&channel).cloned().unwrap_or_default()
@@ -89,6 +93,18 @@ async fn slack_api(
                     .cloned()
                     .unwrap_or_default()
             };
+            let included_parent =
+                if method == "conversations.replies" && args.contains_key("oldest") {
+                    messages
+                        .iter()
+                        .find(|m| m["ts"].as_str() == args.get("ts").map(String::as_str))
+                        .cloned()
+                } else {
+                    None
+                };
+            if let Some(oldest) = args.get("oldest") {
+                messages.retain(|m| m["ts"].as_str().unwrap_or("") >= oldest.as_str());
+            }
             if let Some(latest) = args.get("latest") {
                 messages.retain(|m| m["ts"].as_str().unwrap_or("") <= latest.as_str());
             }
@@ -103,6 +119,10 @@ async fn slack_api(
             } else {
                 String::new()
             };
+            let mut selected = selected;
+            if let Some(parent) = included_parent {
+                selected.insert(0, parent);
+            }
             json!({"ok":true,"messages":selected,"has_more":more,"response_metadata":{"next_cursor":next}})
         }
         _ => json!({"ok":false,"error":"unknown_method"}),
@@ -1043,4 +1063,237 @@ async fn connector_updates_require_explicit_policy_and_verified_owner_dm() {
         let (_,invalid)=f.call("/context/mcp",Some(&owner),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slack_connector_update_plan","arguments":{"command":"do anything"}}})).await;
         assert_eq!(invalid["error"]["code"], -32602);
     }
+}
+
+fn record_reply(f: &Fixture, channel: &str, thread: &str, ts: &str, text: &str) {
+    let message = acp_slack_adapter::model::Message {
+        team: "TTEST".into(),
+        channel: channel.into(),
+        thread: thread.into(),
+        ts: ts.into(),
+        revision: ts.into(),
+        sender: "UOWNER".into(),
+        bot: false,
+        text: text.into(),
+        deleted: false,
+        files: vec![],
+    };
+    Store::open(f.home.path())
+        .unwrap()
+        .ingest(&format!("{channel}-{ts}"), &message, false)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn channel_catchup_finds_new_outcome_in_old_thread_and_refreshes_cached_text() {
+    let f = Fixture::new().await;
+    let root = "1000.000001";
+    for n in 2..=80 {
+        record_reply(
+            &f,
+            "CSHARED",
+            root,
+            &format!("1001.{n:06}"),
+            "STALE-CACHED-CONTENT",
+        );
+    }
+    record_reply(
+        &f,
+        "DOTHER",
+        "1000.000009",
+        "9999.000001",
+        "PRIVATE-CACHED-CONTENT",
+    );
+    {
+        let mut fake = f.fake.lock().unwrap();
+        fake.history.insert(
+            "CSHARED".into(),
+            (1..=80)
+                .map(|n| {
+                    message(
+                        &format!("1000.{n:06}"),
+                        "UOWNER",
+                        "Older main-channel status: awaiting review",
+                    )
+                })
+                .collect(),
+        );
+        let mut replies: Vec<_> = (2..80)
+            .map(|n| message(&format!("1001.{n:06}"), "UBOT", "Review discussion"))
+            .collect();
+        replies.insert(
+            0,
+            message(root, "UOWNER", "Original task, before the outcome"),
+        );
+        replies.push(message(
+            "1001.000080",
+            "UOWNER",
+            "Completion receipt: reviewed version merged as abc123; accepted.",
+        ));
+        fake.replies
+            .insert(("CSHARED".into(), root.into()), replies);
+    }
+    let grant = f.grant("CSHARED", "", "UPEER", false);
+    let (status, value) = f
+        .query(json!({"operation":"orientation","access":{"mode":"grant","grant":grant}}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(value.to_string().contains("merged as abc123"));
+    assert!(!value.to_string().contains("STALE-CACHED-CONTENT"));
+    assert!(!value.to_string().contains("PRIVATE-CACHED-CONTENT"));
+    assert_eq!(
+        value["recent_thread_activity"]["items"][0]["thread_id"],
+        root
+    );
+    assert_eq!(
+        value["recent_thread_activity"]["items"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(value["recent_thread_activity"]["complete"], false);
+    assert!(
+        value["recent_thread_activity"]["items"][0]["messages"][3]["url"]
+            .as_str()
+            .unwrap()
+            .contains("1001.000080")
+    );
+    assert!(
+        !f.fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(_, channel)| channel == "DOTHER")
+    );
+}
+
+#[tokio::test]
+async fn recent_thread_windows_are_bounded_and_never_replay_deleted_cached_replies() {
+    let f = Fixture::new().await;
+    for room in 1..=6 {
+        let root = format!("1000.{room:06}");
+        for n in 1..=8 {
+            let ts = format!("100{room}.{n:06}");
+            record_reply(&f, "CSHARED", &root, &ts, "DELETED-CACHED-TEXT");
+            if room != 6 {
+                f.fake
+                    .lock()
+                    .unwrap()
+                    .replies
+                    .entry(("CSHARED".into(), root.clone()))
+                    .or_default()
+                    .push(message(&ts, "UBOT", &"x".repeat(5000)));
+            }
+        }
+    }
+    let value = context::orientation_for(
+        &f.state.instance_config(),
+        f.home.path(),
+        &Fixture::input("CSHARED", "", "UPEER", false),
+    )
+    .await
+    .unwrap();
+    let items = value["recent_thread_activity"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(items[0]["messages"].as_array().unwrap().is_empty());
+    assert!(!value.to_string().contains("DELETED-CACHED-TEXT"));
+    let chars: usize = items
+        .iter()
+        .flat_map(|window| window["messages"].as_array().unwrap())
+        .map(|m| m["text"].as_str().unwrap().chars().count())
+        .sum();
+    assert!(chars <= 6000);
+    assert!(
+        items
+            .iter()
+            .all(|window| window["messages"].as_array().unwrap().len() <= 4)
+    );
+    assert_eq!(
+        f.fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(method, _)| method == "conversations.replies")
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn recent_thread_discovery_respects_live_membership_and_thread_only_grants() {
+    let f = Fixture::new().await;
+    record_reply(
+        &f,
+        "CSHARED",
+        "1000.000001",
+        "1001.000001",
+        "Private sibling",
+    );
+    f.state.config.write().unwrap().context.thread_only_grants = true;
+    let value = context::orientation_for(
+        &f.state.instance_config(),
+        f.home.path(),
+        &Fixture::input("CSHARED", "1000.000002", "UPEER", false),
+    )
+    .await
+    .unwrap();
+    assert!(value.get("recent_thread_activity").is_none());
+    f.fake
+        .lock()
+        .unwrap()
+        .members
+        .get_mut("CSHARED")
+        .unwrap()
+        .retain(|member| member != "UPEER");
+    f.fake.lock().unwrap().calls.clear();
+    assert!(
+        context::orientation_for(
+            &f.state.instance_config(),
+            f.home.path(),
+            &Fixture::input("CSHARED", "", "UPEER", false)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        !f.fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(method, _)| method == "conversations.replies")
+    );
+}
+
+#[tokio::test]
+async fn unavailable_thread_refresh_keeps_parent_context_without_cached_reply_text() {
+    let f = Fixture::new().await;
+    record_reply(
+        &f,
+        "CSHARED",
+        "1000.000001",
+        "1001.000001",
+        "CACHED-OUTCOME-MUST-NOT-LEAK",
+    );
+    f.fake.lock().unwrap().unavailable_replies = true;
+    let value = context::orientation_for(
+        &f.state.instance_config(),
+        f.home.path(),
+        &Fixture::input("CSHARED", "", "UPEER", false),
+    )
+    .await
+    .unwrap();
+    assert!(value.to_string().contains("History of CSHARED"));
+    assert!(!value.to_string().contains("CACHED-OUTCOME-MUST-NOT-LEAK"));
+    assert_eq!(
+        value["recent_thread_activity"]["items"][0]["available"],
+        false
+    );
+    assert_eq!(
+        value["recent_thread_activity"]["items"][0]["complete"],
+        false
+    );
 }

@@ -33,6 +33,18 @@ Orientation includes the current conversation and reply destination, participant
 recent parent messages, thread references, coverage and source links. For an older
 thread, a bounded excerpt around the root includes its preceding question where
 available. Prompts direct the agent to retrieve referenced context proactively.
+Channel-level orientation also refreshes up to three recently active threads,
+even when their roots have fallen out of the latest ten parent messages. The
+connector uses timestamps from up to 120 locally observed replies as discovery
+hints, plus recent parent metadata; it fetches the actual content from Slack.
+Each thread window contains at most four replies, with a combined 6,000-character
+text budget and source links. Each refresh has a two-second limit. Deleted or
+unavailable replies are never replaced with cached text, and unavailable windows
+are marked explicitly. These windows are not a complete thread archive; follow
+source links or use the context tools for details. Thread-only grants do not gain
+access to sibling windows. Status reports must consider these newer outcomes
+before repeating an older pending-work summary.
+
 The adapter does not claim to know the user's viewport, selection, unread state
 or unsent draft.
 
@@ -134,8 +146,8 @@ accessible top-level history since its last checkpoint for unseen human messages
 It reuses ordinary ingress, scope checks, coalescing and deduplication. It never
 replays accepted, interrupted, completed or uncertain jobs. Pagination is bounded;
 errors retain the checkpoint, rate limits delay retries, and a first installation
-starts at the present. Thread-only replies outside that history still depend on
-Socket Mode delivery; this is not a complete Slack event archive.
+starts at the present. Known-thread replies are also recovered as described below;
+this is not a complete Slack event archive.
 
 When an endpoint advertises the optional context-snapshot version 1 extension,
 the connector marks its repeated projection with a conversation-specific key and
