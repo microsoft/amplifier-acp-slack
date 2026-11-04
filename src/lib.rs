@@ -24,3 +24,7 @@ pub mod store;
 pub mod updates;
 pub mod views;
 pub mod work_status;
+
+pub mod followup;
+
+pub mod delivery_recovery;

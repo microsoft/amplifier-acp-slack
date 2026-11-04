@@ -336,6 +336,100 @@ impl Slack {
         }
         anyhow::bail!("Too many attachment redirects")
     }
+    pub async fn authorize_continuation(&self, c: &Config, source: &Message) -> Result<()> {
+        ensure!(
+            c.should_wake(&source.channel, &source.text) && !source.bot && !source.deleted,
+            "Continuation scope changed"
+        );
+        let mut cursor = String::new();
+        let mut actor = false;
+        let mut agent = false;
+        for _ in 0..5 {
+            let value = self
+                .call(
+                    "conversations.members",
+                    json!({"channel":source.channel,"limit":200,"cursor":cursor}),
+                    false,
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Continuation audience could not be verified"))?;
+            let members = value["members"]
+                .as_array()
+                .context("Continuation audience unavailable")?;
+            actor |= members.iter().any(|m| m == &source.sender);
+            agent |= members.iter().any(|m| m == &c.slack.bot_user_id);
+            if actor && agent {
+                break;
+            }
+            cursor = value["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or("")
+                .into();
+            if cursor.is_empty() {
+                break;
+            }
+        }
+        ensure!(actor && agent, "Continuation audience changed");
+        let (method, body) = if source.thread.is_empty() {
+            (
+                "conversations.history",
+                json!({"channel":source.channel,"oldest":source.ts,"latest":source.ts,"inclusive":true,"limit":2}),
+            )
+        } else {
+            (
+                "conversations.replies",
+                json!({"channel":source.channel,"ts":source.thread,"oldest":source.ts,"latest":source.ts,"inclusive":true,"limit":2}),
+            )
+        };
+        let value = self
+            .call(method, body, false)
+            .await
+            .map_err(|_| anyhow::anyhow!("Continuation source could not be checked"))?;
+        let current = value["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["ts"] == source.ts)
+            .and_then(|m| normalize(&source.team, &source.channel, m, None))
+            .context("Continuation source is unavailable")?;
+        ensure!(
+            !current.deleted
+                && current.sender == source.sender
+                && current.text == source.text
+                && current.revision == source.revision,
+            "Continuation source changed"
+        );
+        Ok(())
+    }
+    pub async fn find_message(
+        &self,
+        channel: &str,
+        thread: &str,
+        client_id: &str,
+        since: i64,
+    ) -> std::result::Result<Option<String>, ApiError> {
+        let (method, body) = if thread.is_empty() {
+            (
+                "conversations.history",
+                json!({"channel":channel,"oldest":format!("{}",since/1000-2),"limit":100}),
+            )
+        } else {
+            (
+                "conversations.replies",
+                json!({"channel":channel,"ts":thread,"limit":100}),
+            )
+        };
+        let data = self.call(method, body, false).await?;
+        Ok(data["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| {
+                m["client_msg_id"] == client_id || m["metadata"]["event_payload"]["id"] == client_id
+            })
+            .and_then(|m| m["ts"].as_str())
+            .map(str::to_owned))
+    }
     pub async fn recent(&self, m: &Message) -> Result<Vec<Message>> {
         let (method, body) = if m.thread.is_empty() {
             (
@@ -356,7 +450,7 @@ impl Slack {
         for raw in result["messages"].as_array().into_iter().flatten() {
             if matches!(
                 raw["metadata"]["event_type"].as_str(),
-                Some("acp_permission" | "acp_question")
+                Some("acp_permission" | "acp_question" | "acp_work_status")
             ) {
                 continue;
             }
@@ -620,6 +714,11 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
     if !c.allows(channel, e["channel_type"].as_str().unwrap_or("")) {
         return Ok(());
     }
+    if e["metadata"]["event_type"] == "acp_work_status"
+        || e["message"]["metadata"]["event_type"] == "acp_work_status"
+    {
+        return Ok(());
+    }
     let prior = if e["subtype"] == "message_deleted" {
         store.message(channel, e["deleted_ts"].as_str().unwrap_or(""))?
     } else {
@@ -643,7 +742,7 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
     if own
         && matches!(
             e["metadata"]["event_type"].as_str(),
-            Some("acp_permission" | "acp_question")
+            Some("acp_permission" | "acp_question" | "acp_work_status")
         )
     {
         return Ok(());

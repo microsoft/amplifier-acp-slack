@@ -26,3 +26,36 @@ Every setting remains available through the configuration API/CLI. The browser's
 visible control; Save preferences applies it. Existing installations keep the
 human gate until the owner opts in. No agent identity, ACP endpoint, permission,
 channel scope, or secret is changed by this preference.
+
+## Continuing accepted work
+
+A response can end with one private control line:
+
+```text
+SLACK_FOLLOW_UP {"after_seconds":60,"goal":"Verify the already-created artifact"}
+```
+
+This is a prompt convention over ordinary ACP; there is no proprietary ACP method
+or required shared scheduler. The connector strips the line, records one durable
+continuation, and queues it only after the preceding reply is confirmed delivered.
+The original human, conversation, thread, endpoint, and session binding are kept.
+A fresh source-message and Slack membership check runs before the continuation.
+Reading another room does not grant a return route there.
+
+Delays are 5–3600 seconds, at most eight follow-ups in 24 hours per human request,
+with the installation's existing model/reply budgets also enforced. These turns
+are for concrete progress on an accepted goal, not keep-alive chatter. Bot-origin
+messages cannot schedule this chain. New human input, source changes, scope or
+endpoint changes, and expiry supersede/cancel queued work. A new human turn must
+reassess outstanding work rather than silently dropping it. No model is assumed
+to obey this convention perfectly; deterministic protocol tests and actual-model
+behavior are separate evidence.
+
+Completed ACP results are saved before delivery processing. Restart can finish a
+saved response without rerunning its tools. A Slack text send with a lost receipt
+is reconciled against the original client ID, including individually delivered
+multipart chunks. An absent result in bounded history is not proof of non-delivery.
+Unconfirmed media completion or a crashed prompt without a completed result stays
+explicitly unresolved; neither is blindly rerun. The source conversation receives
+a failure/uncertainty notice where Slack still permits writes. This does not claim
+exactly-once external tool execution across arbitrary backend failures.

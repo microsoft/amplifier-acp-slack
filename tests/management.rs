@@ -19,7 +19,7 @@ fn fixture() -> (tempfile::TempDir, Arc<AppState>, String) {
 #[test]
 fn connection_status_cannot_reuse_a_previous_process_socket() {
     let temp = tempfile::tempdir().unwrap();
-    let store = Store::open(temp.path()).unwrap();
+    let mut store = Store::open(temp.path()).unwrap();
     store
         .audit("connection", json!({"state":"connected"}))
         .unwrap();

@@ -14,6 +14,8 @@ class InteractiveSlack(SlackFixture):
     async def api(self,request):
         if request.method=='POST' and request.match_info['method'] in ('chat.postMessage','chat.update','views.open'):
             body=await request.json()
+            if body.get('metadata',{}).get('event_type')=='acp_work_status':
+                return await super().api(request)
             if request.match_info['method']=='views.open':
                 self.views.append(body);return web.json_response({'ok':True,'view':{'id':'Vfixture'}})
             if 'blocks' in body:
