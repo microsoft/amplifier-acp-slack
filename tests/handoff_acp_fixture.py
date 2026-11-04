@@ -8,7 +8,13 @@ def send(v):print(json.dumps({'jsonrpc':'2.0',**v}),flush=True)
 def update(sid,**v):send({'method':'session/update','params':{'sessionId':sid,'update':v}})
 def permission(sid,tool):
  send({'id':tool,'method':'session/request_permission','params':{'sessionId':sid,'toolCall':{'toolCallId':tool,'title':tool,'kind':'execute'},'options':[{'optionId':'yes','name':'Allow once','kind':'allow_once'}]}})
- r=json.loads(sys.stdin.readline());return r['result']
+ # ACP notifications can arrive between a callback and its response. Match
+ # the response ID, as a real JSON-RPC peer does, instead of assuming ordering.
+ for line in sys.stdin:
+  r=json.loads(line)
+  if r.get('id')==tool and 'method' not in r:return r['result']
+  if r.get('method') and 'id' in r:send({'id':r['id'],'result':{}})
+ raise RuntimeError('ACP disconnected while awaiting permission')
 def effect(name):
  p=root/name;p.write_text(str(int(p.read_text())+1) if p.exists() else '1')
 for line in sys.stdin:
