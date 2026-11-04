@@ -2,7 +2,7 @@ use crate::{
     config::{Attention, Config},
     model::{Decision, Message, now_ms},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -248,16 +248,35 @@ impl Store {
         {
             return Ok(false);
         }
-        let old: Option<String> = tx
+        let old: Option<(String, String)> = tx
             .query_row(
-                "SELECT revision FROM messages WHERE channel=?1 AND ts=?2",
+                "SELECT revision,body FROM messages WHERE channel=?1 AND ts=?2",
                 params![m.channel, m.ts],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if old.as_ref().is_some_and(|v| v >= &m.revision) {
+        if old.as_ref().is_some_and(|v| v.0 >= m.revision) {
             tx.commit()?;
             return Ok(false);
+        }
+        // Slack emits message_changed for thread bookkeeping (reply count,
+        // latest reply, etc.). Only a material change to our message projection
+        // changes authorization/history; keep the source revision stable otherwise.
+        if let Some((_, body)) = &old {
+            let mut before: Value = serde_json::from_str(body)?;
+            let mut after = serde_json::to_value(m)?;
+            before
+                .as_object_mut()
+                .context("Invalid stored message")?
+                .remove("revision");
+            after
+                .as_object_mut()
+                .context("Invalid message")?
+                .remove("revision");
+            if before == after {
+                tx.commit()?;
+                return Ok(false);
+            }
         }
         let ctx = m.context();
         tx.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5) ON CONFLICT(channel,ts) DO UPDATE SET context=excluded.context,revision=excluded.revision,body=excluded.body",params![m.channel,m.ts,ctx,m.revision,serde_json::to_string(m)?])?;
