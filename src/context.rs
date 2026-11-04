@@ -662,7 +662,17 @@ async fn recent_thread_activity(
     for (thread, oldest, _) in hints {
         let page = tokio::time::timeout(Duration::from_secs(2), slack.get("conversations.replies", json!({"channel":conversation.id,"ts":thread,"oldest":oldest,"inclusive":true,"limit":4}))).await.unwrap_or_else(|_| Err(unavailable()));
         let window = match page {
-            Ok(page) => {
+            Ok(mut page) => {
+                // Slack can include the parent in addition to the requested reply
+                // limit, even when it predates oldest. Do not let that extra root
+                // displace the newest reply from our bounded window.
+                if let Some(raw) = page["messages"].as_array_mut() {
+                    raw.retain(|message| {
+                        message["ts"]
+                            .as_str()
+                            .is_some_and(|ts| ts != thread && ts >= oldest.as_str())
+                    });
+                }
                 let (mut items, mut truncated) = messages(c, &conversation.id, &page, 4)?;
                 for item in &mut items {
                     let original = item["text"].as_str().unwrap_or("");

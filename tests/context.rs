@@ -93,6 +93,15 @@ async fn slack_api(
                     .cloned()
                     .unwrap_or_default()
             };
+            let included_parent =
+                if method == "conversations.replies" && args.contains_key("oldest") {
+                    messages
+                        .iter()
+                        .find(|m| m["ts"].as_str() == args.get("ts").map(String::as_str))
+                        .cloned()
+                } else {
+                    None
+                };
             if let Some(oldest) = args.get("oldest") {
                 messages.retain(|m| m["ts"].as_str().unwrap_or("") >= oldest.as_str());
             }
@@ -110,6 +119,10 @@ async fn slack_api(
             } else {
                 String::new()
             };
+            let mut selected = selected;
+            if let Some(parent) = included_parent {
+                selected.insert(0, parent);
+            }
             json!({"ok":true,"messages":selected,"has_more":more,"response_metadata":{"next_cursor":next}})
         }
         _ => json!({"ok":false,"error":"unknown_method"}),
@@ -1108,6 +1121,10 @@ async fn channel_catchup_finds_new_outcome_in_old_thread_and_refreshes_cached_te
         let mut replies: Vec<_> = (2..80)
             .map(|n| message(&format!("1001.{n:06}"), "UBOT", "Review discussion"))
             .collect();
+        replies.insert(
+            0,
+            message(root, "UOWNER", "Original task, before the outcome"),
+        );
         replies.push(message(
             "1001.000080",
             "UOWNER",
