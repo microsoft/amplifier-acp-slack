@@ -571,6 +571,43 @@ mod tests {
         );
     }
     #[test]
+    fn pending_human_decision_survives_peer_reply_and_preserves_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut c = Config::new("Test".into(), "owner".into());
+        c.enabled = true;
+        c.slack.team_id = "Ttest".into();
+        c.attention.settle_ms = 0;
+        let source = crate::model::Message {
+            team: "Ttest".into(),
+            channel: "Ctest".into(),
+            thread: "".into(),
+            ts: "123.0".into(),
+            revision: "123.0".into(),
+            sender: "Uhuman".into(),
+            bot: false,
+            text: "Build the assigned result".into(),
+            deleted: false,
+            files: vec![],
+        };
+        store.ingest("human", &source, true).unwrap();
+        let job = store.claim(&c.attention).unwrap().unwrap();
+        store.db.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,channel,thread,body) VALUES('approval',?1,?2,'session','Uhuman',?3,?4,?5,'pending','Ctest','',?6)", params![job.id, job.context, c.revision as i64, now_ms(), now_ms()+60000, json!({"options":[{"optionId":"once","kind":"allow_once"}]}).to_string()]).unwrap();
+        let mut peer = source.clone();
+        peer.ts = "124.0".into();
+        peer.revision = peer.ts.clone();
+        peer.sender = "Ureviewer".into();
+        peer.bot = true;
+        peer.text = "I will review your result".into();
+        store.ingest("peer", &peer, true).unwrap();
+        expire(&store, &c).unwrap();
+        assert!(live(&store, &c, "approval").unwrap());
+        resolve(&store, &c, "approval", Some("once"), "owner", None).unwrap();
+        let value = current(&store, "approval").unwrap().unwrap();
+        assert_eq!(value["status"], "approved");
+        assert_eq!(value["approver"], "Uhuman");
+    }
+    #[test]
     fn human_wait_is_union_of_bounded_intervals_for_only_this_job() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
