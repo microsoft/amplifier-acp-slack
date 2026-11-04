@@ -45,3 +45,5 @@ Run `tests/work_status.py` for native lifecycle, permission, cancellation, and
 recovery checks, and `tests/scoped_work.py` for fallback visibility, quiet
 participation, simultaneous tool activity, lost delivery receipts, and bounded continuations. Both use actual
 adapter and independent ACP processes with loopback Slack; neither posts to Slack.
+
+This adapter follows the shared [ACP activity contract](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/adapter-activity.v1-candidate.md). Activity meaning originates with the ACP producer; this adapter owns Slack placement, aggregation, fallback and cleanup.
