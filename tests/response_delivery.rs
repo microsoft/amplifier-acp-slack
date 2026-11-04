@@ -153,3 +153,147 @@ fn pending_and_uncertain_are_not_treated_as_failed_or_automatically_resent() {
             .is_empty()
     );
 }
+
+#[test]
+fn bot_traffic_does_not_discard_a_completed_turn_but_source_edits_still_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let a = attention();
+    let first = message("1.000001");
+    s.ingest("first", &first, true).unwrap();
+    let claimed = s.claim(&a).unwrap().unwrap();
+    let job = s.prepare(claimed).unwrap();
+    let mut bot = message("2.000001");
+    bot.bot = true;
+    bot.sender = "Uagent".into();
+    s.ingest("bot", &bot, false).unwrap();
+    s.finish(&job, speak(), &a).unwrap();
+    let out = s.claim_outgoing(&config()).unwrap().unwrap();
+    assert_eq!(out.text, "PRIVATE DRAFT");
+    s.delivery(&out.id, "sent", Some("3.000001"), "", 0)
+        .unwrap();
+    s.ingest("third", &message("4.000001"), true).unwrap();
+    let job = s.claim(&a).unwrap().unwrap();
+    bot.revision = "5.000001".into();
+    bot.text = "Corrected source".into();
+    s.ingest("edit", &bot, false).unwrap();
+    s.finish(&job, speak(), &a).unwrap();
+    assert!(s.claim_outgoing(&config()).unwrap().is_none());
+}
+
+#[test]
+fn completed_replies_wait_durably_without_rerunning_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let mut c = config();
+    c.attention = attention();
+    c.attention.minimum_reply_interval_seconds = 60;
+    s.ingest("one", &message("1.000001"), true).unwrap();
+    let j = s.claim(&c.attention).unwrap().unwrap();
+    s.finish(&j, speak(), &c.attention).unwrap();
+    let out = s.claim_outgoing(&c).unwrap().unwrap();
+    s.delivery(&out.id, "sent", Some("2.000001"), "", 0)
+        .unwrap();
+    let mut bot = message("3.000001");
+    bot.bot = true;
+    s.ingest("two", &bot, true).unwrap();
+    let j = s.claim(&c.attention).unwrap().unwrap();
+    s.finish(&j, speak(), &c.attention).unwrap();
+    assert!(s.claim_outgoing(&c).unwrap().is_none());
+    let facts = s.response_delivery(&j.context, "future").unwrap();
+    assert_eq!(receipt(&facts, &j.id)["status"], "pending");
+    assert!(receipt(&facts, &j.id)["retry_at"].is_number());
+    drop(s);
+    let mut s = Store::open(dir.path()).unwrap();
+    s.recover().unwrap();
+    s.db.execute(
+        "UPDATE outbox SET attempted=attempted-61000 WHERE attempted>0",
+        [],
+    )
+    .unwrap();
+    s.db.execute("UPDATE outbox SET available=0 WHERE status='ready'", [])
+        .unwrap();
+    let resumed = s.claim_outgoing(&c).unwrap().unwrap();
+    assert_eq!(resumed.text, "PRIVATE DRAFT");
+    assert!(s.claim(&c.attention).unwrap().is_none());
+}
+
+#[test]
+fn hourly_model_capacity_defers_the_same_job_instead_of_losing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let mut a = attention();
+    a.max_decisions_per_agent_per_hour = 1;
+    s.ingest("one", &message("1.000001"), true).unwrap();
+    let j = s.claim(&a).unwrap().unwrap();
+    s.finish(
+        &j,
+        Ok(Decision {
+            decision: "pass".into(),
+            text: String::new(),
+            reason: "done".into(),
+            media: vec![],
+        }),
+        &a,
+    )
+    .unwrap();
+    s.ingest("two", &message("2.000001"), true).unwrap();
+    assert!(s.claim(&a).unwrap().is_none());
+    let (id, available): (String, i64) =
+        s.db.query_row(
+            "SELECT id,available FROM jobs WHERE status='pending'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(available > acp_slack_adapter::model::now_ms());
+    drop(s);
+    let mut s = Store::open(dir.path()).unwrap();
+    s.recover().unwrap();
+    assert!(s.claim(&a).unwrap().is_none());
+    s.db.execute(
+        "UPDATE jobs SET updated=updated-3601000 WHERE status!='pending'",
+        [],
+    )
+    .unwrap();
+    s.db.execute("UPDATE jobs SET available=0 WHERE status='pending'", [])
+        .unwrap();
+    assert_eq!(s.claim(&a).unwrap().unwrap().id, id);
+}
+
+#[test]
+fn bot_continuation_is_owner_opt_in_and_keeps_hourly_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let mut c = config();
+    c.attention = attention();
+    c.attention.max_bot_replies_without_human = 1;
+    let mut bot = message("1.000001");
+    bot.bot = true;
+    s.ingest("one", &bot, true).unwrap();
+    let j = s.claim(&c.attention).unwrap().unwrap();
+    s.finish(&j, speak(), &c.attention).unwrap();
+    let out = s.claim_outgoing(&c).unwrap().unwrap();
+    s.delivery(&out.id, "sent", Some("2.000001"), "", 0)
+        .unwrap();
+    bot.ts = "3.000001".into();
+    bot.revision = bot.ts.clone();
+    s.ingest("two", &bot, true).unwrap();
+    let j = s.claim(&c.attention).unwrap().unwrap();
+    s.finish(&j, speak(), &c.attention).unwrap();
+    assert!(s.claim_outgoing(&c).unwrap().is_none());
+    s.db.execute(
+        "UPDATE outbox SET attempted=attempted-61000 WHERE attempted>0",
+        [],
+    )
+    .unwrap();
+    s.db.execute("UPDATE outbox SET available=0", []).unwrap();
+    assert!(s.claim_outgoing(&c).unwrap().is_none()); // legacy human gate still applies
+    c.attention.bot_exchange_cooldown_seconds = 60;
+    c.attention.max_replies_per_context_per_hour = 1;
+    s.db.execute("UPDATE outbox SET available=0", []).unwrap();
+    assert!(s.claim_outgoing(&c).unwrap().is_none()); // opting in never bypasses hourly budget
+    c.attention.max_replies_per_context_per_hour = 30;
+    s.db.execute("UPDATE outbox SET available=0", []).unwrap();
+    assert!(s.claim_outgoing(&c).unwrap().is_some());
+}
