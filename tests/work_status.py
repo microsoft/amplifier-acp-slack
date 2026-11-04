@@ -20,12 +20,12 @@ class StatusSlack(InteractiveSlack):
    self.delivery_started=True;await self.delivery_gate.wait()
   return await super().api(request)
 
-async def main():
+async def main(host_attention=False):
  f=StatusSlack();app=web.Application();app.router.add_post('/api/{method}',f.api);app.router.add_get('/api/{method}',f.api);app.router.add_get('/socket/{name}',f.socket)
  runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start();f.port=site._server.sockets[0].getsockname()[1]
  with tempfile.TemporaryDirectory(prefix='acp-status-') as temp:
   home=Path(temp);(home/'secrets').mkdir();home.chmod(0o700)
-  config={'schema':1,'id':str(uuid.uuid4()),'label':'alpha','revision':1,'enabled':True,'setup_complete':True,'participation':'ambient','acp':{'command':sys.executable,'args':[str(ROOT/'tests/work_status_acp_fixture.py')],'cwd':str(home),'timeout_seconds':60,'client':{'approvals_required':True,'permission_timeout_seconds':20}},'slack':{'team_id':'Ttest','app_id':'Aalpha','bot_user_id':'Ualpha','bot_id':'Balpha','channels':[],'allow_dms':True,'api_base':f'http://127.0.0.1:{f.port}/api/','loopback_test':True},'attention':{'settle_ms':10,'minimum_reply_interval_seconds':0,'max_replies_per_agent_per_hour':100,'max_decisions_per_agent_per_hour':100},'server':{'bind':'127.0.0.1','port':0,'owner':getpass.getuser(),'pam_service':'acp-slack-adapter','public_url':None,'embed_origins':[]}}
+  config={'schema':1,'id':str(uuid.uuid4()),'label':'alpha','revision':1,'enabled':True,'setup_complete':True,'participation':'ambient','acp':{'command':sys.executable,'args':[str(ROOT/'tests/work_status_acp_fixture.py')]+(['--host-attention'] if host_attention else []),'cwd':str(home),'timeout_seconds':60,'client':{'approvals_required':True,'permission_timeout_seconds':20}},'slack':{'team_id':'Ttest','app_id':'Aalpha','bot_user_id':'Ualpha','bot_id':'Balpha','channels':[],'allow_dms':True,'api_base':f'http://127.0.0.1:{f.port}/api/','loopback_test':True},'attention':{'settle_ms':10,'minimum_reply_interval_seconds':0,'max_replies_per_agent_per_hour':100,'max_decisions_per_agent_per_hour':100},'server':{'bind':'127.0.0.1','port':0,'owner':getpass.getuser(),'pam_service':'acp-slack-adapter','public_url':None,'embed_origins':[]}}
   private_json(home/'adapter.json',config);private_json(home/'secrets/slack.json',{'app_token':'test-alpha-app','bot_token':'test-alpha'})
   log=(home/'service.log').open('wb');process=None;checks=[]
   def passed(text):checks.append(text);print('PASS '+text,flush=True)
@@ -58,6 +58,29 @@ async def main():
    passed('Ambient silent assessments emit no work indicator')
    m=await f.send('Cthread','<@Ualpha> Please help',thread='1800000000.123456');await state('Cthread','active');assert all(s['thread_ts']=='1800000000.123456' for s in f.statuses if s['channel_id']=='Cthread')
    passed('Addressed channel work uses the existing thread root')
+   # Quiet evaluation stays invisible; an accepted ambient response is observable
+   # in precisely the destination receiving the response, including top-level posts.
+   for channel,thread in [('Cengage','1800000000.123456'),('Ctop','')]:
+    before=len(f.statuses)
+    await f.send(channel,'Please contribute detailed work',thread=thread)
+    await until(lambda:any(i.get('deleted') for i in f.indicators if i['channel']==channel),'ambient indicator cleanup')
+    updates=[u for u in f.indicator_updates if u['channel']==channel]
+    assert any(u['text']=='Running · Run unit tests (workspace_run)' for u in updates),updates
+    assert all(u.get('thread_ts','')==thread for u in updates),updates
+    if thread:await state(channel,'active')
+    else:assert len(f.statuses)==before
+    assert any(p['channel']==channel and p.get('thread_ts','')==thread for p in f.posts)
+   passed('Accepted ambient turns show scoped tool activity and clean up after delivery, with and without host attention')
+   before=(len(f.statuses),len(f.indicators));await f.send('Chold','People are talking about detailed work')
+   await until(lambda:bool(rows(home,"SELECT id FROM jobs WHERE status='pass' AND json_extract(trigger,'$.channel')='Chold'")),'quiet hold')
+   await asyncio.sleep(.3);assert before==(len(f.statuses),len(f.indicators))
+   passed('Held ambient events never publish temporary messages or native status')
+   if host_attention:
+    before=(len(f.statuses),len(f.indicators));await f.send('Caddressedhold','<@Ualpha> Please stay quiet')
+    await until(lambda:bool(rows(home,"SELECT id FROM jobs WHERE status='pass' AND json_extract(trigger,'$.channel')='Caddressedhold'")),'addressed hold')
+    await asyncio.sleep(.3);assert before==(len(f.statuses),len(f.indicators))
+    passed('A held host offer stays invisible even when the message mentions the agent')
+
    await f.send('Dtools','Please show detailed work');await state('Dtools','active')
    await until(lambda:any(i.get('deleted') for i in f.indicators if i['channel']=='Dtools'),'detailed line cleared')
    labels=[u['text'] for u in f.indicator_updates if u['channel']=='Dtools']
@@ -97,4 +120,4 @@ async def main():
   except Exception:
    print((home/'service.log').read_text(),file=sys.stderr);print(f.statuses,file=sys.stderr);raise
   finally:await stop();log.close();await runner.cleanup()
-if __name__=='__main__':asyncio.run(main())
+if __name__=='__main__':asyncio.run(main('--host-attention' in sys.argv))

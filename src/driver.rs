@@ -684,6 +684,11 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             rusqlite::params![job, crate::model::now_ms()],
         )?;
     }
+    // Track only committed response work. This covers direct replies, accepted
+    // continuations, and current host engage offers; quiet evaluation stays hidden.
+    if !deciding {
+        crate::work_status::track_input(home, input)?;
+    }
     let mut params = json!({"sessionId":sid,"prompt":blocks});
     if let Some(offer) = &attention_offer {
         params["_meta"] = json!({crate::attention::META:offer});
