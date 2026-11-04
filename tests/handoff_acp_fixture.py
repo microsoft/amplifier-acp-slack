@@ -12,7 +12,9 @@ def permission(sid,tool):
  # the response ID, as a real JSON-RPC peer does, instead of assuming ordering.
  for line in sys.stdin:
   r=json.loads(line)
-  if r.get('id')==tool and 'method' not in r:return r['result']
+  if r.get('id')==tool and 'method' not in r:
+   if 'error' in r:raise RuntimeError('Permission callback failed: '+json.dumps(r['error']))
+   return r['result']
   if r.get('method') and 'id' in r:send({'id':r['id'],'result':{}})
  raise RuntimeError('ACP disconnected while awaiting permission')
 def effect(name):
