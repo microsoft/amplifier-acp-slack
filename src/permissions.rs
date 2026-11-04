@@ -69,6 +69,8 @@ fn current(store: &Store, id: &str) -> Result<Option<Value>> {
 }
 /// Match the callback's trusted turn input to the current persisted source.
 /// No caller-supplied identity can replace the sender recorded by Slack ingress.
+/// Peer-agent replies do not revoke an active turn. A newer human instruction,
+/// source edit/removal, stopped job, or configuration change still invalidates it.
 pub(crate) fn live_turn(db: &rusqlite::Connection, c: &Config, input: &Value) -> Result<bool> {
     if !c.enabled {
         return Ok(false);
@@ -80,7 +82,7 @@ pub(crate) fn live_turn(db: &rusqlite::Connection, c: &Config, input: &Value) ->
         return Ok(false);
     };
     let source: Option<String> = db.query_row(
-        "SELECT j.trigger FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND j.context=?2 AND m.context=j.context AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted') AND json_extract(m.body,'$.sender')=json_extract(j.trigger,'$.sender') AND json_extract(m.body,'$.bot')=json_extract(j.trigger,'$.bot')",
+        "SELECT j.trigger FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND j.context=?2 AND m.context=j.context AND j.status='running' AND j.version>=x.human_version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted') AND json_extract(m.body,'$.sender')=json_extract(j.trigger,'$.sender') AND json_extract(m.body,'$.bot')=json_extract(j.trigger,'$.bot')",
         params![job,ctx], |r| r.get(0)).optional()?;
     let Some(source) = source else {
         return Ok(false);
@@ -106,7 +108,7 @@ fn prune(store: &Store) -> Result<()> {
     Ok(())
 }
 fn live(store: &Store, c: &Config, id: &str) -> Result<bool> {
-    Ok(c.enabled && store.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions p JOIN jobs j ON j.id=p.job_id JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE p.id=?1 AND p.config_revision=?2 AND p.context=j.context AND m.context=j.context AND p.channel=m.channel AND p.thread=json_extract(j.trigger,'$.thread') AND p.approver=json_extract(j.trigger,'$.sender') AND NOT json_extract(j.trigger,'$.bot') AND json_extract(m.body,'$.sender')=p.approver AND NOT json_extract(m.body,'$.bot') AND j.status='running' AND j.version=x.version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))", params![id,c.revision as i64], |r|r.get(0))?)
+    Ok(c.enabled && store.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions p JOIN jobs j ON j.id=p.job_id JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE p.id=?1 AND p.config_revision=?2 AND p.context=j.context AND m.context=j.context AND p.channel=m.channel AND p.thread=json_extract(j.trigger,'$.thread') AND p.approver=json_extract(j.trigger,'$.sender') AND NOT json_extract(j.trigger,'$.bot') AND json_extract(m.body,'$.sender')=p.approver AND NOT json_extract(m.body,'$.bot') AND j.status='running' AND j.version>=x.human_version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))", params![id,c.revision as i64], |r|r.get(0))?)
 }
 pub fn cancel_all(store: &Store, reason: &str) -> Result<()> {
     let changed = store.db.execute(
@@ -187,7 +189,7 @@ pub fn resolve(
         None => "cancelled",
         _ => anyhow::bail!("Persistent grants are not supported by this connector"),
     };
-    let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4,closed_at=?5 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version=x.version)", params![id,status,option,actor,now_ms()])?;
+    let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4,closed_at=?5 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version>=x.human_version)", params![id,status,option,actor,now_ms()])?;
     ensure!(n == 1, "Permission changed before the decision was applied");
     store.audit(
         "permission_resolved",
@@ -567,6 +569,43 @@ mod tests {
                 .0
                 .contains("fresh request")
         );
+    }
+    #[test]
+    fn pending_human_decision_survives_peer_reply_and_preserves_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut c = Config::new("Test".into(), "owner".into());
+        c.enabled = true;
+        c.slack.team_id = "Ttest".into();
+        c.attention.settle_ms = 0;
+        let source = crate::model::Message {
+            team: "Ttest".into(),
+            channel: "Ctest".into(),
+            thread: "".into(),
+            ts: "123.0".into(),
+            revision: "123.0".into(),
+            sender: "Uhuman".into(),
+            bot: false,
+            text: "Build the assigned result".into(),
+            deleted: false,
+            files: vec![],
+        };
+        store.ingest("human", &source, true).unwrap();
+        let job = store.claim(&c.attention).unwrap().unwrap();
+        store.db.execute("INSERT INTO permissions(id,job_id,context,session_id,approver,config_revision,created,expires,status,channel,thread,body) VALUES('approval',?1,?2,'session','Uhuman',?3,?4,?5,'pending','Ctest','',?6)", params![job.id, job.context, c.revision as i64, now_ms(), now_ms()+60000, json!({"options":[{"optionId":"once","kind":"allow_once"}]}).to_string()]).unwrap();
+        let mut peer = source.clone();
+        peer.ts = "124.0".into();
+        peer.revision = peer.ts.clone();
+        peer.sender = "Ureviewer".into();
+        peer.bot = true;
+        peer.text = "I will review your result".into();
+        store.ingest("peer", &peer, true).unwrap();
+        expire(&store, &c).unwrap();
+        assert!(live(&store, &c, "approval").unwrap());
+        resolve(&store, &c, "approval", Some("once"), "owner", None).unwrap();
+        let value = current(&store, "approval").unwrap().unwrap();
+        assert_eq!(value["status"], "approved");
+        assert_eq!(value["approver"], "Uhuman");
     }
     #[test]
     fn human_wait_is_union_of_bounded_intervals_for_only_this_job() {
