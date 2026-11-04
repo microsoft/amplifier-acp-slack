@@ -222,7 +222,22 @@ async fn unadvertised_stale_busy_and_unauthorized_changes_fail_before_setting_mo
                 .join(auth::digest(&f.context)),
         )
         .unwrap();
-    lock.try_lock_exclusive().unwrap();
+    // Endpoint teardown is asynchronous; a fork from another parallel test
+    // can briefly retain this descriptor until exec/exit. Acquire our synthetic
+    // busy guard before testing that the management request is rejected.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("Could not acquire test lock: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Previous mode request did not release its lock");
     assert_eq!(
         f.call("GET", &f.context, json!(null), Some(&token)).await.0,
         StatusCode::CONFLICT
