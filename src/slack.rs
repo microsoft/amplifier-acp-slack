@@ -53,6 +53,7 @@ impl Slack {
         };
         let url = format!("{}{method}", self.base);
         let request = if [
+            "users.conversations",
             "conversations.history",
             "conversations.replies",
             "conversations.members",
@@ -559,10 +560,28 @@ impl Slack {
             .unwrap()
             .audit("connection", json!({"state":"connecting"}))?;
         let mut verified_hello = false;
+        let mut recovery = tokio::task::JoinSet::new();
+        let mut recovered = false;
+        let mut retry_at = tokio::time::Instant::now();
+        let since = crate::reconnect::checkpoint(&store.lock().unwrap())?;
         let mut ping = tokio::time::interval(std::time::Duration::from_secs(20));
         loop {
             tokio::select! {
-                _=ping.tick()=>ws.send(Ws::Ping(Vec::new().into())).await?,
+                _=ping.tick()=>{
+                    ws.send(Ws::Ping(Vec::new().into())).await?;
+                    if recovered { crate::reconnect::advance(&store.lock().unwrap(),crate::model::now_ms())?; }
+                    else if verified_hello && recovery.is_empty() && tokio::time::Instant::now()>=retry_at {
+                        let (client,c,s)=(self.clone(),c.clone(),store.clone());
+                        recovery.spawn(async move {crate::reconnect::recover(&client,&c,s,since).await});
+                    }
+                },
+                Some(result)=recovery.join_next(),if !recovery.is_empty()=>{
+                    let delay=result.as_ref().ok().and_then(|r|r.as_ref().err()).and_then(|e|e.downcast_ref::<crate::reconnect::Retry>()).map_or(60,|r|r.0);
+                    retry_at=tokio::time::Instant::now()+std::time::Duration::from_secs(delay);
+                    recovered=matches!(result,Ok(Ok(_)));
+                    if !recovered {store.lock().unwrap().audit("reconnect_recovery_incomplete",json!({"reason":"History recovery incomplete; checkpoint retained for retry"}))?;}
+                    notify.notify_one();
+                },
                 frame=ws.next()=>{
                     let Some(frame)=frame else {return Ok(())};
                     match frame? {
@@ -572,6 +591,8 @@ impl Slack {
                             if envelope["type"]=="hello" {
                                 ensure!(envelope["connection_info"]["app_id"]==c.slack.app_id,"Socket token belongs to a different Slack app");
                                 verified_hello=true;
+                                let (client,c,s)=(self.clone(),c.clone(),store.clone());
+                                recovery.spawn(async move {crate::reconnect::recover(&client,&c,s,since).await});
                                 store.lock().unwrap().audit("connection",json!({"state":"connected"}))?;
                             }
                             if envelope["type"]=="events_api" {
@@ -714,9 +735,28 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
     if !c.allows(channel, e["channel_type"].as_str().unwrap_or("")) {
         return Ok(());
     }
-    if e["metadata"]["event_type"] == "acp_work_status"
+    let activity_ts = e["deleted_ts"]
+        .as_str()
+        .or_else(|| e["message"]["ts"].as_str())
+        .or_else(|| e["ts"].as_str())
+        .unwrap_or("");
+    let known_activity: bool = store.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ignored_activity WHERE channel=?1 AND ts=?2)",
+        rusqlite::params![channel, activity_ts],
+        |r| r.get(0),
+    )?;
+    if known_activity
+        || e["metadata"]["event_type"] == "acp_work_status"
         || e["message"]["metadata"]["event_type"] == "acp_work_status"
+        || e["previous_message"]["metadata"]["event_type"] == "acp_work_status"
     {
+        if !activity_ts.is_empty() {
+            store.db.execute(
+                "INSERT OR REPLACE INTO ignored_activity VALUES(?1,?2,?3)",
+                rusqlite::params![channel, activity_ts, crate::model::now_ms()],
+            )?;
+            store.db.execute("DELETE FROM ignored_activity WHERE seen<?1 OR rowid NOT IN (SELECT rowid FROM ignored_activity ORDER BY seen DESC LIMIT 10000)",[crate::model::now_ms()-3*86400000])?;
+        }
         return Ok(());
     }
     let prior = if e["subtype"] == "message_deleted" {

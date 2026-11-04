@@ -43,6 +43,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox_parts(outbox_id TEXT NOT NULL,part INTEGER NOT NULL,client_id TEXT NOT NULL UNIQUE,text TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'ready',slack_ts TEXT,PRIMARY KEY(outbox_id,part));
             CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ignored_activity(channel TEXT,ts TEXT,seen INTEGER NOT NULL,PRIMARY KEY(channel,ts));
             CREATE TABLE IF NOT EXISTS prompt_attempts(job_id TEXT PRIMARY KEY,started INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS turn_receipts(job_id TEXT PRIMARY KEY,result TEXT NOT NULL,created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS session_bindings(context TEXT PRIMARY KEY, endpoint TEXT NOT NULL, session_id TEXT NOT NULL, resumable INTEGER NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, updated INTEGER NOT NULL);
@@ -86,6 +87,7 @@ impl Store {
         }
         crate::permissions::initialize(&store)?;
         crate::followup::initialize(&store)?;
+        crate::handoff::initialize(&store)?;
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
@@ -331,7 +333,7 @@ impl Store {
     /// neither a private draft nor an attempted send establishes publication.
     pub fn response_delivery(&self, context: &str, current_job: &str) -> Result<Value> {
         let mut stmt = self.db.prepare(
-            "SELECT j.id,json_extract(j.trigger,'$.ts'),j.status,o.status,o.slack_ts,o.note,o.available
+            "SELECT j.id,json_extract(j.trigger,'$.ts'),j.status,o.status,o.slack_ts,COALESCE(NULLIF(o.note,''),j.note),o.available
              FROM jobs j LEFT JOIN outbox o ON o.job_id=j.id
              WHERE j.context=?1 AND j.id!=?2 AND j.status NOT IN ('pending','running')
              ORDER BY j.updated DESC,j.rowid DESC LIMIT 12",
@@ -356,7 +358,7 @@ impl Store {
                     _ => "unknown",
                 };
                 Ok(json!({"job_id":row.get::<_,String>(0)?,
-                "trigger_message_id":row.get::<_,String>(1)?,"status":status,
+                "trigger_message_id":row.get::<_,String>(1)?,"status":status,"job_status":job_status,
                 "slack_message_id":row.get::<_,Option<String>>(4)?,"delivery_note":row.get::<_,Option<String>>(5)?,"retry_at":row.get::<_,Option<i64>>(6)?.filter(|t|*t>now_ms())}))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
