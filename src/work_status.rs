@@ -411,6 +411,12 @@ impl ToolActivity {
         };
         let label = if title.is_empty() {
             format!("{action}…")
+        } else if title
+            .to_lowercase()
+            .starts_with(&format!("{} ", action.to_lowercase()))
+            || title.eq_ignore_ascii_case(action)
+        {
+            title
         } else {
             format!("{action} · {title}")
         };

@@ -57,3 +57,9 @@ fn empty_labels_and_duplicate_names_have_useful_fallbacks() {
     );
     assert_eq!(activity.update(&json!({"sessionUpdate":"tool_call","toolCallId":"b","kind":"search","status":"in_progress"})).unwrap(), "Searching…");
 }
+
+#[test]
+fn producer_present_tense_title_is_not_repeated() {
+    let mut activity = ToolActivity::default();
+    assert_eq!(activity.update(&json!({"sessionUpdate":"tool_call","toolCallId":"a","title":"Reading README.md","kind":"read","status":"in_progress"})).unwrap(), "Reading README.md");
+}
