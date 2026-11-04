@@ -53,7 +53,7 @@ fn empty_labels_and_duplicate_names_have_useful_fallbacks() {
                 &json!({"sessionUpdate":"tool_call_update","toolCallId":"a","status":"completed"})
             )
             .unwrap(),
-        "Preparing the response…"
+        "Thinking…"
     );
     assert_eq!(activity.update(&json!({"sessionUpdate":"tool_call","toolCallId":"b","kind":"search","status":"in_progress"})).unwrap(), "Searching…");
 }
