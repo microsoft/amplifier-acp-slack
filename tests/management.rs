@@ -15,6 +15,50 @@ fn fixture() -> (tempfile::TempDir, Arc<AppState>, String) {
     let token = std::fs::read_to_string(temp.path().join("secrets/control-token")).unwrap();
     (temp, state, token)
 }
+
+#[test]
+fn connection_status_cannot_reuse_a_previous_process_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    store
+        .audit("connection", json!({"state":"connected"}))
+        .unwrap();
+    assert_eq!(
+        store.status().unwrap()["slack_connection"]["state"],
+        "connected"
+    );
+    store.recover().unwrap();
+    assert_eq!(
+        store.status().unwrap()["slack_connection"]["state"],
+        "connecting"
+    );
+    store
+        .audit("connection", json!({"state":"connected"}))
+        .unwrap();
+    store
+        .audit(
+            "connection_failed",
+            json!({"category":"update_coordination_unavailable"}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.status().unwrap()["slack_connection"]["state"],
+        "failed"
+    );
+    store.audit("process_started", json!({})).unwrap();
+    store
+        .audit("connection", json!({"state":"connected"}))
+        .unwrap();
+    assert_eq!(
+        store.status().unwrap()["slack_connection"]["state"],
+        "connected"
+    );
+    store.audit("process_stopped", json!({})).unwrap();
+    assert_eq!(
+        store.status().unwrap()["slack_connection"]["state"],
+        "stopped"
+    );
+}
 async fn request(
     state: Arc<AppState>,
     method: &str,

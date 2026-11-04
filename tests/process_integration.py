@@ -4,6 +4,8 @@ Run after cargo build: python3 tests/process_integration.py
 Requires aiohttp. Set ACP_SLACK_TEST_BINARY to exercise a release binary.
 All Slack traffic stays on loopback and accepts only test-* credentials. This
 tests protocol/lifecycle boundaries, not Slack's service or model/social quality.
+ACP_SLACK_TEST_UPDATES may name a host-owned read-only mount with a 0400
+admission.lock and 0500 directory, to test an actual container mount as well.
 """
 
 import asyncio
@@ -220,6 +222,16 @@ async def main():
                 private_json(home / "adapter.json", config)
                 private_json(home / "secrets/slack.json", {
                     "app_token": f"test-{name}-app", "bot_token": f"test-{name}"})
+                if name == "alpha":
+                    # Host-managed update controls may be read-only inside an
+                    # installation. Normal Slack intake must not modify them.
+                    updates = home / "updates"
+                    if os.environ.get("ACP_SLACK_TEST_UPDATES"):
+                        updates.symlink_to(os.environ["ACP_SLACK_TEST_UPDATES"], target_is_directory=True)
+                    else:
+                        updates.mkdir(mode=0o700)
+                        (updates / "admission.lock").touch(mode=0o400)
+                        updates.chmod(0o500)
 
             async def start(name, connect=True):
                 home = homes[name]
@@ -285,6 +297,13 @@ async def main():
             assert processes["alpha"].pid != processes["beta"].pid
             passed("Separate installed adapter processes, endpoint implementations, credentials, and state")
 
+            await fixture.send("Dalpha", "hello from a DM with host-managed updates")
+            await until(lambda: has_post("hello from a DM with host-managed updates"), "read-only updates DM reply")
+            updates = homes["alpha"] / "updates"
+            assert updates.stat().st_mode & 0o777 == 0o500
+            assert (updates / "admission.lock").stat().st_mode & 0o777 == 0o400
+            passed("A direct message receives a reply without modifying host-managed update controls")
+
             duplicate = await asyncio.create_subprocess_exec(str(homes["alpha"] / "bin/acp-slack-adapter"),
                 "serve", "--home", str(homes["alpha"]), stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL)
@@ -294,7 +313,7 @@ async def main():
 
             message = await fixture.send("Calpha", "ask alpha: ambient request")
             await until(lambda: has_post("ambient request"), "ambient reply")
-            await until(lambda: count(homes["alpha"], "SELECT COUNT(*) FROM outbox WHERE status='sent'") == 1,
+            await until(lambda: count(homes["alpha"], "SELECT COUNT(*) FROM outbox WHERE status='sent'") == 2,
                         "own echo recorded")
             before = len(fixture.posts)
             jobs_before = count(homes["alpha"], "SELECT COUNT(*) FROM jobs")
