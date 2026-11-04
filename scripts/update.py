@@ -191,9 +191,17 @@ class Controller:
         protected={}
         for base in [self.home/'secrets',self.home/'tls']:
             for file in base.rglob('*'):
-                if file.is_file():protected[str(file.relative_to(self.home))]=digest(file)
+                # The service renews its managed server certificate on startup
+                # when it expires or interface addresses change. Trust anchors
+                # and credentials stay immutable; health validates the new leaf.
+                if file.is_file() and str(file.relative_to(self.home)) not in {
+                        'tls/managed.json','tls/cert.pem','tls/key.pem'}:
+                    protected[str(file.relative_to(self.home))]=digest(file)
         write(backup/'protected-hashes.json',protected)
         return backup
+    def protected_unchanged(self, backup):
+        protected=read(backup/'protected-hashes.json')
+        return all((self.home/path).is_file() and digest(self.home/path)==value for path,value in protected.items())
     def restore_metadata(self, backup):
         if (backup/'release.json').exists():write(self.home/'release.json',read(backup/'release.json'))
         else:(self.home/'release.json').unlink(missing_ok=True)
@@ -251,17 +259,17 @@ class Controller:
                 self.control('start');raise
         try:
             self.gate(critical=True);self.save('swapping');self.replace(target);self.save('verifying');self.control('start');self.health(expected)
-            protected=read(backup/'protected-hashes.json')
-            if any(digest(self.home/path)!=value for path,value in protected.items()):raise RuntimeError('protected_configuration_changed')
+            if not self.protected_unchanged(backup):raise RuntimeError('protected_configuration_changed')
             if digest(self.home/'adapter.json')!=config_hash:raise RuntimeError('configuration_changed_during_update')
             if rollback:self.restore_metadata(backup)
             else:self.record_installation(backup)
             self.save('rolled_back' if rollback else 'succeeded',completed_at=int(time.time()*1000))
-        except Exception:
+        except Exception as error:
             if rollback:
                 self.control('stop');self.replace(candidate);self.control('start');self.health(self.job['binary_sha256'])
                 self.save('succeeded',reason='rollback_failed_current_restored');return
-            self.finish_rollback(backup,'candidate_failed_health')
+            reason=str(error) if str(error) in {'protected_configuration_changed','configuration_changed_during_update'} else 'candidate_failed_health'
+            self.finish_rollback(backup,reason)
     def execute(self):
         try:
             if self.job['action']=='plan':self.plan()

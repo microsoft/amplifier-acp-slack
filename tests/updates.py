@@ -41,6 +41,8 @@ def fake_worker(home, identifier, mode='normal'):
         def health(self,expected):
             if mode=='all_health_failure' or (mode=='health_failure' and expected==self.job['binary_sha256']):raise RuntimeError('health_check_failed')
             super().health(expected)
+            if mode=='secret_changed' and expected==self.job['binary_sha256']:
+                (home/'secrets/fixture-secret').write_text('changed-by-fixture')
     with patch.object(u,'service',return_value='fixture-only'),patch.object(u,'run',side_effect=run):
         with (home/'updates/worker.lock').open('a+b') as lock:
             u.fcntl.flock(lock,u.fcntl.LOCK_EX)
@@ -85,6 +87,33 @@ class Updates(unittest.TestCase):
         self.assertEqual(self.secret.read_text(),'private-not-exported')
         self.assertTrue((self.folder/'backup/state.sqlite3').exists())
         with sqlite3.connect(self.home/'state.sqlite3') as db:self.assertEqual(db.execute("SELECT session_id FROM session_bindings WHERE context='saved'").fetchone()[0],'session-preserved')
+    def test_managed_leaf_renewal_keeps_update_and_trust(self):
+        root=(self.home/'tls/root-ca.crt').read_bytes()
+        leaf=(self.home/'tls/cert.pem').read_bytes()
+        marker=u.read(self.home/'tls/managed.json')
+        # Address changes also require renewal. No real network change is needed.
+        marker['sans']=['previous-interface.invalid']
+        u.write(self.home/'tls/managed.json',marker)
+        job=self.done(self.worker())
+        self.assertEqual(job['state'],'succeeded',job)
+        self.assertEqual((self.home/'tls/root-ca.crt').read_bytes(),root)
+        self.assertNotEqual((self.home/'tls/cert.pem').read_bytes(),leaf)
+        self.assert_preserved()
+    def test_trust_anchors_and_credentials_are_still_protected(self):
+        with patch.object(u,'service',return_value='fixture-only'):
+            controller=u.Controller(self.home,self.id);backup=controller.snapshot()
+            self.assertTrue(controller.protected_unchanged(backup))
+            for name in ['tls/root-ca.crt','tls/root-ca.key','secrets/fixture-secret']:
+                path=self.home/name;before=path.read_bytes()
+                path.write_bytes(before+b'changed')
+                self.assertFalse(controller.protected_unchanged(backup),name)
+                path.write_bytes(before)
+            self.assertTrue(controller.protected_unchanged(backup))
+    def test_protected_change_is_distinguished_from_health_failure(self):
+        job=self.done(self.worker('secret_changed'))
+        self.assertEqual(job['state'],'rolled_back',job)
+        self.assertEqual(job['reason'],'protected_configuration_changed')
+        self.assertEqual(u.digest(self.home/'bin/acp-slack-adapter'),self.original)
     def test_enabled_connector_health_uses_current_socket_audit(self):
         cfg=u.read(self.home/'adapter.json');cfg['enabled']=True;u.write(self.home/'adapter.json',cfg)
         started=u.read(self.home/'endpoints.json')['started_at'];updated=started+1
