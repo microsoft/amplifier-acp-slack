@@ -249,3 +249,22 @@ See [Updating one Slack connector](docs/updates.md) for the CLI, management API,
 and optional owner-DM agent controls.
 
 Bounded agent collaboration and durable delivery waits: [collaboration waits](docs/collaboration-waits.md).
+
+### Optional shared attention
+
+When an ACP endpoint advertises enabled `com.microsoft.amplifier.attention` v1,
+ambient group events use its `_amplifier/attention` method after session setup.
+The connector supplies bounded public channel/thread facts and the original Slack
+timestamp. It checks the source again before attaching the returned one-use offer
+to `session/prompt`. Instance owns the evaluator and budgets; no decision provider,
+credential or evaluator executable is configured in this adapter. A hold creates
+no prompt; an offer skips the legacy LLM participation preflight. The agent still
+may return pass. Ordinary ACP endpoints retain the existing bounded preflight;
+DMs, accepted-work continuation and explicit mentions-only installations retain
+their existing behavior. Do not run the superseded adapter-owned helper alongside
+this path. Source changes, permission checks and delivery receipts still apply.
+
+ACP chunks reach this adapter as they arrive. Public group output is buffered
+until the final speak/pass decision, so private drafts and pass envelopes do not
+leak into Slack. Work/tool progress can update separate activity cards. Attention
+admission does not itself change this presentation policy.

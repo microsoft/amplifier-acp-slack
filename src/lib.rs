@@ -1,4 +1,5 @@
 pub mod acp_auth;
+pub mod attention;
 pub mod auth;
 pub mod client_tools;
 pub mod config;
