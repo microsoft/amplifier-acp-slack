@@ -10,6 +10,7 @@ pub mod error;
 pub mod identity;
 pub mod media;
 pub mod model;
+pub mod participation;
 pub mod permissions;
 pub mod process;
 pub mod provisioning;

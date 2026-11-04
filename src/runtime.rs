@@ -190,10 +190,22 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                                 }
                             }
                         }
-                        if !driver::optional_participation(&c,&input) {
-                            let _=crate::work_status::track(&home,&job);
-                        }
-                        let result=driver::decide(c.clone(),home.clone(),input).await;
+                        let result=match crate::participation::gate(&c,&home,&input,&store).await {
+                            Ok(Some(silence))=>Ok(silence),
+                            Ok(None)=>{
+                                if crate::participation::applies(&c,&input) {
+                                    input["participation_admission"]=json!({"policy":"conversation-participation-v1","admitted":true});
+                                }
+                                if !driver::optional_participation(&c,&input)||input["participation_admission"]["admitted"]==true {
+                                    let _=crate::work_status::track(&home,&job);
+                                }
+                                driver::decide(c.clone(),home.clone(),input).await
+                            },
+                            Err(e)=>{
+                                store.lock().unwrap().audit("participation_unavailable",json!({"job":job.id,"reason":"Decision service unavailable; no ACP fallback started"}))?;
+                                Err(e)
+                            }
+                        };
                         (job,result)
                     },
                     Err(e)=>(job,Err(e))

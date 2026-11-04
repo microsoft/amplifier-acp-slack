@@ -249,3 +249,39 @@ See [Updating one Slack connector](docs/updates.md) for the CLI, management API,
 and optional owner-DM agent controls.
 
 Bounded agent collaboration and durable delivery waits: [collaboration waits](docs/collaboration-waits.md).
+
+## Optional decision-model participation
+
+An ambient connector can ask a fast, independent decision helper whether a group
+message deserves an ACP reasoning turn. Configure `attention.decision_service`
+through the configuration API or `adapter.json`:
+
+```json
+{
+  "command": "/private/this-connector/decisions/agent-runtime",
+  "args": ["--home", "/private/this-connector/decisions", "participate", "jev", "-"],
+  "secret_env": {"TYPESAFE_API_KEY": "participation-key"},
+  "timeout_seconds": 8,
+  "role": "This agent's role in the group"
+}
+```
+
+Store the credential with the connector's existing secret mechanism. The helper
+reads one `conversation-participation-v1` context on stdin and returns one JSON
+result. Constellation Runtime implements the shared policy; another compatible
+helper can be substituted. The connected ACP agent remains unchanged.
+
+Slack supplies recent messages from this conversation, participant names and
+mention/thread facts. The helper evaluates conversational relevance and implicit
+addressees. A hold makes no ACP prompt, while an admission skips the old main-model
+participation preflight and lets the agent consider its actual contribution.
+One-to-one DMs and already accepted bounded continuations retain their existing
+contracts. Newer messages invalidate a delayed gate before an ACP turn begins.
+Helper failures are recorded without an automatic expensive fallback. Without a
+helper, existing behavior is preserved. This is configured per installation;
+there is no shared fleet routing service.
+
+Activity records `participation_decision_attempt` and `participation_gate`
+separately from `acp_turn_started`. An admitted turn may still choose not to post.
+Protocol tests run with `python3 tests/participation.py`; all Slack traffic in that
+fixture stays on loopback and uses synthetic credentials and deterministic peers.

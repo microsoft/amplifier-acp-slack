@@ -636,7 +636,9 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         .await?,
     );
     let response_blocks = blocks.clone();
-    let mut deciding = ambient;
+    // The optional cheap helper has already admitted this reasoning turn.
+    // Do not ask the main model the same participation question again.
+    let mut deciding = ambient && input["participation_admission"]["admitted"] != true;
     if deciding {
         blocks = vec![
             json!({"type":"text","text":format!("Decide quietly whether you should contribute to this conversation. Do not perform work, call tools, ask questions or draft the answer yet. Return exactly one final JSON object: {{\"decision\":\"speak\"}} or {{\"decision\":\"pass\",\"reason\":\"brief reason\"}}. Silence is appropriate when nothing useful is needed. This is only a participation decision; a separate turn will execute an accepted reply. Latest conversation projection:\n{}",serde_json::to_string(input)? )}),

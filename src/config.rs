@@ -131,6 +131,8 @@ impl Default for SlackConfig {
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Attention {
+    /// Optional independent conversation gate; ACP agents remain interchangeable.
+    pub decision_service: Option<crate::participation::Service>,
     pub parallel_contexts: usize,
     pub settle_ms: u64,
     pub minimum_reply_interval_seconds: u64,
@@ -144,6 +146,7 @@ pub struct Attention {
 impl Default for Attention {
     fn default() -> Self {
         Self {
+            decision_service: None,
             parallel_contexts: 2,
             settle_ms: 1500,
             minimum_reply_interval_seconds: 3,
@@ -308,6 +311,9 @@ impl Config {
                 && (1..=1024 * 1024).contains(&client.terminal_output_bytes),
             "Invalid client tool limits"
         );
+        if let Some(service) = &self.attention.decision_service {
+            service.validate()?;
+        }
         ensure!(
             self.acp.command.len() <= 4096
                 && self.acp.args.len() <= 128

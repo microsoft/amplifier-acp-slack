@@ -26,6 +26,7 @@ jobs:
       - run: cargo build --locked
       - run: python3 -m venv /tmp/adapter-tests && /tmp/adapter-tests/bin/pip install aiohttp
       - run: /tmp/adapter-tests/bin/python tests/process_integration.py
+      - run: /tmp/adapter-tests/bin/python tests/participation.py
       - run: /tmp/adapter-tests/bin/python tests/media.py
       - run: /tmp/adapter-tests/bin/python tests/client_capabilities.py
       - run: /tmp/adapter-tests/bin/python tests/questions.py
