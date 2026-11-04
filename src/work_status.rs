@@ -375,7 +375,7 @@ impl ToolActivity {
             return Some(if update["status"] == "failed" {
                 "Checking a tool failure…".into()
             } else {
-                "Preparing the response…".into()
+                "Thinking…".into()
             });
         };
         let action = if tool.status == "pending" || tool.status.is_empty() {

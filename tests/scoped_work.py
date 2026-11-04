@@ -54,7 +54,7 @@ async def main():
     labels=[u['text'] for u in updates]
     assert 'Running · Run unit tests (workspace_run)' in labels,labels
     assert 'Reading · Read '+ch+' notes <!channel> · +1 tool' in labels,labels
-    assert 'Preparing the response…' in labels,labels
+    assert 'Thinking…' in labels,labels
     assert all('\n' not in label and len(label)<=180 for label in labels)
     assert all(marker not in label for label in labels for marker in ['PRIVATE_ARGUMENT','PRIVATE_RESULT','WRONG_SESSION','Ctools' if ch=='Dtools' else 'Dtools'])
    print('PASS Partial ACP updates retain tool labels, concurrent tools share one plain-text line, and simultaneous conversations stay isolated',flush=True)
