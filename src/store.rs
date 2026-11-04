@@ -57,6 +57,31 @@ impl Store {
                 [],
             )?;
         }
+        for (table, column, definition) in [
+            ("jobs", "available", "INTEGER NOT NULL DEFAULT 0"),
+            ("outbox", "attempted", "INTEGER NOT NULL DEFAULT 0"),
+            ("contexts", "human_version", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let present = store
+                .db
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .any(|v| v.is_ok_and(|v| v == column));
+            if !present {
+                store.db.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+                if table == "contexts" {
+                    store
+                        .db
+                        .execute("UPDATE contexts SET human_version=version", [])?;
+                }
+                if table == "outbox" {
+                    store.db.execute("UPDATE outbox SET attempted=created WHERE status IN ('sending','sent','uncertain')",[])?;
+                }
+            }
+        }
         crate::permissions::initialize(&store)?;
         Ok(store)
     }
@@ -207,6 +232,12 @@ impl Store {
         let ctx = m.context();
         tx.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5) ON CONFLICT(channel,ts) DO UPDATE SET context=excluded.context,revision=excluded.revision,body=excluded.body",params![m.channel,m.ts,ctx,m.revision,serde_json::to_string(m)?])?;
         tx.execute("INSERT INTO contexts(id,version,bot_replies,last_human) VALUES(?1,1,0,CASE WHEN ?2 THEN '' ELSE ?3 END) ON CONFLICT(id) DO UPDATE SET version=version+1,bot_replies=CASE WHEN NOT ?2 AND ?3>last_human THEN 0 ELSE bot_replies END,last_human=CASE WHEN NOT ?2 AND ?3>last_human THEN ?3 ELSE last_human END",params![ctx,m.bot||m.deleted,m.ts])?;
+        if !m.bot || old.is_some() {
+            tx.execute(
+                "UPDATE contexts SET human_version=version WHERE id=?1",
+                [&ctx],
+            )?;
+        }
         if old.is_some() {
             tx.execute("UPDATE outbox SET status='cancelled',note='Source edited or deleted before delivery' WHERE status='ready' AND job_id IN (SELECT id FROM jobs WHERE json_extract(trigger,'$.channel')=?1 AND json_extract(trigger,'$.ts')=?2)",params![m.channel,m.ts])?;
         }
@@ -214,7 +245,7 @@ impl Store {
         if old.is_some() && m.thread.is_empty() {
             let thread_ctx = crate::model::context_id(&m.team, &m.channel, &m.ts);
             tx.execute(
-                "UPDATE contexts SET version=version+1 WHERE id=?1",
+                "UPDATE contexts SET version=version+1,human_version=version+1 WHERE id=?1",
                 [thread_ctx],
             )?;
         }
@@ -268,7 +299,7 @@ impl Store {
     /// neither a private draft nor an attempted send establishes publication.
     pub fn response_delivery(&self, context: &str, current_job: &str) -> Result<Value> {
         let mut stmt = self.db.prepare(
-            "SELECT j.id,json_extract(j.trigger,'$.ts'),j.status,o.status,o.slack_ts
+            "SELECT j.id,json_extract(j.trigger,'$.ts'),j.status,o.status,o.slack_ts,o.note,o.available
              FROM jobs j LEFT JOIN outbox o ON o.job_id=j.id
              WHERE j.context=?1 AND j.id!=?2 AND j.status NOT IN ('pending','running')
              ORDER BY j.updated DESC,j.rowid DESC LIMIT 12",
@@ -294,7 +325,7 @@ impl Store {
                 };
                 Ok(json!({"job_id":row.get::<_,String>(0)?,
                 "trigger_message_id":row.get::<_,String>(1)?,"status":status,
-                "slack_message_id":row.get::<_,Option<String>>(4)?}))
+                "slack_message_id":row.get::<_,Option<String>>(4)?,"delivery_note":row.get::<_,Option<String>>(5)?,"retry_at":row.get::<_,Option<i64>>(6)?.filter(|t|*t>now_ms())}))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for item in &mut items {
@@ -347,13 +378,14 @@ impl Store {
     pub fn claim(&mut self, a: &Attention) -> Result<Option<Job>> {
         let now = now_ms();
         let tx = self.db.transaction()?;
-        let candidate:Option<(String,String,String,String)>=tx.query_row("SELECT id,context,trigger,note FROM jobs j WHERE status='pending' AND updated<=?1 AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.context=j.context AND x.status='running') ORDER BY created LIMIT 1",[now-a.settle_ms as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let candidate:Option<(String,String,String,String)>=tx.query_row("SELECT id,context,trigger,note FROM jobs j WHERE status='pending' AND available<=?2 AND updated<=?1 AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.context=j.context AND x.status='running') ORDER BY created LIMIT 1",params![now-a.settle_ms as i64,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let Some((id, context, trigger, note)) = candidate else {
             return Ok(None);
         };
         let decisions:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE status NOT IN ('pending','superseded','budget') AND updated>?1",[now-3600000],|r|r.get(0))?;
         if decisions >= a.max_decisions_per_agent_per_hour as i64 {
-            tx.execute("UPDATE jobs SET status='budget',note='Hourly model decision budget reached' WHERE id=?1",[id])?;
+            let oldest:i64=tx.query_row("SELECT MIN(updated) FROM jobs WHERE status NOT IN ('pending','superseded','budget') AND updated>?1",[now-3600000],|r|r.get(0))?;
+            tx.execute("UPDATE jobs SET available=?2,note='Waiting for hourly model capacity; resumes automatically' WHERE id=?1",params![id,oldest+3600001])?;
             tx.commit()?;
             return Ok(None);
         }
@@ -375,7 +407,7 @@ impl Store {
             reconsidered: note.starts_with("Reconsider"),
         }))
     }
-    pub fn finish(&mut self, job: &Job, result: Result<Decision>, a: &Attention) -> Result<()> {
+    pub fn finish(&mut self, job: &Job, result: Result<Decision>, _a: &Attention) -> Result<()> {
         let d = match result {
             Ok(d) => d,
             Err(error) => {
@@ -401,11 +433,11 @@ impl Store {
             }
         };
         let version: i64 = self.db.query_row(
-            "SELECT version FROM contexts WHERE id=?1",
+            "SELECT human_version FROM contexts WHERE id=?1",
             [&job.context],
             |r| r.get(0),
         )?;
-        if version != job.version {
+        if version > job.version {
             self.db.execute("UPDATE jobs SET status='superseded',updated=?1,note='Conversation changed during this turn; contribution withheld' WHERE id=?2",params![now_ms(),job.id])?;
             self.audit("stale_contribution_withheld", json!({"job":job.id}))?;
             if let Some(current) = self.message(&job.trigger.channel, &job.trigger.ts)?
@@ -415,22 +447,12 @@ impl Store {
             }
             return Ok(());
         }
-        let mut state = d.decision.clone();
-        let mut note = d.reason.clone();
-        if d.decision == "speak"
-            && let Some(why) = self.reply_limit(&job.context, &job.trigger, a)?
-        {
-            state = "limited".into();
-            note = why;
-        }
+        let state = d.decision.clone();
+        let note = d.reason.clone();
         let tx = self.db.transaction()?;
         if state == "speak" {
             let id = Uuid::new_v4().to_string();
             tx.execute("INSERT INTO outbox(id,job_id,context,channel,thread,text,status,created,available,media) VALUES(?1,?2,?3,?4,?5,?6,'ready',?7,?7,?8)",params![id,job.id,job.context,job.trigger.channel,job.trigger.thread,d.text,now_ms(),serde_json::to_string(&d.media)?])?;
-            tx.execute(
-                "UPDATE contexts SET bot_replies=bot_replies+1 WHERE id=?1",
-                [&job.context],
-            )?;
         }
         tx.execute(
             "UPDATE jobs SET status=?1,updated=?2,note=?3 WHERE id=?4",
@@ -447,29 +469,9 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    fn reply_limit(&self, ctx: &str, m: &Message, a: &Attention) -> Result<Option<String>> {
-        let (total,room,last):(i64,i64,i64)=self.db.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN context=?1 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN context=?1 THEN created ELSE 0 END),0) FROM outbox WHERE created>?2 AND status!='failed'",params![ctx,now_ms()-3600000],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        let burst: i64 =
-            self.db
-                .query_row("SELECT bot_replies FROM contexts WHERE id=?1", [ctx], |r| {
-                    r.get(0)
-                })?;
-        let why = if total >= a.max_replies_per_agent_per_hour as i64 {
-            "Agent hourly contribution limit"
-        } else if room >= a.max_replies_per_context_per_hour as i64 {
-            "Conversation hourly contribution limit"
-        } else if m.bot && burst >= a.max_bot_replies_without_human as i64 {
-            "Bot exchange limit; waiting for a human"
-        } else if now_ms() - last < (a.minimum_reply_interval_seconds * 1000) as i64 {
-            "Contribution cooldown"
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(why.into()))
-    }
     pub fn claim_outgoing(&mut self, c: &Config) -> Result<Option<Outgoing>> {
         let tx = self.db.transaction()?;
-        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
+        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.human_version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
             let raw:String=r.get(7)?;
             let media=serde_json::from_str(&raw).map_err(|e|rusqlite::Error::FromSqlConversionFailure(7,rusqlite::types::Type::Text,Box::new(e)))?;
             Ok((Outgoing{id:r.get(0)?,channel:r.get(1)?,thread:r.get(2)?,text:r.get(3)?,media},r.get(4)?,r.get(5)?,r.get(6)?,r.get(8)?))
@@ -494,7 +496,7 @@ impl Store {
             && source
                 .as_ref()
                 .is_some_and(|s| !s.deleted && c.should_wake(&s.channel, &s.text));
-        let unchanged = (original_version == current_version || delivered_parts > 0)
+        let unchanged = (original_version >= current_version || delivered_parts > 0)
             && source
                 .as_ref()
                 .is_some_and(|s| s.revision == trigger.revision);
@@ -507,9 +509,42 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         }
+        let now = now_ms();
+        let attempted: i64 =
+            tx.query_row("SELECT attempted FROM outbox WHERE id=?1", [&out.id], |r| {
+                r.get(0)
+            })?;
+        if attempted == 0 {
+            if let Some((why, until)) = delivery_wait(&tx, &trigger, &c.attention, now)? {
+                let available = until.unwrap_or(now + 30_000);
+                let changed = tx.execute(
+                    "UPDATE outbox SET available=?2,note=?3 WHERE id=?1 AND note!=?3",
+                    params![out.id, available, why],
+                )?;
+                tx.execute(
+                    "UPDATE outbox SET available=?2 WHERE id=?1",
+                    params![out.id, available],
+                )?;
+                if changed > 0 {
+                    tx.execute(
+                        "INSERT INTO audit(time,kind,data) VALUES(?1,'delivery_wait',?2)",
+                        params![
+                            now,
+                            json!({"id":out.id,"reason":why,"retry_at":until}).to_string()
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                return Ok(None);
+            }
+            let last:i64=tx.query_row("SELECT COALESCE(MAX(attempted),0) FROM outbox WHERE context=?1 AND status IN ('sent','sending','uncertain')",[trigger.context()],|r|r.get(0))?;
+            let reset = c.attention.bot_exchange_cooldown_seconds > 0
+                && now - last >= c.attention.bot_exchange_cooldown_seconds as i64 * 1000;
+            tx.execute("UPDATE contexts SET bot_replies=CASE WHEN ?2 THEN 1 ELSE bot_replies+1 END WHERE id=?1",params![trigger.context(),reset])?;
+        }
         tx.execute(
-            "UPDATE outbox SET status='sending',note='' WHERE id=?1 AND status='ready'",
-            [&out.id],
+            "UPDATE outbox SET status='sending',note='',attempted=CASE WHEN attempted=0 THEN ?2 ELSE attempted END WHERE id=?1 AND status='ready'",
+            params![out.id,now],
         )?;
         tx.commit()?;
         Ok(Some(out))
@@ -591,4 +626,54 @@ fn schedule_reconsider(db: &Connection, m: &Message) -> Result<()> {
     db.execute("UPDATE jobs SET note='Reconsider the latest conversation; an earlier response was not delivered. Check work already performed before repeating actions.' WHERE context=?1 AND status='pending'",[m.context()])?;
     db.execute("INSERT INTO jobs(id,context,trigger,status,created,updated,note) SELECT ?1,?2,?3,'pending',?4,?4,'Reconsider the latest conversation; an earlier turn may already have performed work. Do not repeat actions without checking the existing result.' WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE context=?2 AND status IN ('pending','running'))",params![Uuid::new_v4().to_string(),m.context(),serde_json::to_string(m)?,now_ms()])?;
     Ok(())
+}
+
+// Budgets are checked when reserving delivery, rather than throwing away a
+// completed model turn. Retries never replay its tools or count as a new reply.
+fn delivery_wait(
+    db: &Connection,
+    m: &Message,
+    a: &Attention,
+    now: i64,
+) -> Result<Option<(String, Option<i64>)>> {
+    let ctx = m.context();
+    let (total,room,last,oldest,room_oldest):(i64,i64,i64,i64,i64)=db.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN context=?1 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN context=?1 THEN attempted ELSE 0 END),0),COALESCE(MIN(attempted),0),COALESCE(MIN(CASE WHEN context=?1 THEN attempted END),0) FROM outbox WHERE attempted>?2 AND status IN ('sent','sending','uncertain')",params![ctx,now-3600000],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    if total >= a.max_replies_per_agent_per_hour as i64 {
+        return Ok(Some((
+            "Waiting for agent reply capacity".into(),
+            Some(oldest + 3600001),
+        )));
+    }
+    if room >= a.max_replies_per_context_per_hour as i64 {
+        return Ok(Some((
+            "Waiting for conversation reply capacity".into(),
+            Some(room_oldest + 3600001),
+        )));
+    }
+    let burst: i64 = db.query_row("SELECT bot_replies FROM contexts WHERE id=?1", [ctx], |r| {
+        r.get(0)
+    })?;
+    if m.bot && burst >= a.max_bot_replies_without_human as i64 {
+        if a.bot_exchange_cooldown_seconds == 0 {
+            return Ok(Some((
+                "Agent exchange paused until a person responds".into(),
+                None,
+            )));
+        }
+        let until = last + a.bot_exchange_cooldown_seconds as i64 * 1000;
+        if now < until {
+            return Ok(Some((
+                "Agent collaboration pause; resumes automatically".into(),
+                Some(until),
+            )));
+        }
+    }
+    let until = last + a.minimum_reply_interval_seconds as i64 * 1000;
+    if now < until {
+        return Ok(Some((
+            "Reply spacing; resumes automatically".into(),
+            Some(until),
+        )));
+    }
+    Ok(None)
 }

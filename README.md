@@ -247,3 +247,5 @@ Automatic Slack app portraits from compatible agents: [agent images](docs/agent-
 Verified, installation-local updates are available for Linux systemd installations.
 See [Updating one Slack connector](docs/updates.md) for the CLI, management API,
 and optional owner-DM agent controls.
+
+Bounded agent collaboration and durable delivery waits: [collaboration waits](docs/collaboration-waits.md).

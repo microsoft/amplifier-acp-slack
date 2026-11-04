@@ -138,6 +138,8 @@ pub struct Attention {
     pub max_replies_per_agent_per_hour: usize,
     pub max_decisions_per_agent_per_hour: usize,
     pub max_bot_replies_without_human: usize,
+    /// Zero waits for a human; otherwise resume a bounded exchange after this pause.
+    pub bot_exchange_cooldown_seconds: u64,
 }
 impl Default for Attention {
     fn default() -> Self {
@@ -149,6 +151,7 @@ impl Default for Attention {
             max_replies_per_agent_per_hour: 120,
             max_decisions_per_agent_per_hour: 240,
             max_bot_replies_without_human: 3,
+            bot_exchange_cooldown_seconds: 0,
         }
     }
 }
@@ -260,6 +263,11 @@ impl Config {
                 && (1..=10000).contains(&self.attention.max_replies_per_agent_per_hour)
                 && (1..=10000).contains(&self.attention.max_replies_per_context_per_hour),
             "Invalid attention budget"
+        );
+        ensure!(
+            self.attention.bot_exchange_cooldown_seconds == 0
+                || (30..=3600).contains(&self.attention.bot_exchange_cooldown_seconds),
+            "Agent collaboration pause must be zero or 30–3600 seconds"
         );
         ensure!(
             (1..=20).contains(&self.attention.max_bot_replies_without_human),
