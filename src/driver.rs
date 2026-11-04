@@ -617,6 +617,9 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             "Invalid host attention offer"
         );
         attention_offer = Some(json!({"id":offer["id"],"ticket":offer["ticket"]}));
+        // A current engage offer commits to a response just like the ordinary
+        // participation path. Quiet evaluations and stale offers remain invisible.
+        crate::work_status::track_input(home, input)?;
     }
     store.audit(
         "acp_turn_started",
