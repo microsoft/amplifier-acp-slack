@@ -104,7 +104,11 @@ finish its turn and send its acknowledgement before its connector restarts.
 The helper snapshots the prior binary, config and database, atomically replaces
 only the executable, restarts the fixed service, and checks authenticated
 management identity plus Slack connection health. Health failure restores the
-prior binary automatically. It never restores an old database over messages
+prior binary automatically. The managed server certificate may renew during restart
+when it expires or network addresses change; authenticated HTTPS must still verify
+against the unchanged trust root. Credentials and CA material remain protected.
+Unexpected protected-file changes are reported separately from connection-health
+failures. It never restores an old database over messages
 received during the update. A crash during cutover resumes with recovery of the
 prior binary. If rollback itself cannot become healthy, the receipt reports
 `recovery_required` and new agent turns stay paused. An operator can retry the
