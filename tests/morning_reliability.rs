@@ -126,3 +126,55 @@ fn status_creation_updates_and_deletion_never_change_conversation() {
     slack::receive(&c,&mut s,&json!({"event_id":"real","event":{"type":"message","channel":"Dtest","channel_type":"im","ts":"4.0","user":"Uother","bot_id":"Bother","text":"Actual completed work"}})).unwrap();
     assert!(s.message("Dtest", "4.0").unwrap().is_some());
 }
+
+#[tokio::test]
+async fn automatic_approvals_survive_activity_writes_and_still_reject_stale_sources() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let home = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.acp.client.approvals_required = false;
+    c.save(home.path()).unwrap();
+    let mut s = Store::open(home.path()).unwrap();
+    let first = message("1.000001", "Build the project");
+    s.ingest("first", &first, true).unwrap();
+    let job = s.claim(&attention()).unwrap().unwrap();
+    let input = json!({"job_id":job.id,"conversation":{"context":job.context,"channel":first.channel,"thread":first.thread},"trigger":first});
+    let params = json!({"sessionId":"session","toolCall":{"toolCallId":"tool","title":"Build"},"options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]});
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = done.clone();
+    let other = Store::open(home.path()).unwrap();
+    let writer = std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            other
+                .audit("activity_fixture", json!({"working":true}))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    let mut outcomes = Vec::new();
+    for _ in 0..100 {
+        outcomes.push(
+            acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
+                .await,
+        );
+    }
+    done.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    for outcome in outcomes {
+        assert_eq!(outcome.unwrap()["outcome"]["outcome"], "selected");
+    }
+    s.ingest("followup", &message("2.000001", "Stop the work"), true)
+        .unwrap();
+    let stale =
+        acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
+            .await
+            .unwrap();
+    assert_eq!(stale["outcome"]["outcome"], "cancelled");
+    assert_eq!(
+        stale["_meta"]["com.microsoft.amplifier.permission"]["reason"],
+        "source_changed"
+    );
+}

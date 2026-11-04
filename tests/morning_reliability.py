@@ -34,7 +34,8 @@ async def main():
     print('PASS reconnect answers unseen human DM without requiring a fresh message',flush=True)
     count=len(f.posts);await stop();await start();await asyncio.sleep(2);assert len(f.posts)==count;print('PASS restart does not replay completed or accepted work',flush=True)
    except Exception:
-    print((home/'service.log').read_text()[-3000:]);print((work/'fixture-error.txt').read_text() if (work/'fixture-error.txt').exists() else 'no fixture error');raise
+    print((home/'service.log').read_text()[-3000:]);print((work/'fixture-error.txt').read_text() if (work/'fixture-error.txt').exists() else 'no fixture error')
+    print(rows(home,"SELECT kind,data FROM audit ORDER BY seq DESC LIMIT 20"));raise
    finally:await stop();log.close()
  finally:await runner.cleanup()
 if __name__=='__main__':asyncio.run(main())

@@ -438,7 +438,11 @@ pub async fn request(
     }
     if !c.acp.client.approvals_required {
         let s = Store::open(home)?;
-        let tx = s.db.unchecked_transaction()?;
+        // Reserve the write transaction before reading freshness. A deferred
+        // read-to-write upgrade can fail immediately with SQLITE_BUSY when
+        // activity/reconnect writes race the approval, bypassing busy_timeout.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&s.db, rusqlite::TransactionBehavior::Immediate)?;
         if !live_turn(&tx, &current_config, input)? {
             s.audit("permission_declined", json!({"context":ctx,"job_id":job,"tool_call_id":params["toolCall"]["toolCallId"],"reason":"The initiating turn or source is no longer current"}))?;
             tx.commit()?;
