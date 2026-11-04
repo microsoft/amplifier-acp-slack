@@ -105,3 +105,32 @@ Deterministic tests cover room isolation, owner linking, group DMs, parent/threa
 navigation, missing membership, expiry/revocation, resume and explicit silence.
 The [opt-in continuity probe](continuity-check.md) can check a separately
 configured installation. No private deployment transcript is included here.
+
+## Interrupted work and reconnects
+
+A new human message still invalidates the older turn's pending actions. When
+that turn is superseded, a bounded handoff carries its original request, plan,
+and observed tool lifecycle into the successor in the same room and endpoint.
+The agent must reassess against the newest instruction: answer status questions
+and continue authorized unfinished work, honor cancellation, and verify existing
+artifacts before repeating effects. Tool lifecycle observations are not proof of
+external completion. Edited/deleted sources and other endpoints are excluded.
+Delivery receipts include the job's withholding reason, even without an outbox.
+
+Work-status messages and their edits/deletions are control traffic. They do not
+enter the transcript or invalidate active work. A bounded remembered identifier
+set handles cleanup events that omit metadata.
+
+After a verified Socket Mode connection, the connector checks up to 24 hours of
+accessible top-level history since its last checkpoint for unseen human messages.
+It reuses ordinary ingress, scope checks, coalescing and deduplication. It never
+replays accepted, interrupted, completed or uncertain jobs. Pagination is bounded;
+errors retain the checkpoint, rate limits delay retries, and a first installation
+starts at the present. Thread-only replies outside that history still depend on
+Socket Mode delivery; this is not a complete Slack event archive.
+
+When an endpoint advertises the optional context-snapshot version 1 extension,
+the connector marks its repeated projection with a conversation-specific key and
+retains each triggering message plus continuation/handoff state. The newest
+projection replaces older projections only in the runtime's model view. Generic
+ACP endpoints continue receiving ordinary text, and original history stays saved.

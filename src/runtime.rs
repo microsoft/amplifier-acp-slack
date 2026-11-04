@@ -178,8 +178,9 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                         let mut input=driver::request(&c,&job.trigger,history);
                         input["job_id"]=json!(job.id);
                         input["response_delivery"]=delivery;
+                        if let Some(handoff)=crate::handoff::attach(&store.lock().unwrap(),&job,&driver::endpoint_key(&c))? { input["work_handoff"]=handoff; }
                         if let Some(followup)=crate::followup::input(&home,&job.id)? { input["accepted_work_continuation"]=followup; }
-                        if job.reconsidered { input["continuation_note"]=json!("An earlier response was withheld and was NOT posted to Slack. Other participants did not see that draft. Review the actual conversation and delivery receipts before deciding what to say; do not treat a private proposal as shared or agreed. Work may already have been performed: check its result instead of repeating actions. If that evidence is unavailable, say so."); }
+                        if job.reconsidered { input["continuation_note"]=json!("An earlier response was withheld and was NOT posted to Slack. Other participants did not see that draft. Use work_handoff to re-evaluate unfinished work against the newest instruction. A status question alone does not cancel the original objective. Continue still-authorized steps, respecting cancellations and scope changes. Review the actual conversation and delivery receipts before deciding what to say; do not treat a private proposal as shared or agreed. Work may already have been performed: check its result instead of repeating actions. If that evidence is unavailable, say so."); }
                         input["participants_from_slack"]=serde_json::to_value(participants)?;
                         if c.context.enabled {
                             match crate::context::orientation_for(&c,&home,&input).await {

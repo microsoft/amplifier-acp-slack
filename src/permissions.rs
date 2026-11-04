@@ -380,7 +380,7 @@ pub async fn request(
     session: &str,
     params: &Value,
 ) -> Result<Value> {
-    let cancelled = json!({"outcome":{"outcome":"cancelled"}});
+    let cancelled = cancellation("unavailable");
     let sender = input["trigger"]["sender"].as_str().unwrap_or("");
     let ctx = input["conversation"]["context"]
         .as_str()
@@ -434,15 +434,15 @@ pub async fn request(
     if current_config.revision != c.revision
         || current_config.acp.client.approvals_required != c.acp.client.approvals_required
     {
-        return Ok(cancelled);
+        return Ok(cancellation("policy_changed"));
     }
     if !c.acp.client.approvals_required {
         let s = Store::open(home)?;
         let tx = s.db.unchecked_transaction()?;
         if !live_turn(&tx, &current_config, input)? {
-            s.audit("permission_declined", json!({"context":ctx,"job_id":job,"reason":"The initiating turn or source is no longer current"}))?;
+            s.audit("permission_declined", json!({"context":ctx,"job_id":job,"tool_call_id":params["toolCall"]["toolCallId"],"reason":"The initiating turn or source is no longer current"}))?;
             tx.commit()?;
-            return Ok(cancelled);
+            return Ok(cancellation("source_changed"));
         }
         let Some(choice) = options.iter().find(|v| v["kind"] == "allow_once") else {
             s.audit("permission_declined", json!({"context":ctx,"job_id":job,"reason":"Automatic approval requires an advertised single-use allow option"}))?;
@@ -527,11 +527,17 @@ pub async fn request(
                 return Ok(json!({"outcome":{"outcome":"selected","optionId":p["option_id"]}}));
             }
             "pending" => {}
+            "expired" => return Ok(cancellation("expired")),
+            "cancelled" => return Ok(cancellation("source_changed")),
             _ => return Ok(cancelled),
         }
         drop(s);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn cancellation(reason: &str) -> Value {
+    json!({"outcome":{"outcome":"cancelled"},"_meta":{"com.microsoft.amplifier.permission":{"reason":reason}}})
 }
 
 #[cfg(test)]

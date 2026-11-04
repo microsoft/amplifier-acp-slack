@@ -609,6 +609,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     );
     store.audit("context_tools_setup", context_status.clone())?;
     diagnostic_input["context_tools"] = context_status;
+    crate::handoff::start(
+        &store,
+        input["job_id"].as_str().unwrap_or(""),
+        &endpoint,
+        input,
+    )?;
     let input = &diagnostic_input;
     let ambient = optional_participation(c, input);
     let instruction = if ambient {
@@ -635,12 +641,19 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         )
         .await?,
     );
+    let snapshots = init["_meta"]["com.microsoft.amplifier.context-snapshot"]["version"] == 1;
+    if snapshots {
+        mark_snapshot(&mut blocks[0], ctx, input, "response");
+    }
     let response_blocks = blocks.clone();
     let mut deciding = ambient;
     if deciding {
         blocks = vec![
             json!({"type":"text","text":format!("Decide quietly whether you should contribute to this conversation. Do not perform work, call tools, ask questions or draft the answer yet. Return exactly one final JSON object: {{\"decision\":\"speak\"}} or {{\"decision\":\"pass\",\"reason\":\"brief reason\"}}. Silence is appropriate when nothing useful is needed. This is only a participation decision; a separate turn will execute an accepted reply. Latest conversation projection:\n{}",serde_json::to_string(input)? )}),
         ];
+    }
+    if snapshots && deciding {
+        mark_snapshot(&mut blocks[0], ctx, input, "participation decision");
     }
     if let Some(job) = input["job_id"].as_str() {
         store.db.execute(
@@ -780,6 +793,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         }
         if v["method"] == "session/update" && v["params"]["sessionId"] == sid {
             let u = &v["params"]["update"];
+            crate::handoff::observe(&store, input["job_id"].as_str().unwrap_or(""), u)?;
             if !deciding
                 && matches!(
                     u["sessionUpdate"].as_str(),
@@ -960,7 +974,10 @@ fn context_tools_status(enabled: bool, http_supported: bool, session_resumed: bo
 /// Ambient participation is a group policy. A verified 1:1 DM or explicit
 /// address takes precedence without granting any extra retrieval authority.
 pub fn optional_participation(c: &Config, input: &Value) -> bool {
-    if c.participation != "ambient" || input.get("accepted_work_continuation").is_some() {
+    if c.participation != "ambient"
+        || input.get("accepted_work_continuation").is_some()
+        || input.get("work_handoff").is_some()
+    {
         return false;
     }
     let kind = input["orientation"]["conversation_kind"].as_str();
@@ -1096,6 +1113,10 @@ fn mode_details(loaded: &Value) -> Result<Value> {
         "The agent returned an unknown current permission mode."
     );
     Ok(json!({"supported":true,"current_mode_id":current,"available_modes":modes}))
+}
+
+fn mark_snapshot(block: &mut Value, context: &str, input: &Value, phase: &str) {
+    block["_meta"] = json!({"com.microsoft.amplifier.context-snapshot":{"version":1,"key":format!("slack:{context}"),"retainedText":json!({"phase":phase,"trigger":input["trigger"],"accepted_work_continuation":input.get("accepted_work_continuation"),"work_handoff":input.get("work_handoff")}).to_string()}});
 }
 
 #[cfg(test)]
