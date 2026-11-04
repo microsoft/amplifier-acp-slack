@@ -43,6 +43,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox_parts(outbox_id TEXT NOT NULL,part INTEGER NOT NULL,client_id TEXT NOT NULL UNIQUE,text TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'ready',slack_ts TEXT,PRIMARY KEY(outbox_id,part));
             CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS prompt_attempts(job_id TEXT PRIMARY KEY,started INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS turn_receipts(job_id TEXT PRIMARY KEY,result TEXT NOT NULL,created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS session_bindings(context TEXT PRIMARY KEY, endpoint TEXT NOT NULL, session_id TEXT NOT NULL, resumable INTEGER NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, updated INTEGER NOT NULL);
         ")?;
         let store = Self { db };
@@ -83,9 +85,35 @@ impl Store {
             }
         }
         crate::permissions::initialize(&store)?;
+        crate::followup::initialize(&store)?;
         Ok(store)
     }
-    pub fn recover(&self) -> Result<()> {
+    pub fn recover(&mut self) -> Result<()> {
+        // A completed ACP result may have reached us just before a crash. Its
+        // durable receipt can finish delivery without running the agent again.
+        let recovered=self.db.prepare("SELECT j.id,j.context,j.trigger,j.version,t.result FROM jobs j JOIN turn_receipts t ON t.job_id=j.id WHERE j.status='running'")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, context, trigger, version, raw) in recovered {
+            let mut value: Value = serde_json::from_str(&raw)?;
+            let media = value
+                .as_object_mut()
+                .unwrap()
+                .remove("media")
+                .unwrap_or(json!([]));
+            let mut decision: Decision = serde_json::from_value(value)?;
+            decision.media = serde_json::from_value(media)?;
+            decision.validate()?;
+            self.finish(
+                &Job {
+                    id,
+                    context,
+                    trigger: serde_json::from_str(&trigger)?,
+                    version,
+                    reconsidered: false,
+                },
+                Ok(decision),
+                &Attention::default(),
+            )?;
+        }
         crate::permissions::cancel_all(self, "Connector restarted")?;
         self.db.execute("UPDATE jobs SET status='interrupted', note='Process stopped during a model turn; not replayed automatically' WHERE status='running'",[])?;
         self.db.execute("UPDATE outbox SET status='uncertain', note='Process stopped during delivery; inspect Slack before resending' WHERE status='sending'",[])?;
@@ -248,6 +276,10 @@ impl Store {
                 "UPDATE contexts SET version=version+1,human_version=version+1 WHERE id=?1",
                 [thread_ctx],
             )?;
+        }
+        if wake && !m.bot {
+            tx.execute("UPDATE jobs SET status='superseded',note='A new human message superseded the scheduled continuation' WHERE context=?1 AND status='pending' AND id IN (SELECT child FROM followups)",[&ctx])?;
+            tx.execute("UPDATE followups SET status='cancelled' WHERE parent IN (SELECT id FROM jobs WHERE context=?1) AND status IN ('proposed','queued')",[&ctx])?;
         }
         if wake && !m.deleted {
             let existing: Option<String> = tx

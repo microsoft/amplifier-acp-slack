@@ -33,6 +33,7 @@ class SlackFixture:
         self.sockets = {}
         self.messages = []
         self.posts = []
+        self.indicators = []
         self.attempts = {}
         self.acks = set()
         self.sequence = 0
@@ -64,6 +65,16 @@ class SlackFixture:
             else:
                 messages = [m for m in messages if not m.get("thread_ts")]
             return web.json_response({"ok": True, "messages": messages[-80:][::-1]})
+        if method == "chat.postMessage" and body.get("metadata",{}).get("event_type") == "acp_work_status":
+            message={**body,"ts":self.timestamp(),"text":body["markdown_text"],"user":"U"+name,"bot_id":"B"+name}
+            self.messages.append(message);self.indicators.append(message)
+            return web.json_response({"ok":True,"ts":message["ts"]})
+        if method in ("chat.update","chat.delete"):
+            match=next((m for m in self.indicators if m["channel"]==body["channel"] and m["ts"]==body["ts"]),None)
+            if match:
+                if method=="chat.update":match.update(body)
+                else:match["deleted"]=True;self.messages=[m for m in self.messages if m["ts"]!=body["ts"]]
+            return web.json_response({"ok":bool(match),"ts":body["ts"],"error":"message_not_found"})
         if method == "chat.postMessage":
             assert "text" not in body and "blocks" not in body, "Markdown cannot be mixed with legacy fields"
             assert isinstance(body["markdown_text"], str) and len(body["markdown_text"]) <= 12000

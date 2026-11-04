@@ -30,6 +30,7 @@ jobs:
       - run: /tmp/adapter-tests/bin/python tests/client_capabilities.py
       - run: /tmp/adapter-tests/bin/python tests/questions.py
       - run: /tmp/adapter-tests/bin/python tests/work_status.py
+      - run: /tmp/adapter-tests/bin/python tests/scoped_work.py
       - run: python3 tests/slack_setup.py
       - run: python3 tests/management_service.py
       - run: python3 tests/updates.py

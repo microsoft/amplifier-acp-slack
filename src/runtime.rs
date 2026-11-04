@@ -85,6 +85,7 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
             if current.revision != sender_revision || !current.enabled {
                 break;
             }
+            let _ = crate::delivery_recovery::reconcile(&sender_home, &sender).await;
             let next = sender_store.lock().unwrap().claim_outgoing(&current)?;
             if let Some(o) = next {
                 match sender.publish_durable(&o, &sender_store).await {
@@ -134,6 +135,7 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
             _=timer.tick()=>{},
             _=notify.notified()=>{},
         }
+        crate::followup::pump(&home, &c)?;
         while workers.len() < c.attention.parallel_contexts {
             let Some(admission) =
                 crate::updates::admission(&home).context(UpdateAdmissionUnavailable)?
@@ -176,6 +178,7 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                         let mut input=driver::request(&c,&job.trigger,history);
                         input["job_id"]=json!(job.id);
                         input["response_delivery"]=delivery;
+                        if let Some(followup)=crate::followup::input(&home,&job.id)? { input["accepted_work_continuation"]=followup; }
                         if job.reconsidered { input["continuation_note"]=json!("An earlier response was withheld and was NOT posted to Slack. Other participants did not see that draft. Review the actual conversation and delivery receipts before deciding what to say; do not treat a private proposal as shared or agreed. Work may already have been performed: check its result instead of repeating actions. If that evidence is unavailable, say so."); }
                         input["participants_from_slack"]=serde_json::to_value(participants)?;
                         if c.context.enabled {

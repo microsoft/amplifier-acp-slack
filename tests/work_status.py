@@ -44,11 +44,16 @@ async def main():
      assert response.status==200;return await response.json()
   def transitions(channel):return [s['status'] for s in f.statuses if s['channel_id']==channel]
   async def state(channel,want):await until(lambda:transitions(channel) and transitions(channel)[-1]==want,channel+' '+want)
+  original_send=f.send
+  async def threaded_send(channel,text,**kwargs):
+   kwargs.setdefault('thread','1800000000.123456')
+   return await original_send(channel,text,**kwargs)
+  f.send=threaded_send
   try:
    await start();m=await f.send('Dnormal','Please help');await state('Dnormal','active')
-   assert transitions('Dnormal')==['processing','active'];assert all(s['thread_ts']==m['ts'] for s in f.statuses if s['channel_id']=='Dnormal')
-   assert next(p for p in f.posts if p['channel']=='Dnormal').get('thread_ts','')==''
-   passed('Actual work changes processing to active without moving a DM reply into a thread')
+   assert transitions('Dnormal')==['processing','active'];assert all(s['thread_ts']=='1800000000.123456' for s in f.statuses if s['channel_id']=='Dnormal')
+   assert next(p for p in f.posts if p['channel']=='Dnormal').get('thread_ts','')=='1800000000.123456'
+   passed('Existing-thread work changes processing to active without changing reply placement')
    previous=len(f.statuses);await f.send('Cambient','People are talking');await until(lambda:bool(rows(home,"SELECT id FROM jobs WHERE status='pass'")),'ambient pass');await asyncio.sleep(.4);assert len(f.statuses)==previous
    passed('Ambient silent assessments emit no work indicator')
    m=await f.send('Cthread','<@Ualpha> Please help',thread='1800000000.123456');await state('Cthread','active');assert all(s['thread_ts']=='1800000000.123456' for s in f.statuses if s['channel_id']=='Cthread')
@@ -76,6 +81,7 @@ async def main():
    f.error=None;updated=await api('GET','config');updated['label']='alpha reconnected';await api('PUT','config',{'expected_revision':updated['revision'],'config':updated})
    await state('Duncertain','active');await until(lambda:not rows(home,"SELECT 1 FROM work_status_delivery WHERE channel='Duncertain'"),'uncertain cleanup retired')
    passed('An uncertain earlier delivery survives permanent rejection until restored access confirms active cleanup')
+   await until(lambda:'alpha' in f.sockets,'reconfigured socket connected');await asyncio.sleep(.5)
    f.error='feature_disabled';await f.send('Dunsupported','Please help');await until(lambda:bool(transitions('Dunsupported')),'unsupported request');n=len(f.statuses);await f.send('Dunsupported2','Please help');await until(lambda:any(p['channel']=='Dunsupported2' for p in f.posts),'work continues');await asyncio.sleep(.6);assert len(f.statuses)==n
    passed('Unavailable workspace capability stops attempts and does not prevent agent replies')
    await until(lambda:not rows(home,'SELECT 1 FROM work_status_delivery') and not rows(home,'SELECT 1 FROM work_status_jobs'),'settled indicators retired')

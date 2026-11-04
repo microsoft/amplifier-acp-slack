@@ -337,3 +337,33 @@ fn reservations_wait_for_other_connections_instead_of_aborting_the_connector() {
         assert!(result.unwrap().is_some());
     }
 }
+
+#[test]
+fn restart_delivers_a_durable_completed_result_without_replaying_model_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let m = message("1.001");
+    s.ingest("receipt-source", &m, true).unwrap();
+    let job = s.claim(&attention()).unwrap().unwrap();
+    let result = speak().unwrap();
+    s.db.execute(
+        "INSERT INTO turn_receipts VALUES(?1,?2,?3)",
+        rusqlite::params![job.id, serde_json::to_string(&result).unwrap(), 1],
+    )
+    .unwrap();
+    drop(s);
+    let mut s = Store::open(dir.path()).unwrap();
+    s.recover().unwrap();
+    s.recover().unwrap();
+    assert_eq!(
+        s.db.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.db.query_row("SELECT status FROM jobs", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "speak"
+    );
+    assert!(s.claim(&attention()).unwrap().is_none());
+}

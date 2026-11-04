@@ -82,6 +82,11 @@ for line in sys.stdin:
             continue
         conversation = json.loads(prompt.split("Latest conversation projection:\n", 1)[1])
         trigger = conversation["trigger"]["text"]
+        if 'Decide quietly' in prompt and not any(word in trigger for word in ['fail-prompt-no-retry','stall-child','malformed']):
+            log('participation' if 'ask '+NAME in trigger else 'prompt',session_id=sid,input=conversation)
+            update(sid,'agent_message_chunk',json.dumps({'decision':'speak' if 'ask '+NAME in trigger else 'pass','reason':'fixture decision'}))
+            result(request,{'stopReason':'end_turn'})
+            continue
         state = json.loads(session_path(sid).read_text())
         state["turns"] += 1
         session_path(sid).write_text(json.dumps(state))

@@ -1,37 +1,36 @@
 # Work status in Slack
 
-Direct requests and explicit addresses can show Slack's native working
-indicator. Actual work maps to `processing`; an unresolved permission or ACP
-question maps to `suspended`; completed, failed, or cancelled work maps to
-`active` (ready for another request). A reply awaiting delivery remains working.
-Ambient participation checks do not announce themselves.
+An ambient group contribution has two ordinary ACP turns: a private participation
+decision, then the accepted response. A pass produces no public indicator. Direct
+messages and explicit addresses already commit to a response under the connector's
+participation policy. The agent's tools and permission rules are unchanged; the
+participation prompt asks for no tools and client callbacks are refused in that
+phase. This prompt convention is not a universal engine-side tool sandbox.
 
-The connector uses Slack's optional
-[`agents.sessions.setStatus`](https://docs.slack.dev/reference/methods/agents.sessions.setStatus/)
-method with the existing bot's `chat:write` scope. The indicator belongs to the
-existing thread root, or the triggering message for an unthreaded conversation.
-This does not move replies into threads or post status messages. Each agent
-updates only its own status; Slack combines statuses when several agents share
-a thread.
+For an existing thread the connector first tries Slack's
+[`agents.sessions.setStatus`](https://docs.slack.dev/reference/methods/agents.sessions.setStatus/).
+If that optional API is unavailable, a temporary working message uses the same
+bot's existing `chat:write` access. Unthreaded DMs and channel replies use that
+message directly, so status never creates a different thread. There is no global
+presence update, cross-room broadcast, or additional credential setup.
 
-Status delivery is durable. Only transitions and retry deadlines cause Slack
-requests. Unchanged working states are not repeatedly sent. Completed targets
-are removed from the reconciliation queue; operational activity retains the
-transition history. Cleanup runs on graceful shutdown and after crash recovery.
-Interrupted model turns are not replayed to recover an indicator. If Slack is
-unreachable or rate limited, cleanup remains pending until access returns.
+The message stays in the exact reply destination. Coarse ACP tool kinds can change
+it to “Checking information…” or “Working on the task…”. Private tool arguments,
+paths, raw reasoning and titles are never copied to Slack. A pending approval or
+question says it is waiting for the person; queued delivery says it is sending.
+Successful delivery or a pass removes the temporary message. Failed/interrupted
+work leaves a scoped explanation instead of silently disappearing. Operational
+messages carry `acp_work_status` metadata and are excluded from this connector's
+context and agent-trigger processing, including messages from peer connectors.
 
-Some workspaces do not enable Slack's agent-task experience. A
-`feature_disabled`, `unknown_method`, or access rejection disables further
-indicator attempts until connection configuration or credentials change. Agent
-work and replies continue normally. The connector does not ask for extra
-permissions or substitute cosmetic chat messages. Diagnostic capability state
-is available through `work_status::status`; it is separate from agent health.
+Status transitions and receipts are durable. A lost POST response is looked up
+by its exact client message ID before cleanup; it is never blindly reposted.
+Deletes and updates are retriable, and rate-limit deadlines are honored. If Slack
+itself is unreachable, delivery and cleanup remain pending. An API rejection is
+recorded in Activity; the connector cannot guarantee a visible message when Slack
+rejects all writes.
 
-Editing a source message invalidates pending approvals and stale output; it
-does not by itself interrupt all running ACP work. A still-running turn remains
-working until it finishes or is actually cancelled.
-
-Run `python3 tests/work_status.py` after `cargo build` for actual adapter,
-independent ACP process, and loopback Slack tests. No external messages, model
-calls, or live Slack probes are used.
+Run `tests/work_status.py` for native lifecycle, permission, cancellation, and
+recovery checks, and `tests/scoped_work.py` for fallback visibility, quiet
+participation, lost delivery receipts, and bounded continuations. Both use actual
+adapter and independent ACP processes with loopback Slack; neither posts to Slack.

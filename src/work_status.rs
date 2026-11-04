@@ -1,5 +1,5 @@
-//! Slack lifecycle indicators derived from actual addressed work, never timers.
-//! Delivery intent is durable and idempotent. No model prompts or chat messages.
+//! Slack lifecycle indicators derived from committed response work.
+//! Native thread status or a scoped temporary message, with durable delivery intent.
 use crate::{
     config::Config,
     model::now_ms,
@@ -26,38 +26,31 @@ fn initialize(s: &Store) -> Result<()> {
         CREATE INDEX IF NOT EXISTS work_status_jobs_target ON work_status_jobs(channel,thread);
         CREATE TABLE IF NOT EXISTS work_status_delivery(channel TEXT NOT NULL,thread TEXT NOT NULL,desired TEXT NOT NULL DEFAULT 'active',confirmed TEXT NOT NULL DEFAULT 'active',dirty INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,blocked INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',updated INTEGER NOT NULL,PRIMARY KEY(channel,thread));
         CREATE TABLE IF NOT EXISTS work_status_control(id INTEGER PRIMARY KEY CHECK(id=1),credential_key TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',retry_at INTEGER NOT NULL DEFAULT 0);")?;
+    s.db.execute_batch("CREATE TABLE IF NOT EXISTS response_indicators(job_id TEXT PRIMARY KEY,channel TEXT NOT NULL,thread TEXT NOT NULL,client_id TEXT NOT NULL,slack_ts TEXT,attempted INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'waiting',phase TEXT NOT NULL DEFAULT 'Working on a response…',shown TEXT NOT NULL DEFAULT '',retry_at INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);")?;
     Ok(())
 }
-/// Called only after the worker identifies a direct/addressed turn. The thread
+/// Called only after a direct/addressed turn or accepted participation. The thread
 /// root is presentation metadata; normal reply placement remains unchanged.
 pub fn track(home: &Path, job: &Job) -> Result<()> {
     let mut s = Store::open(home)?;
     initialize(&s)?;
-    if s.db
-        .query_row(
-            "SELECT disabled FROM work_status_control WHERE id=1",
-            [],
-            |r| r.get::<_, bool>(0),
-        )
-        .optional()?
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
     let root = if job.trigger.thread.is_empty() {
         &job.trigger.ts
     } else {
         &job.trigger.thread
     };
     let tx = s.db.transaction()?;
-    tx.execute(
-        "INSERT OR IGNORE INTO work_status_jobs VALUES(?1,?2,?3)",
-        params![job.id, job.trigger.channel, root],
-    )?;
-    tx.execute(
-        "INSERT OR IGNORE INTO work_status_delivery(channel,thread,updated) VALUES(?1,?2,?3)",
-        params![job.trigger.channel, root, now_ms()],
-    )?;
+    if !job.trigger.thread.is_empty() {
+        tx.execute(
+            "INSERT OR IGNORE INTO work_status_jobs VALUES(?1,?2,?3)",
+            params![job.id, job.trigger.channel, root],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO work_status_delivery(channel,thread,updated) VALUES(?1,?2,?3)",
+            params![job.trigger.channel, root, now_ms()],
+        )?;
+    }
+    tx.execute("INSERT OR IGNORE INTO response_indicators(job_id,channel,thread,client_id,created) VALUES(?1,?2,?3,?4,?5)",params![job.id,job.trigger.channel,job.trigger.thread,uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL,format!("work-status:{}",job.id).as_bytes()).to_string(),now_ms()])?;
     tx.commit()?;
     changed(home);
     Ok(())
@@ -220,6 +213,7 @@ pub async fn reconcile(home: &Path, c: &Config, slack: &Slack, stopping: bool) -
                     "token_revoked",
                     "token_expired",
                     "not_authed",
+                    "not_authorized",
                     "not_allowed_token_type",
                 ]
                 .contains(&reason.as_str())
@@ -246,6 +240,7 @@ pub async fn run(home: std::path::PathBuf, c: Config, slack: Slack) {
         // The timer reconciles local durable job state and retry deadlines. It
         // never polls Slack or emits a status while the state is unchanged.
         let _ = reconcile(&home, &c, &slack, false).await;
+        let _ = fallback_reconcile(&home, &slack, false).await;
         tokio::select! {_=notification().notified()=>{},_=tokio::time::sleep(Duration::from_millis(250))=>{}}
     }
 }
@@ -259,6 +254,11 @@ pub async fn shutdown(home: &Path) {
         let _ = prepare(home, &c, true);
         let _ =
             tokio::time::timeout(Duration::from_secs(3), reconcile(home, &c, &slack, true)).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            fallback_reconcile(home, &slack, true),
+        )
+        .await;
     }
 }
 pub fn status(home: &Path) -> Value {
@@ -269,4 +269,187 @@ pub fn status(home: &Path) -> Value {
         return json!({"available":false});
     }
     s.db.query_row("SELECT disabled,reason,retry_at FROM work_status_control WHERE id=1",[],|r|Ok(json!({"available":!r.get::<_,bool>(0)?,"reason":r.get::<_,String>(1)?,"retry_at":r.get::<_,i64>(2)?}))).unwrap_or_else(|_|json!({"available":null}))
+}
+
+/// Presentation attaches to a committed reply, never global bot presence.
+pub fn track_input(home: &Path, input: &Value) -> Result<()> {
+    let s = Store::open(home)?;
+    let id = input["job_id"].as_str().unwrap_or("");
+    let job =
+        s.db.query_row(
+            "SELECT context,trigger,version FROM jobs WHERE id=?1 AND status='running'",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((context, trigger, version)) = job {
+        track(
+            home,
+            &Job {
+                id: id.into(),
+                context,
+                trigger: serde_json::from_str(&trigger)?,
+                version,
+                reconsidered: false,
+            },
+        )?;
+    }
+    Ok(())
+}
+pub fn phase(home: &Path, job: &str, kind: &str) -> Result<()> {
+    let s = Store::open(home)?;
+    initialize(&s)?;
+    let text = match kind {
+        "execute" | "edit" => "Working on the task…",
+        "read" | "search" | "fetch" => "Checking information…",
+        _ => "Working on a response…",
+    };
+    s.db.execute(
+        "UPDATE response_indicators SET phase=?2 WHERE job_id=?1 AND state<>'finished'",
+        params![job, text],
+    )?;
+    changed(home);
+    Ok(())
+}
+
+/// Fallback for ordinary Slack apps without agent-session status access. Its
+/// post/update/delete calls use existing chat:write access and exact reply scope.
+/// A lost POST receipt is looked up, never blindly repeated.
+pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> Result<()> {
+    let s = Store::open(home)?;
+    initialize(&s)?;
+    let rows=s.db.prepare("SELECT i.job_id,i.channel,i.thread,i.client_id,i.slack_ts,i.attempted,i.phase,i.shown,i.created,j.status,COALESCE(o.status,''),EXISTS(SELECT 1 FROM work_status_control WHERE disabled=1) OR EXISTS(SELECT 1 FROM work_status_jobs w JOIN work_status_delivery d ON d.channel=w.channel AND d.thread=w.thread WHERE w.job_id=i.job_id AND d.blocked=1) FROM response_indicators i JOIN jobs j ON j.id=i.job_id LEFT JOIN outbox o ON o.job_id=j.id WHERE i.state<>'finished' AND (i.state<>'failed_visible' OR (j.status NOT IN ('failed','interrupted') AND COALESCE(o.status,'') NOT IN ('failed','uncertain'))) AND i.retry_at<=?1 ORDER BY i.created LIMIT 32")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,bool>(11)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (
+        id,
+        channel,
+        thread,
+        client_id,
+        mut ts,
+        attempted,
+        phase,
+        shown,
+        created,
+        job,
+        outbox,
+        unavailable,
+    ) in rows
+    {
+        let failed = ["failed", "interrupted"].contains(&job.as_str())
+            || ["failed", "uncertain"].contains(&outbox.as_str());
+        let working =
+            job == "running" || (job == "speak" && ["ready", "sending"].contains(&outbox.as_str()));
+        let waiting = s.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM permissions WHERE job_id=?1 AND status='pending')",
+            [&id],
+            |r| r.get::<_, bool>(0),
+        )? || crate::questions::waiting_job_ids(home, &Config::load(home)?)?
+            .contains(&id);
+        let text = if failed {
+            "I couldn’t confirm this request finished. Some work or a reply may already exist; I’ll need to check that before repeating it."
+        } else if job == "speak" {
+            "Sending the response…"
+        } else if waiting {
+            "Waiting for your answer…"
+        } else {
+            &phase
+        };
+        if ts.is_none() && attempted {
+            if let Ok(Some(found)) = slack
+                .find_message(&channel, &thread, &client_id, created)
+                .await
+            {
+                s.db.execute(
+                    "UPDATE response_indicators SET slack_ts=?2 WHERE job_id=?1",
+                    params![id, found],
+                )?;
+                ts = Some(found);
+            } else {
+                s.db.execute(
+                    "UPDATE response_indicators SET retry_at=?2 WHERE job_id=?1",
+                    params![id, now_ms() + 30_000],
+                )?;
+                continue;
+            }
+        }
+        if stopping || (!working && !failed) {
+            if let Some(ref ts) = ts {
+                match slack
+                    .call("chat.delete", json!({"channel":channel,"ts":ts}), false)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ApiError::Rejected(reason)) if reason == "message_not_found" => {}
+                    Err(_) => {
+                        s.db.execute(
+                            "UPDATE response_indicators SET retry_at=?2 WHERE job_id=?1",
+                            params![id, now_ms() + 5000],
+                        )?;
+                        continue;
+                    }
+                }
+            }
+            s.db.execute(
+                "UPDATE response_indicators SET state='finished' WHERE job_id=?1",
+                [&id],
+            )?;
+            continue;
+        }
+        if !failed && !unavailable && !thread.is_empty() && ts.is_none() {
+            continue;
+        }
+        if ts.is_some() && shown == text {
+            continue;
+        }
+        let mut body = json!({"channel":channel,"text":text,"unfurl_links":false,"unfurl_media":false,"metadata":{"event_type":"acp_work_status","event_payload":{"id":client_id}}});
+        let method = if let Some(ref ts) = ts {
+            body["ts"] = json!(ts);
+            "chat.update"
+        } else {
+            body.as_object_mut().unwrap().remove("text");
+            body["markdown_text"] = json!(text);
+            body["client_msg_id"] = json!(client_id);
+            if !thread.is_empty() {
+                body["thread_ts"] = json!(thread);
+            }
+            s.db.execute(
+                "UPDATE response_indicators SET attempted=1 WHERE job_id=?1",
+                [&id],
+            )?;
+            "chat.postMessage"
+        };
+        match slack.call(method, body, false).await {
+            Ok(value) => {
+                let received = ts.or_else(|| value["ts"].as_str().map(str::to_owned));
+                if let Some(ts) = received {
+                    s.db.execute("UPDATE response_indicators SET slack_ts=?2,shown=?3,state=?4,retry_at=?5 WHERE job_id=?1",params![id,ts,text,if failed {"failed_visible"} else {"posted"},now_ms()+1500])?;
+                }
+            }
+            Err(ApiError::RateLimited(seconds)) => {
+                s.db.execute("UPDATE response_indicators SET attempted=CASE WHEN slack_ts IS NULL THEN 0 ELSE attempted END,retry_at=?2 WHERE job_id=?1",params![id,now_ms()+seconds.clamp(1,3600) as i64*1000])?;
+            }
+            Err(ApiError::Rejected(_)) => {
+                s.db.execute(
+                    "UPDATE response_indicators SET state='finished' WHERE job_id=?1",
+                    [&id],
+                )?;
+                s.audit(
+                    "response_indicator_unavailable",
+                    json!({"job":id,"reason":"Slack rejected the scoped status message"}),
+                )?;
+            }
+            Err(ApiError::Uncertain) => {
+                s.db.execute(
+                    "UPDATE response_indicators SET retry_at=?2 WHERE job_id=?1",
+                    params![id, now_ms() + 5000],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
