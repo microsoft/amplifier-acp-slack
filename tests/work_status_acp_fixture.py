@@ -8,6 +8,18 @@ for line in sys.stdin:
  elif method=='session/prompt':
   prompt=''.join(b.get('text','') for b in p['prompt']);input=json.loads(prompt.split('Latest conversation projection:\n',1)[1]);text=input['trigger']['text'];sid=p['sessionId']
   time.sleep(.6)
+  if 'detailed' in text:
+   def update(**fields):send({'method':'session/update','params':{'sessionId':sid,'update':fields}})
+   send({'method':'session/update','params':{'sessionId':'wrong-session','update':{'sessionUpdate':'tool_call','toolCallId':'wrong','title':'WRONG_SESSION','kind':'execute','status':'in_progress'}}})
+   update(sessionUpdate='tool_call',toolCallId='test',title='Run unit tests',name='workspace_run',kind='execute',status='pending',rawInput={'secret':'PRIVATE_ARGUMENT'})
+   update(sessionUpdate='tool_call_update',toolCallId='test',status='in_progress')
+   if 'Decide quietly' not in prompt:time.sleep(2.4)
+   update(sessionUpdate='tool_call',toolCallId='read',title='Read '+input['trigger']['channel']+'\nnotes <!channel>',kind='read',status='in_progress',rawOutput='PRIVATE_RESULT')
+   if 'Decide quietly' not in prompt:time.sleep(2.2)
+   update(sessionUpdate='tool_call_update',toolCallId='read',status='completed')
+   if 'Decide quietly' not in prompt:time.sleep(1.8)
+   update(sessionUpdate='tool_call_update',toolCallId='test',status='completed')
+   if 'Decide quietly' not in prompt:time.sleep(1.8)
   if 'permission' in text:
    send({'id':'permission','method':'session/request_permission','params':{'sessionId':sid,'toolCall':{'toolCallId':'fixture','title':'Perform requested action','kind':'execute'},'options':[{'optionId':'yes','name':'Allow once','kind':'allow_once'},{'optionId':'no','name':'Reject once','kind':'reject_once'}]}})
    json.loads(sys.stdin.readline());time.sleep(.6)

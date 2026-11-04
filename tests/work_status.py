@@ -58,6 +58,13 @@ async def main():
    passed('Ambient silent assessments emit no work indicator')
    m=await f.send('Cthread','<@Ualpha> Please help',thread='1800000000.123456');await state('Cthread','active');assert all(s['thread_ts']=='1800000000.123456' for s in f.statuses if s['channel_id']=='Cthread')
    passed('Addressed channel work uses the existing thread root')
+   await f.send('Dtools','Please show detailed work');await state('Dtools','active')
+   await until(lambda:any(i.get('deleted') for i in f.indicators if i['channel']=='Dtools'),'detailed line cleared')
+   labels=[u['text'] for u in f.indicator_updates if u['channel']=='Dtools']
+   assert 'Running · Run unit tests (workspace_run)' in labels,labels
+   assert 'Reading · Read Dtools notes <!channel> · +1 tool' in labels,labels
+   assert all(u.get('thread_ts')=='1800000000.123456' for u in f.indicator_updates if u['channel']=='Dtools')
+   passed('Native enum-only thread status is supplemented by one scoped tool-detail line and cleaned up')
    await f.send('Dpermission','Need permission');await state('Dpermission','suspended');n=len(f.statuses);await asyncio.sleep(.6);assert len(f.statuses)==n
    await f.action(f.approvals[-1],0);await state('Dpermission','active');assert transitions('Dpermission')==['processing','suspended','processing','active']
    passed('Human approvals suspend work and resume it only after a real decision')

@@ -658,6 +658,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut callbacks = tokio::task::JoinSet::new();
     let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
     let mut tool_calls: HashMap<String, Value> = HashMap::new();
+    let mut activity = crate::work_status::ToolActivity::default();
     loop {
         let v = tokio::select! {
             result=callbacks.join_next(),if !callbacks.is_empty()=>{
@@ -784,12 +785,10 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                     u["sessionUpdate"].as_str(),
                     Some("tool_call" | "tool_call_update")
                 )
+                && let Some(text) = activity.update(u)
             {
-                let _ = crate::work_status::phase(
-                    home,
-                    input["job_id"].as_str().unwrap_or(""),
-                    u["kind"].as_str().unwrap_or(""),
-                );
+                let _ =
+                    crate::work_status::phase(home, input["job_id"].as_str().unwrap_or(""), &text);
             }
             if matches!(
                 u["sessionUpdate"].as_str(),

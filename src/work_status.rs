@@ -10,7 +10,12 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, path::Path, sync::OnceLock, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::OnceLock,
+    time::Duration,
+};
 use tokio::sync::Notify;
 
 fn notification() -> &'static Notify {
@@ -302,14 +307,129 @@ pub fn track_input(home: &Path, input: &Value) -> Result<()> {
     }
     Ok(())
 }
-pub fn phase(home: &Path, job: &str, kind: &str) -> Result<()> {
+#[derive(Default)]
+pub struct ToolActivity {
+    active: HashMap<String, ActiveTool>,
+    sequence: u64,
+}
+
+#[derive(Default)]
+struct ActiveTool {
+    title: String,
+    name: String,
+    kind: String,
+    status: String,
+    sequence: u64,
+}
+
+fn single_line(text: &str, limit: usize) -> String {
+    let text: String = text.chars().map(|c| {
+        if c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') { ' ' } else { c }
+    }).collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > limit {
+        format!(
+            "{}…",
+            text.chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        text
+    }
+}
+
+impl ToolActivity {
+    /// ACP updates are partial. Keep public presentation fields across updates,
+    /// never command arguments, tool output, or private reasoning content.
+    pub fn update(&mut self, update: &Value) -> Option<String> {
+        let id = update["toolCallId"].as_str()?;
+        if id.is_empty() || id.len() > 1024 {
+            return None;
+        }
+        let completed = matches!(update["status"].as_str(), Some("completed" | "failed"));
+        if completed {
+            self.active.remove(id)?;
+        } else {
+            if !self.active.contains_key(id) && update["sessionUpdate"] != "tool_call" {
+                return None;
+            }
+            if self.active.len() >= 100 && !self.active.contains_key(id) {
+                return None;
+            }
+            self.sequence += 1;
+            let tool = self.active.entry(id.into()).or_default();
+            for (key, target, limit) in [
+                ("title", &mut tool.title, 110),
+                ("name", &mut tool.name, 48),
+                ("kind", &mut tool.kind, 24),
+                ("status", &mut tool.status, 24),
+            ] {
+                if let Some(value) = update[key].as_str() {
+                    *target = single_line(value, limit);
+                }
+            }
+            tool.sequence = self.sequence;
+        }
+        let Some(tool) = self.active.values().max_by_key(|t| t.sequence) else {
+            return Some(if update["status"] == "failed" {
+                "Checking a tool failure…".into()
+            } else {
+                "Preparing the response…".into()
+            });
+        };
+        let action = if tool.status == "pending" || tool.status.is_empty() {
+            "Starting"
+        } else {
+            match tool.kind.as_str() {
+                "read" => "Reading",
+                "search" => "Searching",
+                "fetch" => "Fetching",
+                "edit" => "Editing",
+                "delete" => "Deleting",
+                "move" => "Moving",
+                "execute" => "Running",
+                "think" => "Thinking",
+                "switch_mode" => "Switching mode",
+                _ => "Using a tool",
+            }
+        };
+        let title = if tool.kind == "think" {
+            String::new()
+        } else if tool.title.is_empty() {
+            tool.name.clone()
+        } else if !tool.name.is_empty()
+            && tool.title.replace('_', " ").to_lowercase()
+                != tool.name.replace('_', " ").to_lowercase()
+        {
+            format!("{} ({})", tool.title, tool.name)
+        } else {
+            tool.title.clone()
+        };
+        let label = if title.is_empty() {
+            format!("{action}…")
+        } else {
+            format!("{action} · {title}")
+        };
+        let others = self.active.len() - 1;
+        let suffix = if others == 0 {
+            String::new()
+        } else {
+            format!(
+                " · +{others} {}",
+                if others == 1 { "tool" } else { "tools" }
+            )
+        };
+        Some(format!(
+            "{}{suffix}",
+            single_line(&label, 180 - suffix.chars().count())
+        ))
+    }
+}
+
+pub fn phase(home: &Path, job: &str, text: &str) -> Result<()> {
     let s = Store::open(home)?;
     initialize(&s)?;
-    let text = match kind {
-        "execute" | "edit" => "Working on the task…",
-        "read" | "search" | "fetch" => "Checking information…",
-        _ => "Working on a response…",
-    };
     s.db.execute(
         "UPDATE response_indicators SET phase=?2 WHERE job_id=?1 AND state<>'finished'",
         params![job, text],
@@ -400,19 +520,27 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
             )?;
             continue;
         }
-        if !failed && !unavailable && !thread.is_empty() && ts.is_none() {
+        if !failed
+            && !unavailable
+            && !thread.is_empty()
+            && ts.is_none()
+            && phase == "Working on a response…"
+        {
             continue;
         }
         if ts.is_some() && shown == text {
             continue;
         }
-        let mut body = json!({"channel":channel,"text":text,"unfurl_links":false,"unfurl_media":false,"metadata":{"event_type":"acp_work_status","event_payload":{"id":client_id}}});
+        // Tool labels are display data, not Slack markup or mention instructions.
+        let fallback_text = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let mut body = json!({"channel":channel,"text":fallback_text,"mrkdwn":false,"parse":"none","link_names":false,"blocks":[{"type":"section","text":{"type":"plain_text","text":text,"emoji":false}}],"unfurl_links":false,"unfurl_media":false,"metadata":{"event_type":"acp_work_status","event_payload":{"id":client_id}}});
         let method = if let Some(ref ts) = ts {
             body["ts"] = json!(ts);
             "chat.update"
         } else {
-            body.as_object_mut().unwrap().remove("text");
-            body["markdown_text"] = json!(text);
             body["client_msg_id"] = json!(client_id);
             if !thread.is_empty() {
                 body["thread_ts"] = json!(thread);

@@ -40,11 +40,24 @@ async def main():
    await f.send('Dnormal','Please help');await until(lambda:finished('Dnormal'),'DM indicator cleared')
    assert len(indicators('Dnormal'))==1 and not indicators('Dnormal')[0].get('thread_ts');assert not f.statuses
    print('PASS DM work stays in the main DM, with one temporary indicator and no synthetic thread',flush=True)
-   before=len(f.indicators);await f.send('Cquiet','People are discussing');await until(lambda:bool(rows(home,"SELECT 1 FROM jobs WHERE status='pass'")),'quiet pass');assert len(f.indicators)==before
+   before=len(f.indicators);await f.send('Cquiet','People are discussing detailed options');await until(lambda:bool(rows(home,"SELECT 1 FROM jobs WHERE status='pass'")),'quiet pass');assert len(f.indicators)==before
    print('PASS Quiet participation emits no public activity',flush=True)
    await f.send('Cgroup','Please contribute to this idea',thread='1800000000.000001');await asyncio.sleep(.3);assert not indicators('Cgroup')
    await until(lambda:finished('Cgroup'),'group done');assert indicators('Cgroup')[0]['thread_ts']=='1800000000.000001';assert len(f.statuses)==1
    print('PASS Group assessment is private; accepted reply has exact-thread fallback despite rejected native status',flush=True)
+   await f.send('Dtools','Please show detailed work')
+   await f.send('Ctools','<@Ualpha> Please show detailed work',thread='1800000000.000002')
+   await until(lambda:finished('Dtools') and finished('Ctools'),'detailed activity finished',timeout=25)
+   for ch,thread in [('Dtools',''),('Ctools','1800000000.000002')]:
+    updates=[u for u in f.indicator_updates if u['channel']==ch]
+    assert len(indicators(ch))==1 and all(u.get('thread_ts','')==thread for u in updates)
+    labels=[u['text'] for u in updates]
+    assert 'Running · Run unit tests (workspace_run)' in labels,labels
+    assert 'Reading · Read '+ch+' notes <!channel> · +1 tool' in labels,labels
+    assert 'Preparing the response…' in labels,labels
+    assert all('\n' not in label and len(label)<=180 for label in labels)
+    assert all(marker not in label for label in labels for marker in ['PRIVATE_ARGUMENT','PRIVATE_RESULT','WRONG_SESSION','Ctools' if ch=='Dtools' else 'Dtools'])
+   print('PASS Partial ACP updates retain tool labels, concurrent tools share one plain-text line, and simultaneous conversations stay isolated',flush=True)
    # A failed actual turn leaves an honest scoped outcome instead of vanishing.
    await f.send('Dfail','Please fail');await until(lambda:indicators('Dfail') and 'couldn’t confirm' in indicators('Dfail')[0].get('text',''),'visible failure')
    assert not indicators('Dfail')[0].get('deleted')
