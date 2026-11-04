@@ -617,9 +617,6 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             "Invalid host attention offer"
         );
         attention_offer = Some(json!({"id":offer["id"],"ticket":offer["ticket"]}));
-        // A current engage offer commits to a response just like the ordinary
-        // participation path. Quiet evaluations and stale offers remain invisible.
-        crate::work_status::track_input(home, input)?;
     }
     store.audit(
         "acp_turn_started",
@@ -686,6 +683,11 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             "INSERT OR IGNORE INTO prompt_attempts VALUES(?1,?2)",
             rusqlite::params![job, crate::model::now_ms()],
         )?;
+    }
+    // Track only committed response work. This covers direct replies, accepted
+    // continuations, and current host engage offers; quiet evaluation stays hidden.
+    if !deciding {
+        crate::work_status::track_input(home, input)?;
     }
     let mut params = json!({"sessionId":sid,"prompt":blocks});
     if let Some(offer) = &attention_offer {

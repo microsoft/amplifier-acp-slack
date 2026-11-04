@@ -75,6 +75,12 @@ async def main(host_attention=False):
    await until(lambda:bool(rows(home,"SELECT id FROM jobs WHERE status='pass' AND json_extract(trigger,'$.channel')='Chold'")),'quiet hold')
    await asyncio.sleep(.3);assert before==(len(f.statuses),len(f.indicators))
    passed('Held ambient events never publish temporary messages or native status')
+   if host_attention:
+    before=(len(f.statuses),len(f.indicators));await f.send('Caddressedhold','<@Ualpha> Please stay quiet')
+    await until(lambda:bool(rows(home,"SELECT id FROM jobs WHERE status='pass' AND json_extract(trigger,'$.channel')='Caddressedhold'")),'addressed hold')
+    await asyncio.sleep(.3);assert before==(len(f.statuses),len(f.indicators))
+    passed('A held host offer stays invisible even when the message mentions the agent')
+
    await f.send('Dtools','Please show detailed work');await state('Dtools','active')
    await until(lambda:any(i.get('deleted') for i in f.indicators if i['channel']=='Dtools'),'detailed line cleared')
    labels=[u['text'] for u in f.indicator_updates if u['channel']=='Dtools']

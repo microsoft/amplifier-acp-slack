@@ -191,9 +191,6 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                                 }
                             }
                         }
-                        if !driver::optional_participation(&c,&input) {
-                            let _=crate::work_status::track(&home,&job);
-                        }
                         let result=driver::decide(c.clone(),home.clone(),input).await;
                         (job,result)
                     },

@@ -8,7 +8,7 @@ for line in sys.stdin:
   if '--host-attention' in sys.argv:result['_meta']={'com.microsoft.amplifier.attention':{'version':1,'enabled':True,'method':'_amplifier/attention'}}
  elif method=='_amplifier/attention':
   text=p['context']['messages'][-1]['text'];time.sleep(.6)
-  result={'action':'engage' if 'contribute' in text or '<@Ualpha>' in text else 'hold','id':'fixture-offer','ticket':'fixture-ticket','reason':'fixture'}
+  result={'action':'engage' if 'stay quiet' not in text and ('contribute' in text or '<@Ualpha>' in text) else 'hold','id':'fixture-offer','ticket':'fixture-ticket','reason':'fixture'}
  elif method=='session/new':result={'sessionId':'saved-fixture'}
  elif method=='session/prompt':
   if '_meta' in p:assert p['_meta']['com.microsoft.amplifier.attention']=={'id':'fixture-offer','ticket':'fixture-ticket'}
