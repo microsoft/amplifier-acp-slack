@@ -595,6 +595,29 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     };
     ensure!(sid.len() <= 1024, "Invalid ACP session id");
     store.bind_session(ctx, &endpoint, &sid, can_load, &input["conversation"])?;
+    let host_attention = crate::attention::supported(&init) && crate::attention::applies(c, input);
+    let mut attention_offer = None;
+    if host_attention {
+        let evidence = crate::attention::context(c, input)?;
+        let offer=client.peer.request(crate::attention::METHOD,json!({"sessionId":sid,"occurredAt":crate::attention::occurred_at(input)?,"context":evidence})).await?;
+        store.audit("attention_offer",json!({"context":ctx,"id":offer["id"],"action":offer["action"],"reason":offer["reason"],"admitted":false}))?;
+        let source: Message = serde_json::from_value(input["trigger"].clone())?;
+        let mut fresh = input.clone();
+        fresh["history"] = json!(store.history(&source)?);
+        if offer["action"] != "engage" || crate::attention::context(c, &fresh)? != evidence {
+            return Ok(Decision {
+                decision: "pass".into(),
+                text: String::new(),
+                reason: "No current host attention offer".into(),
+                media: vec![],
+            });
+        }
+        ensure!(
+            offer["ticket"].as_str().is_some() && offer["id"].as_str().is_some(),
+            "Invalid host attention offer"
+        );
+        attention_offer = Some(json!({"id":offer["id"],"ticket":offer["ticket"]}));
+    }
     store.audit(
         "acp_turn_started",
         json!({"context":ctx,"session_id":sid,"resumed":loaded,
@@ -616,7 +639,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         input,
     )?;
     let input = &diagnostic_input;
-    let ambient = optional_participation(c, input);
+    let ambient = host_attention || optional_participation(c, input);
     let instruction = if ambient {
         "Read the room. Contribute only when useful and timely. Silence is normal; do not acknowledge merely to take a turn or repeat a settled point. Return exactly one final JSON object: {\"decision\":\"speak\",\"text\":\"your concise contribution\",\"reason\":\"brief operational reason\"} or {\"decision\":\"pass\",\"reason\":\"brief operational reason\"}. This optional participation convention is a prompt contract, not a special ACP capability."
     } else {
@@ -646,7 +669,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         mark_snapshot(&mut blocks[0], ctx, input, "response");
     }
     let response_blocks = blocks.clone();
-    let mut deciding = ambient;
+    let mut deciding = ambient && !host_attention;
     if deciding {
         blocks = vec![
             json!({"type":"text","text":format!("Decide quietly whether you should contribute to this conversation. Do not perform work, call tools, ask questions or draft the answer yet. Return exactly one final JSON object: {{\"decision\":\"speak\"}} or {{\"decision\":\"pass\",\"reason\":\"brief reason\"}}. Silence is appropriate when nothing useful is needed. This is only a participation decision; a separate turn will execute an accepted reply. Latest conversation projection:\n{}",serde_json::to_string(input)? )}),
@@ -661,7 +684,14 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             rusqlite::params![job, crate::model::now_ms()],
         )?;
     }
-    client.peer.write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":blocks}})).await?;
+    let mut params = json!({"sessionId":sid,"prompt":blocks});
+    if let Some(offer) = &attention_offer {
+        params["_meta"] = json!({crate::attention::META:offer});
+    }
+    client
+        .peer
+        .write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params}))
+        .await?;
     let mut output = String::new();
     let mut media = Vec::new();
     let mut media_omitted = false;
@@ -711,6 +741,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             if v["result"]["stopReason"] != "end_turn" {
                 store.audit("acp_turn_failed",json!({"context":ctx,"session_id":sid,"reason":"Agent did not complete the turn"}))?;
                 bail!("ACP turn did not complete");
+            }
+            if let Some(offer) = attention_offer.take() {
+                store.audit(
+                    "attention_turn_completed",
+                    json!({"context":ctx,"id":offer["id"],"stop_reason":v["result"]["stopReason"]}),
+                )?;
             }
             if deciding {
                 let choice: Value = serde_json::from_str(
