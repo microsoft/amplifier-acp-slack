@@ -297,3 +297,43 @@ fn bot_continuation_is_owner_opt_in_and_keeps_hourly_limits() {
     s.db.execute("UPDATE outbox SET available=0", []).unwrap();
     assert!(s.claim_outgoing(&c).unwrap().is_some());
 }
+
+#[test]
+fn reservations_wait_for_other_connections_instead_of_aborting_the_connector() {
+    for reserve_delivery in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let a = attention();
+        s.ingest("work", &message("1.000001"), true).unwrap();
+        if reserve_delivery {
+            let job = s.claim(&a).unwrap().unwrap();
+            s.finish(&job, speak(), &a).unwrap();
+        }
+        // Permissions and status use their own connections. Hold a write open
+        // while the worker reserves a job or reply against the same database.
+        let mut other = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+        let tx = other
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "INSERT INTO settings VALUES('concurrent-check','active')",
+            [],
+        )
+        .unwrap();
+        let (ready, started) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            if reserve_delivery {
+                s.claim_outgoing(&config()).map(|out| out.map(|v| v.id))
+            } else {
+                s.claim(&a).map(|job| job.map(|v| v.id))
+            }
+        });
+        started.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tx.commit().unwrap();
+        let result = worker.join().unwrap();
+        assert!(result.is_ok(), "reservation {reserve_delivery}: {result:?}");
+        assert!(result.unwrap().is_some());
+    }
+}

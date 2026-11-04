@@ -377,7 +377,12 @@ impl Store {
     }
     pub fn claim(&mut self, a: &Attention) -> Result<Option<Job>> {
         let now = now_ms();
-        let tx = self.db.transaction()?;
+        // Reserve the write before reading: permission/status connections can
+        // write concurrently, and a deferred read-to-write upgrade can fail
+        // immediately with SQLITE_BUSY instead of honoring the busy timeout.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidate:Option<(String,String,String,String)>=tx.query_row("SELECT id,context,trigger,note FROM jobs j WHERE status='pending' AND available<=?2 AND updated<=?1 AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.context=j.context AND x.status='running') ORDER BY created LIMIT 1",params![now-a.settle_ms as i64,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let Some((id, context, trigger, note)) = candidate else {
             return Ok(None);
@@ -470,7 +475,12 @@ impl Store {
         Ok(())
     }
     pub fn claim_outgoing(&mut self, c: &Config) -> Result<Option<Outgoing>> {
-        let tx = self.db.transaction()?;
+        // Reserve the write before reading: permission/status connections can
+        // write concurrently, and a deferred read-to-write upgrade can fail
+        // immediately with SQLITE_BUSY instead of honoring the busy timeout.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.human_version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
             let raw:String=r.get(7)?;
             let media=serde_json::from_str(&raw).map_err(|e|rusqlite::Error::FromSqlConversionFailure(7,rusqlite::types::Type::Text,Box::new(e)))?;
