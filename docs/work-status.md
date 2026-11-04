@@ -18,7 +18,7 @@ The message stays in the exact reply destination. It shows the current action an
 the agent's public ACP tool title, plus its tool name when supplied and distinct:
 “Running · Run unit tests (workspace_run)”, for example. Partial progress updates
 retain that label; parallel tools add a count to the same line. Completed tools
-leave the active set, and once all finish the line says “Preparing the response…”.
+leave the active set, and once all finish the line says “Thinking…”.
 Existing threads with native enum-only status also receive this detail line when
 tools run. A pending approval or question says it is waiting for the person;
 queued delivery says it is sending.

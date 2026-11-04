@@ -31,7 +31,10 @@ fn initialize(s: &Store) -> Result<()> {
         CREATE INDEX IF NOT EXISTS work_status_jobs_target ON work_status_jobs(channel,thread);
         CREATE TABLE IF NOT EXISTS work_status_delivery(channel TEXT NOT NULL,thread TEXT NOT NULL,desired TEXT NOT NULL DEFAULT 'active',confirmed TEXT NOT NULL DEFAULT 'active',dirty INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,blocked INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',updated INTEGER NOT NULL,PRIMARY KEY(channel,thread));
         CREATE TABLE IF NOT EXISTS work_status_control(id INTEGER PRIMARY KEY CHECK(id=1),credential_key TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',retry_at INTEGER NOT NULL DEFAULT 0);")?;
-    s.db.execute_batch("CREATE TABLE IF NOT EXISTS response_indicators(job_id TEXT PRIMARY KEY,channel TEXT NOT NULL,thread TEXT NOT NULL,client_id TEXT NOT NULL,slack_ts TEXT,attempted INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'waiting',phase TEXT NOT NULL DEFAULT 'Working on a response…',shown TEXT NOT NULL DEFAULT '',retry_at INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);")?;
+    s.db.execute_batch("CREATE TABLE IF NOT EXISTS response_indicators(job_id TEXT PRIMARY KEY,channel TEXT NOT NULL,thread TEXT NOT NULL,client_id TEXT NOT NULL,slack_ts TEXT,attempted INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'waiting',phase TEXT NOT NULL DEFAULT 'Thinking…',shown TEXT NOT NULL DEFAULT '',retry_at INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);")?;
+    // Existing databases retain their original column default. Normalize only
+    // generic live placeholders; preserve tool labels and historical delivery text.
+    s.db.execute("UPDATE response_indicators SET phase='Thinking…' WHERE state<>'finished' AND phase IN ('Preparing the response…','Preparing the response...','Working on a response…','Working on the task…','Working on the task...')", [])?;
     Ok(())
 }
 /// Called only after a direct/addressed turn or accepted participation. The thread
@@ -55,7 +58,7 @@ pub fn track(home: &Path, job: &Job) -> Result<()> {
             params![job.trigger.channel, root, now_ms()],
         )?;
     }
-    tx.execute("INSERT OR IGNORE INTO response_indicators(job_id,channel,thread,client_id,created) VALUES(?1,?2,?3,?4,?5)",params![job.id,job.trigger.channel,job.trigger.thread,uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL,format!("work-status:{}",job.id).as_bytes()).to_string(),now_ms()])?;
+    tx.execute("INSERT OR IGNORE INTO response_indicators(job_id,channel,thread,client_id,created,phase) VALUES(?1,?2,?3,?4,?5,'Thinking…')",params![job.id,job.trigger.channel,job.trigger.thread,uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL,format!("work-status:{}",job.id).as_bytes()).to_string(),now_ms()])?;
     tx.commit()?;
     changed(home);
     Ok(())
@@ -520,12 +523,7 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
             )?;
             continue;
         }
-        if !failed
-            && !unavailable
-            && !thread.is_empty()
-            && ts.is_none()
-            && phase == "Working on a response…"
-        {
+        if !failed && !unavailable && !thread.is_empty() && ts.is_none() && phase == "Thinking…" {
             continue;
         }
         if ts.is_some() && shown == text {
@@ -580,4 +578,60 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn upgraded_database_starts_with_thinking_and_preserves_specific_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        initialize(&s).unwrap();
+        let schema: String =
+            s.db.query_row(
+                "SELECT sql FROM sqlite_master WHERE name='response_indicators'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        s.db.execute_batch("DROP TABLE response_indicators")
+            .unwrap();
+        s.db.execute_batch(
+            &schema.replace("DEFAULT 'Thinking…'", "DEFAULT 'Preparing the response…'"),
+        )
+        .unwrap();
+        s.db.execute("INSERT INTO response_indicators(job_id,channel,thread,client_id,created) VALUES('old','Dtest','','old',0)", []).unwrap();
+        s.db.execute("INSERT INTO response_indicators(job_id,channel,thread,client_id,created,phase) VALUES('tool','Dtest','','tool',0,'Reading · README.md')", []).unwrap();
+        let trigger = serde_json::from_value(json!({"team":"Ttest","channel":"Dtest","thread":"","ts":"1.0","revision":"1","sender":"Utest","bot":false,"text":"Hello","deleted":false})).unwrap();
+        track(
+            dir.path(),
+            &Job {
+                id: "new".into(),
+                context: "fixture".into(),
+                trigger,
+                version: 1,
+                reconsidered: false,
+            },
+        )
+        .unwrap();
+        for id in ["old", "new"] {
+            let phase: String =
+                s.db.query_row(
+                    "SELECT phase FROM response_indicators WHERE job_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(phase, "Thinking…");
+        }
+        let phase: String =
+            s.db.query_row(
+                "SELECT phase FROM response_indicators WHERE job_id='tool'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "Reading · README.md");
+    }
 }
