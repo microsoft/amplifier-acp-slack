@@ -256,15 +256,26 @@ pub fn queue(home: &Path, command: Command, agent: bool) -> ApiResult<Value> {
 /// Shared admission lock closes the last-idle-check/worker-start race. Intake
 /// still persists new Slack messages; only starting another ACP turn is delayed.
 pub fn admission(home: &Path) -> Result<Option<std::fs::File>> {
-    private_dir(&home.join("updates"))?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.join("updates/admission.lock"))?;
-    if file.try_lock_exclusive().is_err() {
-        return Ok(None);
+    // The host may own update controls and expose them read-only to a container.
+    // flock needs an open descriptor, not write access. Keep using the SAME
+    // inode as the host updater so its drain/critical-section fence still works.
+    let file = match std::fs::File::open(home.join("updates/admission.lock")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            private_dir(&home.join("updates"))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(home.join("updates/admission.lock"))?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e.into()),
     }
     if let Some(job) = active(home)
         && [
@@ -336,6 +347,36 @@ pub async fn action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn admission_reads_host_owned_controls_without_changing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let host_lock = lock(dir.path(), "admission.lock").unwrap();
+        let root = dir.path().join("updates");
+        let path = root.join("admission.lock");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Contention still blocks turns even when self-update is disabled.
+        assert!(admission(dir.path()).unwrap().is_none());
+        drop(host_lock);
+        let permit = admission(dir.path()).unwrap().unwrap();
+        let other = std::fs::File::open(&path).unwrap();
+        assert!(other.try_lock_exclusive().is_err());
+        drop(permit);
+        assert!(other.try_lock_exclusive().is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     #[test]
     fn owner_context_does_not_grant_updates_and_scope_cannot_expand() {
         let dir = tempfile::tempdir().unwrap();

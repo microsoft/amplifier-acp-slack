@@ -2,7 +2,7 @@ use crate::{
     config::{self, Config},
     driver, slack, store,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::json;
 use std::{
@@ -10,6 +10,29 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::{sync::Notify, task::JoinSet};
+
+#[derive(Debug)]
+struct UpdateAdmissionUnavailable;
+impl std::fmt::Display for UpdateAdmissionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Connector update coordination is unavailable; check installation storage and permissions")
+    }
+}
+impl std::error::Error for UpdateAdmissionUnavailable {}
+
+fn failure_details(error: &anyhow::Error) -> (&'static str, &'static str) {
+    if error.is::<UpdateAdmissionUnavailable>() {
+        (
+            "update_coordination_unavailable",
+            "Connector update coordination is unavailable; check installation storage and permissions",
+        )
+    } else {
+        (
+            "connection_failed",
+            "Connection could not start or stopped unexpectedly; check connector activity",
+        )
+    }
+}
 
 async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> Result<()> {
     let home = std::fs::canonicalize(home)?;
@@ -112,7 +135,9 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
             _=notify.notified()=>{},
         }
         while workers.len() < c.attention.parallel_contexts {
-            let Some(admission) = crate::updates::admission(&home)? else {
+            let Some(admission) =
+                crate::updates::admission(&home).context(UpdateAdmissionUnavailable)?
+            else {
                 break;
             };
             let next = store.lock().unwrap().claim(&c.attention)?;
@@ -242,22 +267,37 @@ pub async fn supervise(
         )?;
         let observed = c.revision;
         let result = run(home.clone(), changes.clone()).await;
-        if result.is_err() {
-            runtime_status(
-                &home,
-                &c,
-                "failed",
-                "Connection failed; check the configured Slack credentials and endpoint",
-            )?;
+        if let Err(error) = result {
+            // Never expose raw paths, credentials, prompts or endpoint stderr.
+            let (category, reason) = failure_details(&error);
+            runtime_status(&home, &c, "failed", reason)?;
             let s = store::Store::open(&home)?;
             s.audit(
                 "connection_failed",
-                json!({"reason":"Connection could not start or stopped unexpectedly"}),
+                json!({"category":category,"reason":reason}),
             )?;
         }
         if *changes.borrow() != observed {
             continue;
         }
         tokio::select! { r=changes.changed()=>if r.is_err(){return Ok(());}, _=tokio::time::sleep(std::time::Duration::from_secs(15))=>{} }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failure_diagnostics_identify_coordination_without_leaking_causes() {
+        let error =
+            anyhow::anyhow!("private path or credential").context(UpdateAdmissionUnavailable);
+        let (category, reason) = failure_details(&error);
+        assert_eq!(category, "update_coordination_unavailable");
+        assert!(!reason.contains("credential"));
+        assert!(!reason.contains("private path"));
+        assert_eq!(
+            failure_details(&anyhow::anyhow!("secret")).0,
+            "connection_failed"
+        );
     }
 }

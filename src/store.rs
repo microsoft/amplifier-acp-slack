@@ -616,16 +616,21 @@ impl Store {
         let contexts: i64 = self
             .db
             .query_row("SELECT COUNT(*) FROM contexts", [], |r| r.get(0))?;
-        let connection: Option<String> = self
+        let connection: Option<(String, String)> = self
             .db
             .query_row(
-                "SELECT data FROM audit WHERE kind='connection' ORDER BY seq DESC LIMIT 1",
+                "SELECT kind,data FROM audit WHERE kind IN ('connection','process_started','process_stopped','connection_failed') ORDER BY seq DESC LIMIT 1",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         Ok(
-            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"slack_connection":connection.and_then(|s|serde_json::from_str::<Value>(&s).ok())}),
+            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
+                "connection" => serde_json::from_str::<Value>(&data).ok(),
+                "process_started" => Some(json!({"state":"connecting"})),
+                "process_stopped" => Some(json!({"state":"stopped"})),
+                _ => Some(json!({"state":"failed"})),
+            })}),
         )
     }
 }

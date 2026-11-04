@@ -119,3 +119,19 @@ schema migrations.
 
 Validation uses disposable loopback installations and fake platform boundaries;
 `python3 tests/updates.py` makes no live Slack posts or model calls.
+
+## Host-managed installations
+
+When an operator manages updates outside a container, keep the in-app update
+policy disabled and the executable and update controls read-only. Prepare
+`updates/admission.lock` on the host before mounting the directory. The connector
+opens that existing file read-only and locks the same inode as the host updater;
+it does not change permissions, write into the update folder, or bypass drain
+and recovery gates. Missing controls on a writable installation are initialized
+as usual. Do not delete or replace the lock file while either side is running.
+
+After a restart, run `check --target all` against the installation. Valid Slack
+credentials, a running web service, or a previous `connected` audit entry alone
+do not establish recovery. The check requires a fresh Socket Mode connection
+for the current runtime/configuration as well as an ACP handshake and session.
+It does not send a prompt or post a Slack message.

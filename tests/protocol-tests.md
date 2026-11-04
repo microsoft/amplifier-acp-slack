@@ -31,6 +31,14 @@ Initialization failures are exercised separately: one transient failure recovers
 before prompting, a permanent failure stops after two attempts, and a failed
 prompt is not retried by the initialization mechanism.
 
+The first installation also receives and answers a DM with read-only update
+controls. The test checks that their permissions remain unchanged. To exercise
+an actual read-only container mount, set `ACP_SLACK_TEST_UPDATES` to a mounted
+directory containing an empty `admission.lock`; use directory mode 0500 and
+file mode 0400. The test then uses that mount instead of its local fixture.
+The updater tests separately verify that host lock contention, drain leases,
+and critical recovery continue to prevent new turns.
+
 The endpoint's deterministic policy exists only to make these boundary conditions
 repeatable. Passing these tests establishes connector behavior under those
 conditions; it does not establish Slack service behavior, compatibility with every
