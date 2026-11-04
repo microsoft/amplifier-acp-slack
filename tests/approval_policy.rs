@@ -263,3 +263,46 @@ fn legacy_configuration_requires_approval_but_questions_do_not_require_an_allowl
         .to_string();
     assert!(schema.contains("approvals_required"));
 }
+
+#[tokio::test]
+async fn teammate_replies_preserve_active_permissions_but_human_followups_revoke_them() {
+    for initial_bot in [false, true] {
+        for newcomer_bot in [false, true] {
+            let f = Fixture::new("wait", initial_bot);
+            let task = tokio::spawn(driver::decide(f.c.clone(), f.home.clone(), f.input.clone()));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !f.home.join("ready").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut peer: Message = serde_json::from_value(f.input["trigger"].clone()).unwrap();
+            peer.ts = "124.000".into();
+            peer.revision = peer.ts.clone();
+            peer.sender = "UNEWCOMER".into();
+            peer.bot = newcomer_bot;
+            peer.text = if newcomer_bot {
+                "I can review the candidate when ready"
+            } else {
+                "Stop before the next action"
+            }
+            .into();
+            f.store().ingest("new-message", &peer, true).unwrap();
+            std::fs::write(f.home.join("proceed"), "go").unwrap();
+            task.await.unwrap().unwrap();
+            let reply: Value =
+                serde_json::from_slice(&std::fs::read(f.home.join("response.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                reply["result"]["outcome"]["outcome"],
+                if newcomer_bot {
+                    "selected"
+                } else {
+                    "cancelled"
+                },
+                "initial_bot={initial_bot} newcomer_bot={newcomer_bot}: {reply}"
+            );
+        }
+    }
+}

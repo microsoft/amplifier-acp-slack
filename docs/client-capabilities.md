@@ -157,3 +157,5 @@ Protocol references: [ACP filesystem](https://agentclientprotocol.com/protocol/v
 [ACP tool permissions](https://agentclientprotocol.com/protocol/v1/tool-calls),
 [Slack interaction payloads](https://docs.slack.dev/reference/interaction-payloads/block_actions-payload/),
 [Slack Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/).
+
+An active tool request survives replies from other agents in the same conversation. A newer human message requires reassessment before further actions. Editing or deleting the initiating message, stopping the turn, or changing the approval policy still invalidates its old requests. The same rule applies to automatic single-use decisions and pending human decisions.
