@@ -178,3 +178,48 @@ async fn automatic_approvals_survive_activity_writes_and_still_reject_stale_sour
         "source_changed"
     );
 }
+
+#[tokio::test]
+async fn thread_bookkeeping_preserves_work_but_actual_root_edits_revoke_it() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.acp.client.approvals_required = false;
+    c.save(home.path()).unwrap();
+    let mut s = Store::open(home.path()).unwrap();
+    let root = message("1.000001", "Build this result");
+    s.ingest("root", &root, false).unwrap();
+    let mut reply = message("2.000001", "Continue here");
+    reply.thread = root.ts.clone();
+    s.ingest("reply", &reply, true).unwrap();
+    let job = s.claim(&attention()).unwrap().unwrap();
+    let input = json!({"job_id":job.id,"conversation":{"context":job.context,"channel":reply.channel,"thread":reply.thread},"trigger":reply});
+    let params = json!({"sessionId":"session","toolCall":{"toolCallId":"tool","title":"Build"},"options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]});
+    for n in 3..6 {
+        slack::receive(&c,&mut s,&json!({"event_id":format!("bookkeeping-{n}"),"event":{"type":"message","subtype":"message_changed","channel":"Dtest","channel_type":"im","event_ts":format!("{n}.000001"),"message":{"ts":root.ts,"thread_ts":root.ts,"user":root.sender,"text":root.text,"reply_count":n,"latest_reply":format!("{n}.0")}}})).unwrap();
+        let actual =
+            acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
+                .await
+                .unwrap();
+        assert_eq!(actual["outcome"]["outcome"], "selected");
+        assert_eq!(
+            s.message(&root.channel, &root.ts)
+                .unwrap()
+                .unwrap()
+                .revision,
+            root.revision
+        );
+    }
+    slack::receive(&c,&mut s,&json!({"event_id":"real-edit","event":{"type":"message","subtype":"message_changed","channel":"Dtest","channel_type":"im","event_ts":"6.000001","message":{"ts":root.ts,"thread_ts":root.ts,"user":root.sender,"text":"Stop this work"}}})).unwrap();
+    let actual =
+        acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
+            .await
+            .unwrap();
+    assert_eq!(actual["outcome"]["outcome"], "cancelled");
+    s.finish(&job, decision(), &attention()).unwrap();
+    let status: String =
+        s.db.query_row("SELECT status FROM jobs WHERE id=?1", [job.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "superseded");
+}

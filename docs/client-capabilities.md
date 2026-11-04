@@ -159,3 +159,5 @@ Protocol references: [ACP filesystem](https://agentclientprotocol.com/protocol/v
 [Slack Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/).
 
 An active tool request survives replies from other agents in the same conversation. A newer human message requires reassessment before further actions. Editing or deleting the initiating message, stopping the turn, or changing the approval policy still invalidates its old requests. The same rule applies to automatic single-use decisions and pending human decisions.
+
+Slack thread-bookkeeping events (for example, changed reply counts with unchanged message content) do not advance the source revision or interrupt active work. Actual message, attachment, sender, routing or deletion changes remain material and require reassessment.
