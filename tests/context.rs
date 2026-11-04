@@ -230,6 +230,98 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn thread_only_grants_deny_parent_siblings_and_other_rooms_before_reading() {
+    let f = Fixture::new().await;
+    f.state.config.write().unwrap().context.thread_only_grants = true;
+    f.fake.lock().unwrap().replies.insert(
+        ("CSHARED".into(), "1000.000002".into()),
+        vec![message("1000.000002", "UPEER", "Allowed thread")],
+    );
+    let grant = f.grant("CSHARED", "1000.000002", "UPEER", false);
+    let access = json!({"mode":"grant","grant":grant});
+    let (_, authorization) = f
+        .query(json!({"operation":"authorize","access":access}))
+        .await;
+    assert_eq!(authorization["scope"], "thread");
+    for operation in ["read", "orientation", "search"] {
+        let mut request = json!({"operation":operation,"access":access});
+        if operation == "search" {
+            request["query"] = json!("Allowed");
+        }
+        let (status, result) = f.query(request.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["messages"][0]["text"], "Allowed thread");
+        assert!(result.get("parent_context").is_none());
+        request["conversation_id"] = json!("CSHARED");
+        assert_eq!(f.query(request.clone()).await.0, StatusCode::FORBIDDEN);
+        request["thread_id"] = json!("1000.000003");
+        assert_eq!(f.query(request.clone()).await.0, StatusCode::FORBIDDEN);
+        request["conversation_id"] = json!("DOWNER");
+        request["thread_id"] = json!("1000.000002");
+        assert_eq!(f.query(request).await.0, StatusCode::FORBIDDEN);
+    }
+    let (_, denied) = f.call("/context/mcp", Some(&grant), json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slack_context_orientation","arguments":{"conversation_id":"CSHARED"}}})).await;
+    assert_eq!(denied["result"]["isError"], true);
+    let orientation = context::orientation_for(
+        &f.state.instance_config(),
+        f.home.path(),
+        &Fixture::input("CSHARED", "1000.000002", "UPEER", false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(orientation["messages"][0]["text"], "Allowed thread");
+    assert!(
+        !f.fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(method, _)| method == "conversations.history")
+    );
+    f.fake
+        .lock()
+        .unwrap()
+        .members
+        .get_mut("CSHARED")
+        .unwrap()
+        .retain(|id| id != "UBOT");
+    assert_eq!(
+        f.query(json!({"operation":"read","access":access})).await.0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn thread_only_policy_preserves_room_and_verified_owner_authority() {
+    let f = Fixture::new().await;
+    f.state.config.write().unwrap().context.thread_only_grants = true;
+    let room_grant = f.grant("CSHARED", "", "UPEER", false);
+    let (status, room) = f
+        .query(json!({"operation":"read","access":{"mode":"grant","grant":room_grant}}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(room["messages"][0]["text"], "History of CSHARED");
+    let owner_grant = f.grant("DOWNER", "1000.000002", "UOWNER", false);
+    let access = json!({"mode":"grant","grant":owner_grant});
+    let (_, authorization) = f
+        .query(json!({"operation":"authorize","access":access}))
+        .await;
+    assert_eq!(authorization["scope"], "owner_shared_membership");
+    assert_eq!(
+        f.query(json!({"operation":"read","access":access,"conversation_id":"CSHARED"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.query(json!({"operation":"read","access":access,"conversation_id":"DOTHER"}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
 async fn owner_discovery_and_reads_require_shared_membership_and_exclude_other_dms() {
     let f = Fixture::new().await;
     let (status, list) = f

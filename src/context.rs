@@ -384,6 +384,7 @@ fn authorized_value(c: &Config, auth: &Authority) -> Value {
         "provider_id":format!("slack:{}",c.id),
         "conversation_id":auth.origin.as_ref().map(|v| &v.id),
         "thread_id":if auth.thread.is_empty() {None} else {Some(&auth.thread)},
+        "scope":if auth.owner {"owner_shared_membership"} else if c.context.thread_only_grants && !auth.thread.is_empty() {"thread"} else {"conversation"},
         "label":auth.origin.as_ref().map(|v| &v.label),
         "conversation_kind":auth.origin.as_ref().map(|v| if v.direct {"direct"} else {"group"}),
         "observed_at":now_ms()
@@ -670,7 +671,12 @@ async fn dispatch(
                 (request.conversation_id.is_none() && !auth.thread.is_empty())
                     .then_some(auth.thread.as_str())
             });
-            if request.operation == "orientation" {
+            let thread_only =
+                !auth.owner && c.context.thread_only_grants && !auth.thread.is_empty();
+            if thread_only && thread != Some(auth.thread.as_str()) {
+                return Err(ApiError::forbidden());
+            }
+            if request.operation == "orientation" && !thread_only {
                 orientation(c, slack, auth, &conversation, thread).await
             } else {
                 let mut page = read_page(
@@ -742,6 +748,9 @@ pub async fn orientation_for(c: &Config, home: &Path, input: &Value) -> Result<V
         let slack = SlackReader::new(c, home)?;
         let auth = slack.authorize_grant(c, &grant).await?;
         let conversation = auth.origin.as_ref().ok_or_else(ApiError::forbidden)?;
+        if c.context.thread_only_grants && !auth.owner && !grant.thread.is_empty() {
+            return read_page(c, &slack, conversation, Some(&grant.thread), 12, None, None).await;
+        }
         orientation(
             c,
             &slack,

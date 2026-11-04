@@ -50,6 +50,8 @@ impl Default for MediaConfig {
 pub struct ContextConfig {
     pub enabled: bool,
     pub owner_slack_user_id: String,
+    /// Limit non-owner grants originating in a thread to that thread.
+    pub thread_only_grants: bool,
 }
 fn mentions() -> String {
     "mentions".into()
