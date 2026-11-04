@@ -1,5 +1,5 @@
 """Process-level interrupted-work and missed-DM recovery; no external service."""
-import asyncio,getpass,json,sys,tempfile,time,uuid
+import asyncio,getpass,json,sys,tempfile,time,uuid,sqlite3
 from pathlib import Path
 from aiohttp import web
 from process_integration import SlackFixture,ROOT,BINARY,private_json,until,rows
@@ -32,6 +32,19 @@ async def main():
     await stop();missed=await f.send('Doffline','Hello while offline');await f.send('Doffline','bot chatter',user='Uother',bot_id='Bother');await start()
     await until(lambda:any(p['channel']=='Doffline' for p in f.posts),'missed human DM',35);assert len([p for p in f.posts if p['channel']=='Doffline'])==1
     print('PASS reconnect answers unseen human DM without requiring a fresh message',flush=True)
+    # Parent predates the reconnect history window, so only the known-thread
+    # index can discover the new reply. Real history intentionally omits replies.
+    old_root=f'{time.time()-172800:.6f}'
+    await f.send('Dthread','Establish thread',thread=old_root)
+    await until(lambda:any(p['channel']=='Dthread' for p in f.posts),'initial thread reply')
+    await stop()
+    with sqlite3.connect(home/'state.sqlite3') as db:
+     db.execute("UPDATE settings SET value=? WHERE key='socket_checkpoint'",(str(int(time.time()*1000)),))
+    missed_thread=await f.send('Dthread','Please continue here while offline',thread=old_root)
+    await start()
+    await until(lambda:len([p for p in f.posts if p['channel']=='Dthread'])==2,'missed thread reply',35)
+    assert all(p.get('thread_ts')==old_root for p in f.posts if p['channel']=='Dthread')
+    print('PASS reconnect recovers an old-root thread reply in its original thread',flush=True)
     count=len(f.posts);await stop();await start();await asyncio.sleep(2);assert len(f.posts)==count;print('PASS restart does not replay completed or accepted work',flush=True)
    except Exception:
     print((home/'service.log').read_text()[-3000:]);print((work/'fixture-error.txt').read_text() if (work/'fixture-error.txt').exists() else 'no fixture error')

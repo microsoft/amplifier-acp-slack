@@ -142,3 +142,18 @@ the connector marks its repeated projection with a conversation-specific key and
 retains each triggering message plus continuation/handoff state. The newest
 projection replaces older projections only in the runtime's model view. Generic
 ACP endpoints continue receiving ordinary text, and original history stays saved.
+
+## Recovering after a connection outage
+
+A verified reconnect reads up to 24 hours of missed human messages in allowed
+conversations. It also reads replies to threads already recorded locally or
+discovered in recovered parent messages, including roots older than the outage.
+Replies keep their original thread. Accepted, interrupted, uncertain or completed
+work is not replayed by history recovery. Rate limits and incomplete pagination
+retain the checkpoint for retry. Each room is bounded to 500 known threads and
+each history/thread read to ten pages. Capacity failures are reported in activity.
+
+Slack does not provide an all-recent-thread-replies endpoint: a new reply on an
+old root that this installation has never observed may remain undiscoverable.
+This is bounded recovery, not a guarantee that every offline event is delivered.
+See [Slack's thread history API](https://docs.slack.dev/reference/methods/conversations.replies/).

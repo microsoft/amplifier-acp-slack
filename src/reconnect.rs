@@ -8,7 +8,10 @@ use crate::{
 use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 pub fn checkpoint(s: &Store) -> Result<i64> {
     let old: Option<String> =
@@ -91,6 +94,61 @@ pub async fn recover(
                 "History recovery page limit reached; checkpoint retained"
             );
         }
+        // Slack history contains parent messages, not their thread replies. Revisit
+        // known threads even when their root predates this outage, plus threads
+        // discovered in the recovered parent page. Never scan unrelated rooms.
+        let mut threads = known_threads(&s.lock().unwrap(), channel)?;
+        for m in &messages {
+            if let Some(root) = m["thread_ts"].as_str().filter(|v| !v.is_empty()) {
+                threads.insert(root.to_owned());
+            } else if m["reply_count"].as_u64().unwrap_or(0) > 0
+                && let Some(root) = m["ts"].as_str()
+            {
+                threads.insert(root.to_owned());
+            }
+        }
+        ensure!(
+            threads.len() <= 500,
+            "Thread recovery limit reached; checkpoint retained"
+        );
+        for root in threads {
+            let mut cursor = String::new();
+            for page in 0..10 {
+                let data = match client.call("conversations.replies", json!({
+                    "channel":channel,"ts":root,"oldest":format!("{:.3}",since as f64/1000.0),
+                    "latest":format!("{:.3}",until as f64/1000.0),"inclusive":true,
+                    "include_all_metadata":true,"limit":100,"cursor":cursor
+                }), false).await {
+                    Ok(data) => data,
+                    Err(slack::ApiError::Rejected(code)) if code == "thread_not_found" => break,
+                    Err(error) => return Err(recovery_error(error)),
+                };
+                for mut m in data["messages"].as_array().into_iter().flatten().cloned() {
+                    // The parent is already represented by history. A reply must
+                    // remain in this thread even if the server omits thread_ts.
+                    if m["ts"] == root {
+                        continue;
+                    }
+                    m["thread_ts"] = json!(root);
+                    messages.push(m);
+                }
+                cursor = data["response_metadata"]["next_cursor"]
+                    .as_str()
+                    .unwrap_or("")
+                    .into();
+                if cursor.is_empty() {
+                    ensure!(
+                        data["has_more"] != true,
+                        "Incomplete thread pagination; checkpoint retained"
+                    );
+                    break;
+                }
+                ensure!(
+                    page < 9,
+                    "Thread recovery page limit reached; checkpoint retained"
+                );
+            }
+        }
         messages.sort_by(|a, b| a["ts"].as_str().cmp(&b["ts"].as_str()));
         for mut m in messages {
             if m.get("bot_id").is_some()
@@ -135,7 +193,7 @@ pub async fn recover(
     }
     let store = s.lock().unwrap();
     advance(&store, until)?;
-    store.audit("reconnect_recovery",json!({"recovered_messages":recovered,"since":since,"through":until,"scope":"accessible conversations; human messages only; no replay of accepted work"}))?;
+    store.audit("reconnect_recovery",json!({"recovered_messages":recovered,"since":since,"through":until,"scope":"accessible conversations and known/discovered threads; human messages only; no replay of accepted work"}))?;
     Ok(recovered)
 }
 
@@ -155,4 +213,16 @@ fn recovery_error(error: slack::ApiError) -> anyhow::Error {
         slack::ApiError::RateLimited(seconds) => Retry(seconds.max(60)).into(),
         _ => anyhow::anyhow!("Slack history recovery unavailable; checkpoint retained"),
     }
+}
+
+fn known_threads(s: &Store, channel: &str) -> Result<BTreeSet<String>> {
+    let mut q = s.db.prepare("SELECT thread FROM session_bindings WHERE channel=?1 AND thread<>'' UNION SELECT json_extract(body,'$.thread') FROM messages WHERE channel=?1 AND json_extract(body,'$.thread')<>'' LIMIT 501")?;
+    let threads = q
+        .query_map([channel], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    ensure!(
+        threads.len() <= 500,
+        "Thread recovery limit reached; checkpoint retained"
+    );
+    Ok(threads)
 }
