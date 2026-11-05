@@ -15,7 +15,13 @@ When initialize advertises `_meta.steering.supported`, the connector uses the
 optional [ACP steering extension](https://github.com/agentclientprotocol/codex-acp/blob/main/docs/steering.md).
 Each request includes `idleBehavior: "promptRequired"` and a stable installation-local
 `inputId`. One steering request is outstanding at a time; input can arrive while
-tools and approval callbacks continue. Those updates share the active lifecycle's
+tools and approval callbacks continue. Its prompt contains the new source and
+fixed conversation/authority information, not another copy of history, orientation
+or delivery receipts. The initial context remains available and further details
+can be retrieved through the existing scoped tools. The separate attention
+judgment still receives local conversation evidence. Incremental updates do not
+carry a replacement-snapshot key, so they preserve the initial snapshot and each
+accepted update. Those updates share the active lifecycle's
 execution and hourly model-decision budget; deferred ordinary prompts consume their
 own slots. Ambient human channel updates still require the
 Instance attention offer, and Instance remains responsible for admission. A definite hold remains held;
@@ -87,12 +93,16 @@ An explicit `remoteQueued` receipt remains queued through delayed acknowledgment
 If final completion arrives without incorporation, it becomes `unknown` with reason
 `remote_queue_unincorporated_at_end`, without replay or public peer-error chatter.
 
-Structured `acp_work_status`, `acp_permission` and `acp_question` messages are
+Structured `acp_work_status`, `acp_permission`, `acp_question` and
+`acp_connector_notice` messages are
 excluded from intake, history, context reads, search and thread candidates, from
 any author and through edit/delete wrappers. Known local control IDs cover later
 metadata-free events. History reads request Slack metadata and backfill up to four
 upstream pages, preserving the cursor after each fully consumed page. Controls
 remain visible in Slack. Human messages that merely say “Thinking” remain evidence.
+An explicitly requested thread still includes its root when that root is a control
+or error notice. Connector notices confirm their own delivery before context
+filtering, and their persisted type covers later metadata-free own events.
 
 ## Final-response coverage
 

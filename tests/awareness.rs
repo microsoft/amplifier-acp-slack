@@ -168,9 +168,14 @@ fn controls_from_any_author_never_become_context_or_candidates() {
     c.participation = "ambient".into();
     c.slack.team_id = "T".into();
     c.slack.channels = vec!["C".into()];
-    for (n, kind) in ["acp_work_status", "acp_permission", "acp_question"]
-        .iter()
-        .enumerate()
+    for (n, kind) in [
+        "acp_work_status",
+        "acp_permission",
+        "acp_question",
+        "acp_connector_notice",
+    ]
+    .iter()
+    .enumerate()
     {
         let raw = json!({"type":"message","channel":"C","ts":format!("{n}.000"),"user":"Upeer","bot_id":"Bpeer","text":"Thinking","metadata":{"event_type":kind}});
         for e in [

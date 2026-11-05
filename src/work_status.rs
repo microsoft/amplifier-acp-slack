@@ -453,7 +453,7 @@ pub fn phase(home: &Path, job: &str, text: &str) -> Result<()> {
 pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> Result<()> {
     let s = Store::open(home)?;
     initialize(&s)?;
-    let rows=s.db.prepare("SELECT i.job_id,i.channel,i.thread,i.client_id,i.slack_ts,i.attempted,i.phase,i.shown,i.created,j.status,COALESCE(o.status,''),EXISTS(SELECT 1 FROM work_status_control WHERE disabled=1) OR EXISTS(SELECT 1 FROM work_status_jobs w JOIN work_status_delivery d ON d.channel=w.channel AND d.thread=w.thread WHERE w.job_id=i.job_id AND d.blocked=1) FROM response_indicators i JOIN jobs j ON j.id=i.job_id LEFT JOIN outbox o ON o.job_id=j.id WHERE i.state<>'finished' AND (i.state<>'failed_visible' OR (j.status NOT IN ('failed','interrupted') AND COALESCE(o.status,'') NOT IN ('failed','uncertain'))) AND i.retry_at<=?1 ORDER BY i.created LIMIT 32")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,bool>(11)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=s.db.prepare("SELECT i.job_id,i.channel,i.thread,i.client_id,i.slack_ts,i.attempted,i.phase,i.shown,i.created,j.status,COALESCE(o.status,''),EXISTS(SELECT 1 FROM work_status_control WHERE disabled=1) OR EXISTS(SELECT 1 FROM work_status_jobs w JOIN work_status_delivery d ON d.channel=w.channel AND d.thread=w.thread WHERE w.job_id=i.job_id AND d.blocked=1),COALESCE(o.connector_notice,0)=1 AND o.status IN ('ready','sending','sent','uncertain') FROM response_indicators i JOIN jobs j ON j.id=i.job_id LEFT JOIN outbox o ON o.job_id=j.id WHERE i.state<>'finished' AND (i.state<>'failed_visible' OR (j.status NOT IN ('failed','interrupted') AND COALESCE(o.status,'') NOT IN ('failed','uncertain')) OR (o.connector_notice=1 AND o.status IN ('ready','sending','sent','uncertain'))) AND i.retry_at<=?1 ORDER BY i.created LIMIT 32")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,bool>(11)?,r.get::<_,bool>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (
         id,
         channel,
@@ -467,12 +467,16 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
         job,
         outbox,
         unavailable,
+        notice,
     ) in rows
     {
-        let failed = ["failed", "interrupted"].contains(&job.as_str())
-            || ["failed", "uncertain"].contains(&outbox.as_str());
-        let working =
-            job == "running" || (job == "speak" && ["ready", "sending"].contains(&outbox.as_str()));
+        // A detailed connector notice already owns this failure's presentation.
+        // Keep one sending indicator, then retire it; do not add a second error.
+        let failed = !notice
+            && (["failed", "interrupted"].contains(&job.as_str())
+                || ["failed", "uncertain"].contains(&outbox.as_str()));
+        let working = job == "running"
+            || ((job == "speak" || notice) && ["ready", "sending"].contains(&outbox.as_str()));
         let waiting = s.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM permissions WHERE job_id=?1 AND status='pending')",
             [&id],
@@ -487,6 +491,8 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
             failure_note.as_str()
         } else if failed {
             "I couldn’t confirm this request finished. Some work or a reply may already exist; I’ll need to check that before repeating it."
+        } else if notice {
+            "Sending the status update…"
         } else if job == "speak" {
             "Sending the response…"
         } else if waiting {

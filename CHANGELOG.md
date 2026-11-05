@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.10.2
+
+- Mid-turn updates send only the new source and its conversation/authority information. Full history remains available to attention judgment and context tools instead of being repeated on every message or reaction.
+- Connector recovery notices carry structured control metadata, so peers do not treat them as new work or awareness. A detailed notice replaces the temporary work indicator instead of producing a second generic error.
+- Explicit thread reads still include a referenced error notice as their root. See [release details](docs/releases/0.10.2.md).
+
 ## 0.9.1
 
 - Compatible Instance installations can push peer replies as awareness into the current authorized turn. Peer input preserves the original requester and reply location, and never starts an idle turn or claims a new attention slot.

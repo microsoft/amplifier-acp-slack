@@ -91,7 +91,8 @@ class SlackFixture:
             if "lost-response" in body["markdown_text"]:
                 return web.Response(status=500)
             message = await self.send(body["channel"], body["markdown_text"], user="U" + name,
-                bot_id="B" + name, thread=body.get("thread_ts", ""), client_id=message_id)
+                bot_id="B" + name, thread=body.get("thread_ts", ""), client_id=message_id,
+                metadata=body.get("metadata"))
             return web.json_response({"ok": True, "ts": message["ts"]})
         return web.json_response({"ok": False, "error": "unknown_method"})
 
@@ -116,7 +117,7 @@ class SlackFixture:
         self.sequence += 1
         return f"{1800000000 + self.sequence}.000001"
 
-    async def send(self, channel, text, *, user="UHUMAN", bot_id=None, thread="", client_id=None):
+    async def send(self, channel, text, *, user="UHUMAN", bot_id=None, thread="", client_id=None, metadata=None):
         message = {"type": "message", "channel": channel,
             "channel_type": "im" if channel.startswith("D") else "channel",
             "user": user, "text": text, "ts": self.timestamp()}
@@ -126,6 +127,8 @@ class SlackFixture:
             message["thread_ts"] = thread
         if client_id:
             message["client_msg_id"] = client_id
+        if metadata:
+            message["metadata"] = metadata
         self.messages.append(message)
         await self.deliver(message)
         return message

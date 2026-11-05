@@ -158,7 +158,7 @@ fn failure_notice(s: &Store, id: &str, state: &str, note: &str) -> Result<()> {
         params![id, state],
     )?;
     tx.execute("UPDATE jobs SET status='failed',note=?2,version=(SELECT version FROM contexts WHERE id=jobs.context) WHERE id=?1",params![id,format!("Steering {state}; input was not automatically replayed")])?;
-    tx.execute("INSERT OR IGNORE INTO outbox(id,job_id,context,channel,thread,text,status,created,available) SELECT ?1,id,context,json_extract(trigger,'$.channel'),json_extract(trigger,'$.thread'),?2,'ready',?3,?3 FROM jobs WHERE id=?1",params![id,note,now_ms()])?;
+    tx.execute("INSERT OR IGNORE INTO outbox(id,job_id,context,channel,thread,text,status,created,available,connector_notice) SELECT ?1,id,context,json_extract(trigger,'$.channel'),json_extract(trigger,'$.thread'),?2,'ready',?3,?3,1 FROM jobs WHERE id=?1",params![id,note,now_ms()])?;
     tx.commit()?;
     trace(s, id, state)
 }

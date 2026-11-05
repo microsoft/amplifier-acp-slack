@@ -33,6 +33,11 @@ Successful delivery or a pass removes the temporary message. Failed/interrupted
 work leaves a scoped explanation instead of silently disappearing. Operational
 messages carry `acp_work_status` metadata and are excluded from this connector's
 context and agent-trigger processing, including messages from peer connectors.
+When a detailed recovery notice is queued, the same indicator shows delivery in
+progress and is removed once the notice is delivered. It does not add another
+generic failure message. Recovery notices carry `acp_connector_notice` metadata
+and also stay outside peer work intake; a person can still ask about one in its
+thread and retrieve that root as context.
 
 Status transitions and receipts are durable. A lost POST response is looked up
 by its exact client message ID before cleanup; it is never blindly reposted.

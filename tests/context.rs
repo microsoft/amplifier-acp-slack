@@ -1343,9 +1343,14 @@ async fn controls_do_not_displace_requested_messages_or_enter_search_and_thread_
             )
         })
         .collect();
-    for (n, kind) in ["acp_work_status", "acp_permission", "acp_question"]
-        .iter()
-        .enumerate()
+    for (n, kind) in [
+        "acp_work_status",
+        "acp_permission",
+        "acp_question",
+        "acp_connector_notice",
+    ]
+    .iter()
+    .enumerate()
     {
         let mut item = message(&format!("1000.00000{}", n + 5), "UBOT", "PRIVATE CONTROL");
         item["metadata"] = json!({"event_type":kind});
@@ -1354,7 +1359,7 @@ async fn controls_do_not_displace_requested_messages_or_enter_search_and_thread_
     }
     // A known owned control remains excluded if Slack omits metadata later.
     raw.push(message(
-        "1000.000008",
+        "1000.000009",
         "UBOT",
         "PRIVATE CONTROL WITHOUT METADATA",
     ));
@@ -1362,7 +1367,7 @@ async fn controls_do_not_displace_requested_messages_or_enter_search_and_thread_
         .unwrap()
         .db
         .execute(
-            "INSERT INTO ignored_activity VALUES('CSHARED','1000.000008',0)",
+            "INSERT INTO ignored_activity VALUES('CSHARED','1000.000009',0)",
             [],
         )
         .unwrap();
@@ -1411,38 +1416,40 @@ async fn control_backfill_is_bounded_and_keeps_exact_continuation() {
 
 #[tokio::test]
 async fn referenced_error_root_remains_visible_but_unrelated_controls_do_not() {
-    let f = Fixture::new().await;
-    let mut root = message(
-        "1000.000002",
-        "UBOT",
-        "The agent finished but its answer could not be read.",
-    );
-    root["metadata"] = json!({"event_type":"acp_work_status"});
-    let mut unrelated = message("1000.000003", "UBOT", "UNRELATED STATUS");
-    unrelated["metadata"] = json!({"event_type":"acp_work_status"});
-    f.fake.lock().unwrap().replies.insert(
-        ("CSHARED".into(), "1000.000002".into()),
-        vec![
-            root,
-            unrelated,
-            message("1000.000004", "UPEER", "Explain this error"),
-        ],
-    );
-    let value = context::orientation_for(
-        &f.state.instance_config(),
-        f.home.path(),
-        &Fixture::input("CSHARED", "1000.000002", "UPEER", false),
-    )
-    .await
-    .unwrap();
-    assert!(value.to_string().contains("answer could not be read"));
-    assert!(!value.to_string().contains("UNRELATED STATUS"));
-    let grant = f.grant("CSHARED", "1000.000002", "UPEER", false);
-    let (_,read)=f.call("/context/mcp",Some(&grant),json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slack_context_read","arguments":{}}})).await;
-    assert_eq!(
-        read["result"]["structuredContent"]["root"]["connector_notice"],
-        true
-    );
+    for kind in ["acp_work_status", "acp_connector_notice"] {
+        let f = Fixture::new().await;
+        let mut root = message(
+            "1000.000002",
+            "UBOT",
+            "The agent finished but its answer could not be read.",
+        );
+        root["metadata"] = json!({"event_type":kind});
+        let mut unrelated = message("1000.000003", "UBOT", "UNRELATED STATUS");
+        unrelated["metadata"] = json!({"event_type":"acp_work_status"});
+        f.fake.lock().unwrap().replies.insert(
+            ("CSHARED".into(), "1000.000002".into()),
+            vec![
+                root,
+                unrelated,
+                message("1000.000004", "UPEER", "Explain this error"),
+            ],
+        );
+        let value = context::orientation_for(
+            &f.state.instance_config(),
+            f.home.path(),
+            &Fixture::input("CSHARED", "1000.000002", "UPEER", false),
+        )
+        .await
+        .unwrap();
+        assert!(value.to_string().contains("answer could not be read"));
+        assert!(!value.to_string().contains("UNRELATED STATUS"));
+        let grant = f.grant("CSHARED", "1000.000002", "UPEER", false);
+        let (_,read)=f.call("/context/mcp",Some(&grant),json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slack_context_read","arguments":{}}})).await;
+        assert_eq!(
+            read["result"]["structuredContent"]["root"]["connector_notice"],
+            true
+        );
+    }
 }
 #[tokio::test]
 async fn reactions_are_current_scoped_and_writes_only_use_the_bots_identity() {
