@@ -35,6 +35,7 @@ async def case(mode):
     assert all(p['channel']==channel and p['thread_ts']==thread for p in f.posts)
     trace=rows(home,"SELECT data FROM audit WHERE kind='turn_context_coverage' ORDER BY seq DESC LIMIT 1")[0][0];assert 'private source' not in trace and 'PRIVATE CONTROL' not in trace
     stages=rows(home,'SELECT state FROM steering_inputs');assert all(v[0] in ('incorporated','historyOnly','unknown') for v in stages),stages
+    if mode=='peerRemoteQueued':assert all(v[0]=='unknown' for v in stages),stages
     if mode=='peerRace':assert any(v[0]=='historyOnly' for v in stages),stages
     print('PASS',mode,flush=True)
    except Exception:
@@ -44,5 +45,5 @@ async def case(mode):
     log.close()
  finally:await runner.cleanup()
 async def main():
- for mode in ('peerSupported','peerFallback','peerIdle','peerUnknown','peerRace'):await case(mode)
+ for mode in ('peerSupported','peerFallback','peerIdle','peerUnknown','peerRace','peerRemoteQueued'):await case(mode)
 if __name__=='__main__':asyncio.run(main())

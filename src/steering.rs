@@ -9,6 +9,8 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 pub const METHOD: &str = "_session/steering";
 pub const RECEIPTS: &str = "io.github.bkrabach.agent-runtime";
+pub const MAX_PENDING_AWARENESS: i64 = 256;
+pub const MAX_PENDING_AWARENESS_BYTES: i64 = 4 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Input {
     pub id: String,
@@ -41,6 +43,7 @@ pub fn initialize(s: &Store) -> Result<()> {
     for (name, definition) in [
         ("intent", "TEXT NOT NULL DEFAULT 'input'"),
         ("body", "TEXT"),
+        ("reason", "TEXT NOT NULL DEFAULT ''"),
     ] {
         let exists =
             s.db.prepare("PRAGMA table_info(steering_inputs)")?
@@ -100,7 +103,7 @@ pub fn submit(s: &Store, input: &Input, active: &str, sid: &str) -> Result<bool>
 pub fn defer(s: &Store, id: &str, active: &str) -> Result<()> {
     let tx = s.db.unchecked_transaction()?;
     tx.execute(
-        "UPDATE steering_inputs SET state=CASE WHEN intent='awareness' THEN 'historyOnly' ELSE 'promptRequired' END,target_job=?2 WHERE input_id=?1",
+        "UPDATE steering_inputs SET state=CASE WHEN intent='awareness' THEN 'historyOnly' ELSE 'promptRequired' END,reason=CASE WHEN intent='awareness' THEN 'no_matching_active_prompt' ELSE reason END,target_job=?2 WHERE input_id=?1",
         params![id, active],
     )?;
     tx.execute(
@@ -122,8 +125,8 @@ pub fn held(s: &Store, id: &str, active: &str) -> Result<()> {
 }
 pub fn injected(s: &Store, id: &str, receipt: &Value) -> Result<()> {
     s.db.execute(
-        "UPDATE steering_inputs SET state=CASE WHEN state='incorporated' THEN state ELSE 'received' END,receipt=?2 WHERE input_id=?1 AND state IN ('submitted','received','remoteQueued','incorporated')",
-        params![id, receipt.to_string()],
+        "UPDATE steering_inputs SET state=CASE WHEN state IN ('incorporated','remoteQueued') THEN state WHEN ?3='remoteQueued' THEN 'remoteQueued' ELSE 'received' END,receipt=CASE WHEN state IN ('incorporated','remoteQueued') THEN receipt ELSE ?2 END WHERE input_id=?1 AND state IN ('submitted','received','remoteQueued','incorporated')",
+        params![id, receipt.to_string(),receipt["state"].as_str().unwrap_or("")],
     )?;
     s.db.execute("UPDATE jobs SET status='steered',note='Input admitted to the existing ACP turn; incorporation is not yet confirmed' WHERE id=?1 AND status='steering'",[id])?;
     trace(s, id, "received")
@@ -177,7 +180,7 @@ pub fn receipt(s: &Store, active: &str, value: &Value) -> Result<()> {
         return Ok(());
     }
     // Do not let delayed/duplicate receipts move incorporated input backwards.
-    s.db.execute("UPDATE steering_inputs SET state=?2,receipt=?3 WHERE input_id=?1 AND state<>'incorporated'",params![id,state,json!({"inputId":id,"state":state,"turnId":value["turnId"],"sequence":value["sequence"]}).to_string()])?;
+    s.db.execute("UPDATE steering_inputs SET state=?2,receipt=?3 WHERE input_id=?1 AND state<>'incorporated' AND (state<>'remoteQueued' OR ?2='incorporated')",params![id,state,json!({"inputId":id,"state":state,"turnId":value["turnId"],"sequence":value["sequence"]}).to_string()])?;
     trace(s, id, state)
 }
 pub fn recover(s: &Store) -> Result<()> {
@@ -197,12 +200,27 @@ pub fn abandon(s: &Store, active: &str) -> Result<()> {
     Ok(())
 }
 pub fn complete(s: &Store, active: &str) -> Result<()> {
-    s.db.execute("UPDATE steering_inputs SET state='completed' WHERE target_job=?1 AND state IN ('received','remoteQueued')",[active])?;
+    // A provider-side queue is not proof that the final turn used this input.
+    // Preserve the explicit uncertainty and never turn it into replayable work.
+    let queued =
+        s.db.prepare(
+            "SELECT input_id FROM steering_inputs WHERE target_job=?1 AND state='remoteQueued'",
+        )?
+        .query_map([active], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in queued {
+        s.db.execute("UPDATE steering_inputs SET reason='remote_queue_unincorporated_at_end' WHERE input_id=?1", [&id])?;
+        fail(s, &id, "unknown")?;
+    }
+    s.db.execute(
+        "UPDATE steering_inputs SET state='completed' WHERE target_job=?1 AND state='received'",
+        [active],
+    )?;
     retire_awareness(s, active)?;
     Ok(())
 }
 pub fn history_only(s: &Store, id: &str) -> Result<()> {
-    s.db.execute("UPDATE steering_inputs SET state='historyOnly' WHERE input_id=?1 AND intent='awareness' AND state='queued'", [id])?;
+    s.db.execute("UPDATE steering_inputs SET state='historyOnly',reason='not_submitted_to_active_turn' WHERE input_id=?1 AND intent='awareness' AND state='queued'", [id])?;
     trace(s, id, "historyOnly")
 }
 pub(crate) fn retire_awareness(s: &Store, active: &str) -> Result<()> {
@@ -214,10 +232,9 @@ pub(crate) fn retire_awareness(s: &Store, active: &str) -> Result<()> {
 }
 /// Identifiers and receipt stages only: no source text or provider diagnostics.
 fn trace(s: &Store, id: &str, stage: &str) -> Result<()> {
-    let data = s.db.query_row("SELECT intent,context,source_id,revision,target_job,COALESCE(body,(SELECT trigger FROM jobs WHERE id=input_id)) FROM steering_inputs WHERE input_id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?))).optional()?;
-    if let Some((intent, context, source, revision, active, body)) = data {
-        let message: Message = serde_json::from_str(&body)?;
-        s.audit("steering_delivery", json!({"input_id":id,"intent":intent,"context":context,"source_id":source,"message_id":message.ts,"revision":revision,"active_job":active,"stage":stage}))?;
+    let data:Option<Value> = s.db.query_row("SELECT intent,context,source_id,revision,target_job,json_extract(COALESCE(body,(SELECT trigger FROM jobs WHERE id=input_id)),'$.ts'),reason,state FROM steering_inputs WHERE input_id=?1",[id],|r|Ok(json!({"input_id":id,"intent":r.get::<_,String>(0)?,"context":r.get::<_,String>(1)?,"source_id":r.get::<_,String>(2)?,"revision":r.get::<_,String>(3)?,"active_job":r.get::<_,Option<String>>(4)?,"message_id":r.get::<_,String>(5)?,"reason":r.get::<_,String>(6)?,"retained_state":r.get::<_,String>(7)?,"stage":stage}))).optional()?;
+    if let Some(data) = data {
+        s.audit("steering_delivery", data)?;
     }
     Ok(())
 }
@@ -233,7 +250,7 @@ pub fn coverage(s: &Store, active: &str, stage: &str, outbox: Option<&str>) -> R
             |r| r.get(0),
         )
         .optional()?;
-    let receipts = s.db.prepare("SELECT input_id,intent,state,revision,COALESCE(json_extract(body,'$.ts'),(SELECT json_extract(trigger,'$.ts') FROM jobs WHERE id=input_id)) FROM steering_inputs WHERE target_job=?1 ORDER BY seq DESC LIMIT 32")?.query_map([active], |r|Ok(json!({"input_id":r.get::<_,String>(0)?,"intent":r.get::<_,String>(1)?,"stage":r.get::<_,String>(2)?,"revision":r.get::<_,String>(3)?,"message_id":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let receipts = s.db.prepare("SELECT input_id,intent,state,revision,COALESCE(json_extract(body,'$.ts'),(SELECT json_extract(trigger,'$.ts') FROM jobs WHERE id=input_id)),reason FROM steering_inputs WHERE target_job=?1 ORDER BY seq DESC LIMIT 32")?.query_map([active], |r|Ok(json!({"input_id":r.get::<_,String>(0)?,"intent":r.get::<_,String>(1)?,"stage":r.get::<_,String>(2)?,"revision":r.get::<_,String>(3)?,"message_id":r.get::<_,String>(4)?,"reason":r.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     s.audit("turn_context_coverage", json!({"active_job":active,"stage":stage,"outbox_id":outbox,"context":context,"trigger_message_id":trigger,"latest_message_id":latest,"prompt_context_version":prompt_version,"observed_context_version":observed_version,"control_version":control_version,"inputs":receipts,"max_inputs":32,"guaranteed_final_reconsideration":false}))
 }
 /// Tickets are private installation state. Only a definite backend idle result
@@ -291,6 +308,6 @@ pub fn status(s: &Store) -> Result<Value> {
         s.db.prepare("SELECT i.state,COUNT(*) FROM steering_inputs i GROUP BY i.state")?
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
-    let oldest:Option<i64>=s.db.query_row("SELECT MIN(i.created) FROM steering_inputs i JOIN jobs j ON j.id=i.input_id WHERE j.status IN ('pending','steering')",[],|r|r.get(0))?;
+    let oldest:Option<i64>=s.db.query_row("SELECT MIN(i.created) FROM steering_inputs i LEFT JOIN jobs j ON j.id=i.input_id WHERE j.status IN ('pending','steering') OR (i.intent='awareness' AND i.state IN ('queued','submitted'))",[],|r|r.get(0))?;
     Ok(json!({"states":counts,"oldest_queued_age_ms":oldest.map(|t|(now_ms()-t).max(0))}))
 }

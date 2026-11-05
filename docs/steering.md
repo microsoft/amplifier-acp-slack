@@ -77,9 +77,15 @@ The projection keeps the original trigger and human authority; the separately
 attributed `awareness_input` is evidence, not a new commission or tool permission.
 
 Unsupported, idle (`promptRequired`) and too-late peer inputs remain normal source
-history. They never fall back to a new prompt. Unknown/rejected peer delivery is
+history. They never fall back to a new prompt. Pending peer awareness is bounded to 256 inputs and 4 MiB of serialized source data per active job, including
+admitted inputs awaiting incorporation. Overflow stays `historyOnly` with an
+`awareness_queue_capacity` reason and source attribution; the original source
+remains in history and no work is created. Unknown/rejected peer delivery is
 recorded privately without another public error message or automatic retry.
 `received` does not mean `incorporated`; neither means a report was published.
+An explicit `remoteQueued` receipt remains queued through delayed acknowledgments.
+If final completion arrives without incorporation, it becomes `unknown` with reason
+`remote_queue_unincorporated_at_end`, without replay or public peer-error chatter.
 
 Structured `acp_work_status`, `acp_permission` and `acp_question` messages are
 excluded from intake, history, context reads, search and thread candidates, from

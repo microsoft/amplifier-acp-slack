@@ -327,7 +327,28 @@ impl Store {
             {
                 // Peer evidence belongs only to the authorized turn that was
                 // active at arrival. It never commissions a new work job.
-                tx.execute("INSERT INTO steering_inputs(input_id,context,source_id,revision,state,created,target_job,intent,body) VALUES(?1,?2,?3,?4,'queued',?5,?6,'awareness',?7)",params![Uuid::new_v4().to_string(),ctx,event_id,m.revision,now_ms(),active,serde_json::to_string(m)?])?;
+                let (pending,bytes):(i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM steering_inputs WHERE target_job=?1 AND intent='awareness' AND state IN ('queued','submitted','received','remoteQueued')",[active],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                let mut body = serde_json::to_string(m)?;
+                let overflow = pending >= crate::steering::MAX_PENDING_AWARENESS
+                    || bytes + body.len() as i64 > crate::steering::MAX_PENDING_AWARENESS_BYTES;
+                let (state, reason) = if overflow {
+                    ("historyOnly", "awareness_queue_capacity")
+                } else {
+                    ("queued", "")
+                };
+                if overflow {
+                    // The full evidence already lives in messages. Keep only
+                    // its attribution in this non-replayable delivery receipt.
+                    let mut source = m.clone();
+                    source.text.clear();
+                    source.files.clear();
+                    body = serde_json::to_string(&source)?;
+                }
+                let id = Uuid::new_v4().to_string();
+                tx.execute("INSERT INTO steering_inputs(input_id,context,source_id,revision,state,created,target_job,intent,body,reason) VALUES(?1,?2,?3,?4,?5,?6,?7,'awareness',?8,?9)",params![id,ctx,event_id,m.revision,state,now_ms(),active,body,reason])?;
+                if overflow {
+                    tx.execute("INSERT INTO audit(time,kind,data) VALUES(?1,'steering_delivery',?2)",params![now_ms(),json!({"input_id":id,"intent":"awareness","context":ctx,"source_id":event_id,"message_id":m.ts,"revision":m.revision,"active_job":active,"stage":state,"reason":reason}).to_string()])?;
+                }
             } else if busy.is_some() && !m.bot {
                 let id = Uuid::new_v4().to_string();
                 tx.execute("INSERT INTO jobs(id,context,trigger,status,created,updated) VALUES(?1,?2,?3,'pending',?4,?4)",params![id,ctx,serde_json::to_string(m)?,now_ms()])?;

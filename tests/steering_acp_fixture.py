@@ -33,7 +33,7 @@ def run(req,data):
    time.sleep(.01)
   permission(sid,'second');log('effect',{'name':'second'});text='Finished original work'+(' with '+','.join(u['text'] for u in updates) if updates else '')
  update(sid,sessionUpdate='agent_message_chunk',messageId='final',content={'type':'text','text':json.dumps({'decision':'speak','text':text,'reason':'fixture'}) if (mode in ambient_modes or peer_mode) else text})
- receipts=[{'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':n}for n,u in enumerate(updates)] if is_root else []
+ receipts=[{'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':n}for n,u in enumerate(updates)] if is_root and mode!='peerRemoteQueued' else []
  send({'id':req['id'],'result':{'stopReason':'end_turn','_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipts':receipts}}}});active=None
 for line in sys.stdin:
  req=json.loads(line);method=req.get('method');p=req.get('params',{});rid=req.get('id')
@@ -85,8 +85,8 @@ for line in sys.stdin:
   elif mode in ('failed','promptRequired','startedNewTurn'):result={'outcome':mode,'reason':'noRunningTurn' if mode=='promptRequired' else 'fixture'}
   elif mode in ('invalid','recovery'):result={'outcome':'unrecognized'}
   else:
-   updates.append(u);result={'outcome':'injected','_meta':{'steering':{'inputId':u['id'],'state':'received','turnId':'fixture-turn','sequence':len(updates)}}}
-   receipt={'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':len(updates)}
+   updates.append(u);result={'outcome':'injected','_meta':{'steering':{'inputId':u['id'],'state':'remoteQueued' if mode=='peerRemoteQueued' else 'received','turnId':'fixture-turn','sequence':len(updates)}}}
+   receipt={'inputId':u['id'],'state':'remoteQueued' if mode=='peerRemoteQueued' else 'incorporated','turnId':'fixture-turn','sequence':len(updates)}
    update(p['sessionId'],sessionUpdate='agent_message_chunk',content={'type':'text','text':''},_meta={'io.github.bkrabach.agent-runtime':{'inputReceipt':receipt}})
    if mode in ('race','peerRace'):
     (root/'finish').write_text('go')

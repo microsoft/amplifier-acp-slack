@@ -294,3 +294,191 @@ fn permission_control_echo_still_confirms_human_ui_delivery() {
         0
     );
 }
+
+#[test]
+fn explicit_remote_queue_needs_incorporation_before_final_completion() {
+    for bot in [false, true] {
+        for incorporated in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut s = Store::open(home.path()).unwrap();
+            s.ingest("root", &message(1, false), true).unwrap();
+            let root = s.claim(&attention()).unwrap().unwrap();
+            s.ingest("update", &message(2, bot), true).unwrap();
+            let input = steering::next(&s, &root.context, &root.id)
+                .unwrap()
+                .unwrap();
+            assert!(steering::submit(&s, &input, &root.id, "session").unwrap());
+            steering::receipt(
+                &s,
+                &root.id,
+                &json!({"inputId":input.id,"state":"remoteQueued","turnId":"turn"}),
+            )
+            .unwrap();
+            // A delayed transport acknowledgment cannot erase the explicit queue.
+            steering::injected(
+                &s,
+                &input.id,
+                &json!({"inputId":input.id,"state":"received"}),
+            )
+            .unwrap();
+            steering::receipt(
+                &s,
+                &root.id,
+                &json!({"inputId":input.id,"state":"received"}),
+            )
+            .unwrap();
+            assert_eq!(
+                s.db.query_row("SELECT state FROM steering_inputs", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "remoteQueued"
+            );
+            if incorporated {
+                steering::receipt(
+                    &s,
+                    &root.id,
+                    &json!({"inputId":input.id,"state":"incorporated"}),
+                )
+                .unwrap();
+            }
+            steering::complete(&s, &root.id).unwrap();
+            s.finish(&root, done(), &attention()).unwrap();
+            assert_eq!(
+                s.db.query_row("SELECT state FROM steering_inputs", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                if incorporated {
+                    "incorporated"
+                } else {
+                    "unknown"
+                }
+            );
+            assert!(s.claim(&attention()).unwrap().is_none());
+            assert_eq!(
+                s.db.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                if bot || incorporated { 1 } else { 2 }
+            );
+            if !incorporated {
+                assert_eq!(
+                    s.db.query_row("SELECT reason FROM steering_inputs", [], |r| r
+                        .get::<_, String>(0))
+                        .unwrap(),
+                    "remote_queue_unincorporated_at_end"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn peer_count_overflow_is_history_only_without_consuming_human_capacity() {
+    let home = tempfile::tempdir().unwrap();
+    let mut s = Store::open(home.path()).unwrap();
+    s.ingest("root", &message(1, false), true).unwrap();
+    let root = s.claim(&attention()).unwrap().unwrap();
+    for n in 2..=258 {
+        s.ingest(&format!("peer{n}"), &message(n, true), true)
+            .unwrap();
+    }
+    assert_eq!(
+        s.db.query_row(
+            "SELECT COUNT(*) FROM steering_inputs WHERE state='queued'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        steering::MAX_PENDING_AWARENESS
+    );
+    assert_eq!(
+        s.db.query_row(
+            "SELECT reason FROM steering_inputs WHERE state='historyOnly'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "awareness_queue_capacity"
+    );
+    assert_eq!(
+        s.message("C", "258.000").unwrap().unwrap().text,
+        message(258, true).text
+    );
+    assert!(
+        steering::status(&s).unwrap()["oldest_queued_age_ms"]
+            .as_i64()
+            .is_some()
+    );
+    s.ingest("human", &message(259, false), true).unwrap();
+    assert_eq!(
+        s.db.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    let first = steering::next(&s, &root.context, &root.id)
+        .unwrap()
+        .unwrap();
+    assert!(steering::submit(&s, &first, &root.id, "session").unwrap());
+    steering::receipt(
+        &s,
+        &root.id,
+        &json!({"inputId":first.id,"state":"incorporated"}),
+    )
+    .unwrap();
+    s.ingest("new-peer", &message(260, true), true).unwrap();
+    assert_eq!(
+        s.db.query_row(
+            "SELECT COUNT(*) FROM steering_inputs WHERE intent='awareness' AND state='queued'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        steering::MAX_PENDING_AWARENESS
+    );
+    assert_eq!(
+        s.db.query_row(
+            "SELECT COUNT(*) FROM steering_inputs WHERE state='historyOnly'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn peer_byte_limit_counts_utf8_bytes_and_already_admitted_unincorporated_input() {
+    let home = tempfile::tempdir().unwrap();
+    let mut s = Store::open(home.path()).unwrap();
+    s.ingest("root", &message(1, false), true).unwrap();
+    let root = s.claim(&attention()).unwrap().unwrap();
+    for n in 2..=7 {
+        let mut peer = message(n, true);
+        peer.text = "é".repeat(400_000);
+        s.ingest(&format!("peer{n}"), &peer, true).unwrap();
+        if n == 2 {
+            let first = steering::next(&s, &root.context, &root.id)
+                .unwrap()
+                .unwrap();
+            assert!(steering::submit(&s, &first, &root.id, "session").unwrap());
+            steering::injected(&s, &first.id, &json!({})).unwrap();
+        }
+    }
+    let (count,bytes):(i64,i64)=s.db.query_row("SELECT COUNT(*),SUM(length(CAST(body AS BLOB))) FROM steering_inputs WHERE state IN ('queued','received')",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(count, 5);
+    assert!(bytes <= steering::MAX_PENDING_AWARENESS_BYTES);
+    assert_eq!(s.db.query_row("SELECT COUNT(*) FROM steering_inputs WHERE state='historyOnly' AND reason='awareness_queue_capacity'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(
+        s.db.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let trace: String =
+        s.db.query_row(
+            "SELECT data FROM audit WHERE kind='steering_delivery' ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(trace.contains("awareness_queue_capacity"));
+    assert!(!trace.contains('é'));
+}
