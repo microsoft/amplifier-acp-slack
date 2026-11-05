@@ -63,6 +63,7 @@ impl Store {
         for (table, column, definition) in [
             ("jobs", "available", "INTEGER NOT NULL DEFAULT 0"),
             ("outbox", "attempted", "INTEGER NOT NULL DEFAULT 0"),
+            ("outbox", "connector_notice", "INTEGER NOT NULL DEFAULT 0"),
             ("contexts", "human_version", "INTEGER NOT NULL DEFAULT 0"),
             ("contexts", "control_version", "INTEGER NOT NULL DEFAULT 0"),
         ] {
@@ -81,8 +82,13 @@ impl Store {
                         .db
                         .execute(&format!("UPDATE contexts SET {column}=version"), [])?;
                 }
-                if table == "outbox" {
+                if table == "outbox" && column == "attempted" {
                     store.db.execute("UPDATE outbox SET attempted=created WHERE status IN ('sending','sent','uncertain')",[])?;
+                }
+                if table == "outbox" && column == "connector_notice" {
+                    // Earlier steering notices use the job ID as their delivery
+                    // ID. Agent replies always have a separate generated ID.
+                    store.db.execute("UPDATE outbox SET connector_notice=1 WHERE id=job_id AND EXISTS(SELECT 1 FROM jobs j WHERE j.id=outbox.job_id AND j.status='failed')", [])?;
                 }
             }
         }

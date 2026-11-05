@@ -63,7 +63,9 @@ for line in sys.stdin:
  elif method=='_session/steering':
   assert p['_meta']['steering']['idleBehavior']=='promptRequired';assert p['_meta']['steering']['inputId']
   if mode in ambient_modes:assert p['_meta']['com.microsoft.amplifier.attention']=={'id':'offer','ticket':'ticket'}
-  data=json.loads(''.join(b.get('text','')for b in p['prompt']).split('Latest conversation projection:\n',1)[1])
+  data=json.loads(''.join(b.get('text','')for b in p['prompt']).split('Incremental conversation update:\n',1)[1])
+  assert 'history' not in data and 'orientation' not in data and 'response_delivery' not in data
+  assert 'com.microsoft.amplifier.context-snapshot' not in p['prompt'][0].get('_meta',{})
   source=data.get('awareness_input',data['trigger'])
   u={'id':p['_meta']['steering']['inputId'],'text':source['text'],'sender':source['sender'],'channel':source['channel'],'thread':source['thread']}
   if peer_mode:
@@ -71,7 +73,6 @@ for line in sys.stdin:
    assert 'com.microsoft.amplifier.attention' not in p['_meta']
    assert data['trigger']['text']=='Build' and data['trigger']['sender']=='UHUMAN' and not data['trigger']['bot']
    assert source['bot'] and 'not a new human request' in p['prompt'][0]['text']
-   assert all('CONTROL' not in m['text'] and 'Thinking' not in m['text'] for m in data['history'])
    u['authority']=data['trigger']['sender'];u['intent']='awareness'
   log('steer',u)
   if active is None:

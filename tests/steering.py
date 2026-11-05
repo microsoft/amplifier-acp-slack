@@ -50,6 +50,17 @@ async def case(mode):
     if mode=='recovery':
      assert len([p for p in f.posts if 'earlier input whose outcome is uncertain' in p['markdown_text']])==2
      assert not any('private-provider-detail' in p['markdown_text'] for p in f.posts)
+     notices=[p for p in f.posts if p.get('metadata',{}).get('event_type')=='acp_connector_notice']
+     assert len(notices)==3
+     await until(lambda:all(i.get('deleted') for i in f.indicators),'detailed notices replace temporary indicators')
+     assert not any('couldn’t confirm' in i['text'] for i in f.indicator_updates)
+     # Replay these diagnostics as another agent's Socket Mode messages. They
+     # must not start another ACP prompt and generate another recovery notice.
+     before_jobs=len(rows(home,'SELECT * FROM jobs'));before_posts=len(f.posts)
+     for notice in notices:
+      event=await f.send(channel,notice['markdown_text'],user='Upeer',bot_id='Bpeer',thread=thread,metadata=notice['metadata'])
+      await until(lambda:bool(rows(home,'SELECT 1 FROM ignored_activity WHERE ts=?',(event['ts'],))),'peer diagnostic excluded')
+     assert len(rows(home,'SELECT * FROM jobs'))==before_jobs and len(f.posts)==before_posts
     steers=[e for e in es if e['kind']=='steer'];assert len({e['id']for e in steers})==len(steers)
     if mode=='fallback':assert not steers
     elif mode in ('supported','attention'):assert len(steers)==3

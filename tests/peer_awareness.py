@@ -14,7 +14,7 @@ async def case(mode):
    private_json(home/'adapter.json',c);private_json(home/'secrets/slack.json',{'app_token':'test-alpha-app','bot_token':'test-alpha'});log=(home/'service.log').open('wb');proc=await asyncio.create_subprocess_exec(str(BINARY),'serve','--home',str(home),stdout=log,stderr=log)
    try:
     await until(lambda:'alpha' in f.sockets,'connected');await f.send(channel,'Build',thread=thread);await until(lambda:(work/'started').exists(),'original effect')
-    for n,kind in enumerate(('acp_work_status','acp_permission','acp_question')):
+    for n,kind in enumerate(('acp_work_status','acp_permission','acp_question','acp_connector_notice')):
      control={'type':'message','channel':channel,'channel_type':'channel','user':'Ualpha' if n==0 else 'Upeer','bot_id':'Balpha' if n==0 else 'Bpeer','ts':f.timestamp(),'thread_ts':thread,'text':'PRIVATE CONTROL','metadata':{'event_type':kind}}
      f.messages.append(control);await f.deliver(control)
      await f.deliver({'type':'message','subtype':'message_changed','channel':channel,'message':control,'previous_message':control,'event_ts':f.timestamp()})

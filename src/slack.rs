@@ -151,10 +151,20 @@ impl Slack {
         o: &Outgoing,
         store: &Arc<Mutex<Store>>,
     ) -> std::result::Result<String, ApiError> {
+        let notice = store
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM outbox WHERE id=?1 AND connector_notice=1)",
+                [&o.id],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(|_| ApiError::Uncertain)?;
         let parts = crate::reply_parts::split(&o.text)
             .map_err(|_| ApiError::Rejected("reply_cannot_be_split_safely".into()))?;
         if parts.len() == 1 {
-            return self.publish(o).await;
+            return self.publish_message(o, notice).await;
         }
         {
             let s = store.lock().unwrap();
@@ -210,7 +220,7 @@ impl Slack {
                     vec![]
                 },
             };
-            match self.publish(&part).await {
+            match self.publish_message(&part, notice).await {
                 Ok(ts) => {
                     store.lock().unwrap().db.execute("UPDATE outbox_parts SET status='sent',slack_ts=?3 WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index as i64,ts]).map_err(|_|ApiError::Uncertain)?;
                     if first.is_none() {
@@ -239,6 +249,13 @@ impl Slack {
         first.ok_or(ApiError::Uncertain)
     }
     pub async fn publish(&self, o: &Outgoing) -> std::result::Result<String, ApiError> {
+        self.publish_message(o, false).await
+    }
+    async fn publish_message(
+        &self,
+        o: &Outgoing,
+        notice: bool,
+    ) -> std::result::Result<String, ApiError> {
         // Upload bytes first without sharing them. Once the message has been
         // posted, any file-completion failure is uncertain, never safe to retry.
         let mut uploaded = Vec::new();
@@ -281,6 +298,10 @@ impl Slack {
         // the Markdown first (which would damage links and code). Validated
         // Each delivery part stays below Slack's 12,000-character limit.
         let mut p = json!({"channel":o.channel,"markdown_text":o.text,"client_msg_id":o.id,"unfurl_links":false,"unfurl_media":false,"parse":"none"});
+        if notice {
+            p["metadata"] =
+                json!({"event_type":"acp_connector_notice","event_payload":{"id":o.id}});
+        }
         if !o.thread.is_empty() {
             p["thread_ts"] = o.thread.clone().into();
         }
@@ -658,14 +679,14 @@ pub fn control_message(e: &Value) -> bool {
     [e, &e["message"], &e["previous_message"]].iter().any(|m| {
         matches!(
             m["metadata"]["event_type"].as_str(),
-            Some("acp_permission" | "acp_question" | "acp_work_status")
+            Some("acp_permission" | "acp_question" | "acp_work_status" | "acp_connector_notice")
         )
     })
 }
 
 pub fn known_control(store: &Store, channel: &str, ts: &str) -> Result<bool> {
     let known: bool = store.db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ignored_activity WHERE channel=?1 AND ts=?2 UNION ALL SELECT 1 FROM permissions WHERE channel=?1 AND slack_ts=?2)",
+        "SELECT EXISTS(SELECT 1 FROM ignored_activity WHERE channel=?1 AND ts=?2 UNION ALL SELECT 1 FROM permissions WHERE channel=?1 AND slack_ts=?2 UNION ALL SELECT 1 FROM outbox WHERE channel=?1 AND slack_ts=?2 AND connector_notice=1)",
         rusqlite::params![channel, ts], |r| r.get(0),
     )?;
     let indicators: bool = store.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='response_indicators')", [], |r| r.get(0))?;
@@ -778,8 +799,8 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
         .or_else(|| e["message"]["ts"].as_str())
         .or_else(|| e["ts"].as_str())
         .unwrap_or("");
-    // Keep UI delivery reconciliation before model-context filtering. An own
-    // permission echo can confirm a post whose HTTP response was lost.
+    // Reconcile own UI delivery before filtering it from model context. An echo
+    // can confirm a notice or permission post whose HTTP response was lost.
     let raw = if e["subtype"] == "message_changed" {
         &e["message"]
     } else {
@@ -788,6 +809,7 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
     if (raw["user"] == c.slack.bot_user_id || raw["bot_id"] == c.slack.bot_id)
         && let (Some(id), Some(ts)) = (raw["client_msg_id"].as_str(), raw["ts"].as_str())
     {
+        store.echo(id, ts)?;
         store.db.execute(
             "UPDATE permissions SET slack_ts=COALESCE(slack_ts,?2) WHERE id=?1 AND channel=?3",
             rusqlite::params![id, ts, channel],
@@ -839,9 +861,6 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
         )?
     {
         return Ok(());
-    }
-    if own && let Some(id) = e["client_msg_id"].as_str() {
-        store.echo(id, &m.ts)?;
     }
     if let Some(id) = p["event_id"].as_str() {
         let active_peer: bool = m.bot
