@@ -30,7 +30,10 @@ terminal response races a steering response, delivery waits for the latter.
 ends. An endpoint without steering uses that queued path directly. Neither path
 cancels and restarts the active task. A restored attention ticket is reused only
 when the backend explicitly restores that original offer and expiry; it is not
-silently renewed. Instance revalidates source, policy and expiry when consumed.
+silently renewed. Instance revalidates source, policy and expiry when consumed. Native Instance
+handoff across a new transport additionally requires the same authenticated
+principal, saved session and verified context source binding. An unbound plain
+ACP session fails closed; the connector does not renew its offer.
 
 Failures, unknown transport outcomes and unexpected outcomes produce a scoped
 visible error and durable diagnostics. They never trigger blind replay. A backend
