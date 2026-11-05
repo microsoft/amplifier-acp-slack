@@ -12,6 +12,16 @@ use std::path::Path;
 
 pub fn initialize(s: &Store) -> Result<()> {
     s.db.execute_batch("CREATE TABLE IF NOT EXISTS followups(parent TEXT PRIMARY KEY,root TEXT NOT NULL,depth INTEGER NOT NULL,deadline INTEGER NOT NULL,available INTEGER NOT NULL,goal TEXT NOT NULL,endpoint TEXT NOT NULL,child TEXT UNIQUE,status TEXT NOT NULL DEFAULT 'proposed');")?;
+    let has_version =
+        s.db.prepare("PRAGMA table_info(followups)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .any(|v| v.is_ok_and(|v| v == "source_version"));
+    if !has_version {
+        s.db.execute(
+            "ALTER TABLE followups ADD COLUMN source_version INTEGER NOT NULL DEFAULT -1",
+            [],
+        )?;
+    }
     Ok(())
 }
 /// A final response can request one later turn. Capture it before finishing the
@@ -30,10 +40,14 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
         ));
     }
     let id = input["job_id"].as_str().unwrap_or("");
-    let s = Store::open(home)?;
+    let mut s = Store::open(home)?;
     initialize(&s)?;
-    let trigger: Option<String> =
-        s.db.query_row(
+    // Serialize the source watermark and eligibility decision with Slack intake.
+    // A message committed afterward must invalidate this proposed continuation.
+    let tx =
+        s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let trigger: Option<String> = tx
+        .query_row(
             "SELECT trigger FROM jobs WHERE id=?1 AND status='running'",
             [id],
             |r| r.get(0),
@@ -50,8 +64,8 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
             "No automatic follow-up was scheduled for this agent-to-agent message.",
         ));
     }
-    let prior: Option<(String, i64, i64)> =
-        s.db.query_row(
+    let prior: Option<(String, i64, i64)> = tx
+        .query_row(
             "SELECT root,depth,deadline FROM followups WHERE child=?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -59,16 +73,33 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
         .optional()?;
     let (root, depth, deadline) = prior.unwrap_or((id.into(), 0, now_ms() + 86_400_000));
     if depth >= 8 || now_ms() + seconds * 1000 >= deadline {
-        s.audit(
-            "continuation_limit",
-            json!({"job":id,"reason":"Continuation budget exhausted"}),
+        tx.execute(
+            "INSERT INTO audit(time,kind,data) VALUES(?1,'continuation_limit',?2)",
+            params![
+                now_ms(),
+                json!({"job":id,"reason":"Continuation budget exhausted"}).to_string()
+            ],
         )?;
+        tx.commit()?;
         return Ok(notice(
             answer,
             "The automatic continuation budget is exhausted. Further work needs a new request.",
         ));
     }
-    s.db.execute("INSERT OR IGNORE INTO followups(parent,root,depth,deadline,available,goal,endpoint) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c)])?;
+    let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.context=?1 AND j.status='pending' AND NOT json_extract(j.trigger,'$.bot')) OR EXISTS(SELECT 1 FROM steering_inputs WHERE target_job=?2 AND state IN ('offering','submitted','unknown','notAccepted','failed','startedNewTurn','held'))",params![trigger.context(),id],|r|r.get(0))?;
+    if unsettled {
+        return Ok(notice(
+            answer,
+            "No automatic follow-up was scheduled while newer input is waiting or its delivery is unresolved.",
+        ));
+    }
+    let source_version: i64 = tx.query_row(
+        "SELECT human_version FROM contexts WHERE id=?1",
+        [trigger.context()],
+        |r| r.get(0),
+    )?;
+    tx.execute("INSERT OR IGNORE INTO followups(parent,root,depth,deadline,available,goal,endpoint,source_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c),source_version])?;
+    tx.commit()?;
     Ok(answer.into())
 }
 pub fn input(home: &Path, id: &str) -> Result<Option<Value>> {
@@ -81,7 +112,7 @@ pub fn pump(home: &Path, c: &Config) -> Result<()> {
     initialize(&s)?;
     let tx =
         s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let rows=tx.prepare("SELECT f.parent,f.endpoint,f.deadline,j.context,j.trigger,j.version FROM followups f JOIN jobs j ON j.id=f.parent WHERE f.status='proposed' AND f.available<=?1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.job_id=j.id AND o.status='sent')")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=tx.prepare("SELECT f.parent,f.endpoint,f.deadline,j.context,j.trigger,CASE WHEN f.source_version>=0 THEN f.source_version ELSE j.version END FROM followups f JOIN jobs j ON j.id=f.parent WHERE f.status='proposed' AND f.available<=?1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.job_id=j.id AND o.status='sent')")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (parent, endpoint, deadline, context, trigger, version) in rows {
         let m: Message = serde_json::from_str(&trigger)?;
         let latest: i64 = tx.query_row(

@@ -38,6 +38,7 @@ fn config() -> Config {
     let mut c = Config::new("Fixture".into(), "tester".into());
     c.enabled = true;
     c.participation = "ambient".into();
+    c.attention = attention();
     c.slack.channels = vec!["Croom".into()];
     c
 }
@@ -51,37 +52,28 @@ fn receipt<'a>(delivery: &'a Value, id: &str) -> &'a Value {
 }
 
 #[test]
-fn newer_queued_message_keeps_its_trigger_and_learns_earlier_draft_was_not_sent() {
+fn ordinary_followup_preserves_active_reply_and_queues_its_own_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path()).unwrap();
     let a = attention();
-    let first = message("1.000001");
-    s.ingest("first", &first, true).unwrap();
+    s.ingest("first", &message("1.000001"), true).unwrap();
     let old = s.claim(&a).unwrap().unwrap();
-    let newer = message("2.000001");
-    s.ingest("newer", &newer, true).unwrap();
+    s.ingest("newer", &message("2.000001"), true).unwrap();
     s.finish(&old, speak(), &a).unwrap();
     let next = s.claim(&a).unwrap().unwrap();
-    assert_eq!(next.trigger.ts, newer.ts);
-    assert!(next.reconsidered);
-    let facts = s.response_delivery(&next.context, &next.id).unwrap();
-    assert_eq!(receipt(&facts, &old.id)["status"], "not_delivered");
-    assert_eq!(receipt(&facts, &old.id)["slack_message_id"], Value::Null);
-    assert!(!facts.to_string().contains("PRIVATE"));
-    assert!(s.claim_outgoing(&config()).unwrap().is_none());
-    // The next result may be published; the old response is never replayed.
-    s.finish(&next, speak(), &a).unwrap();
+    assert_eq!(next.trigger.ts, "2.000001");
+    assert!(!next.reconsidered);
     let out = s.claim_outgoing(&config()).unwrap().unwrap();
     s.delivery(&out.id, "sent", Some("3.000001"), "Confirmed", 0)
         .unwrap();
-    let facts = s.response_delivery(&next.context, "future").unwrap();
-    assert_eq!(receipt(&facts, &next.id)["status"], "delivered");
-    assert_eq!(receipt(&facts, &next.id)["slack_message_id"], "3.000001");
-    assert_eq!(receipt(&facts, &old.id)["status"], "not_delivered");
+    let facts = s.response_delivery(&next.context, &next.id).unwrap();
+    assert_eq!(receipt(&facts, &old.id)["status"], "delivered");
+    s.finish(&next, speak(), &a).unwrap();
+    assert!(s.claim_outgoing(&config()).unwrap().is_some());
 }
 
 #[test]
-fn cancelled_queued_send_is_reported_and_notice_survives_coalescing() {
+fn source_edit_cancels_reply_without_replacing_queued_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path()).unwrap();
     let a = attention();
@@ -89,13 +81,17 @@ fn cancelled_queued_send_is_reported_and_notice_survives_coalescing() {
     s.ingest("first", &first, true).unwrap();
     let old = s.claim(&a).unwrap().unwrap();
     s.finish(&old, speak(), &a).unwrap();
+    let mut edited = first.clone();
+    edited.revision = "1.000002".into();
+    edited.text = "Changed source".into();
+    s.ingest("edit", &edited, false).unwrap();
     s.ingest("second", &message("2.000001"), true).unwrap();
     let running = s.claim(&a).unwrap().unwrap();
     s.ingest("third", &message("3.000001"), true).unwrap();
     assert!(s.claim_outgoing(&config()).unwrap().is_none());
     let next = s.prepare(running).unwrap();
-    assert_eq!(next.trigger.ts, "3.000001");
-    assert!(next.reconsidered);
+    assert_eq!(next.trigger.ts, "2.000001");
+    assert!(!next.reconsidered);
     let facts = s.response_delivery(&next.context, &next.id).unwrap();
     assert_eq!(receipt(&facts, &old.id)["status"], "not_delivered");
 }

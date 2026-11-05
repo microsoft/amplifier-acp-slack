@@ -181,3 +181,70 @@ fn malformed_footer_preserves_the_answer_without_scheduling_work() {
         0
     );
 }
+
+#[test]
+fn incorporated_update_preserves_a_later_continuation_without_changing_authority_version() {
+    let (dir, c, mut s, j) = fixture();
+    let original_version = j.version;
+    let mut m = j.trigger.clone();
+    m.ts = "2.001".into();
+    m.revision = m.ts.clone();
+    m.text = "Also verify the output".into();
+    s.ingest("steer", &m, true).unwrap();
+    let input = acp_slack_adapter::steering::next(&s, &j.context, &j.id)
+        .unwrap()
+        .unwrap();
+    acp_slack_adapter::steering::submit(&s, &input, &j.id, "session").unwrap();
+    acp_slack_adapter::steering::injected(&s, &input.id, &json!({})).unwrap();
+    acp_slack_adapter::steering::receipt(
+        &s,
+        &j.id,
+        &json!({"inputId":input.id,"state":"incorporated"}),
+    )
+    .unwrap();
+    propose(dir.path(), &c, &mut s, &j);
+    s.db.execute("UPDATE outbox SET status='sent'", []).unwrap();
+    followup::pump(dir.path(), &c).unwrap();
+    assert_eq!(
+        s.db.query_row("SELECT version FROM jobs WHERE id=?1", [&j.id], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        original_version
+    );
+    assert_eq!(
+        s.db.query_row("SELECT status FROM followups", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "queued"
+    );
+}
+#[test]
+fn queued_or_unknown_input_prevents_automatic_continuation() {
+    for unknown in [false, true] {
+        let (dir, c, mut s, j) = fixture();
+        let mut m = j.trigger.clone();
+        m.ts = "2.001".into();
+        m.revision = m.ts.clone();
+        s.ingest("steer", &m, true).unwrap();
+        if unknown {
+            let input = acp_slack_adapter::steering::next(&s, &j.context, &j.id)
+                .unwrap()
+                .unwrap();
+            acp_slack_adapter::steering::submit(&s, &input, &j.id, "session").unwrap();
+            acp_slack_adapter::steering::fail(&s, &input.id, "unknown").unwrap();
+        }
+        let text = followup::capture(
+            dir.path(),
+            &c,
+            &json!({"job_id":j.id}),
+            "Progress\nSLACK_FOLLOW_UP {\"after_seconds\":5,\"goal\":\"Continue\"}",
+        )
+        .unwrap();
+        assert!(text.contains("No automatic follow-up"));
+        assert_eq!(
+            s.db.query_row("SELECT COUNT(*) FROM followups", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}

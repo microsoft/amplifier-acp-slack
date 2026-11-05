@@ -64,6 +64,7 @@ impl Store {
             ("jobs", "available", "INTEGER NOT NULL DEFAULT 0"),
             ("outbox", "attempted", "INTEGER NOT NULL DEFAULT 0"),
             ("contexts", "human_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("contexts", "control_version", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let present = store
                 .db
@@ -78,7 +79,7 @@ impl Store {
                 if table == "contexts" {
                     store
                         .db
-                        .execute("UPDATE contexts SET human_version=version", [])?;
+                        .execute(&format!("UPDATE contexts SET {column}=version"), [])?;
                 }
                 if table == "outbox" {
                     store.db.execute("UPDATE outbox SET attempted=created WHERE status IN ('sending','sent','uncertain')",[])?;
@@ -88,6 +89,7 @@ impl Store {
         crate::permissions::initialize(&store)?;
         crate::followup::initialize(&store)?;
         crate::handoff::initialize(&store)?;
+        crate::steering::initialize(&store)?;
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
@@ -116,6 +118,7 @@ impl Store {
                 &Attention::default(),
             )?;
         }
+        crate::steering::recover(self)?;
         crate::permissions::cancel_all(self, "Connector restarted")?;
         self.db.execute("UPDATE jobs SET status='interrupted', note='Process stopped during a model turn; not replayed automatically' WHERE status='running'",[])?;
         self.db.execute("UPDATE outbox SET status='uncertain', note='Process stopped during delivery; inspect Slack before resending' WHERE status='sending'",[])?;
@@ -288,13 +291,21 @@ impl Store {
             )?;
         }
         if old.is_some() {
+            // Busy inputs retain distinct triggers, so edits must retire the
+            // previous pending revision instead of relying on coalescing.
+            tx.execute("UPDATE jobs SET status='superseded',note='Source revision replaced before execution' WHERE status='pending' AND json_extract(trigger,'$.channel')=?1 AND json_extract(trigger,'$.ts')=?2 AND json_extract(trigger,'$.revision')<>?3",params![m.channel,m.ts,m.revision])?;
+            tx.execute("UPDATE steering_inputs SET state='retracted' WHERE input_id IN (SELECT id FROM jobs WHERE status='superseded' AND json_extract(trigger,'$.channel')=?1 AND json_extract(trigger,'$.ts')=?2)",params![m.channel,m.ts])?;
+            tx.execute(
+                "UPDATE contexts SET control_version=version WHERE id=?1",
+                [&ctx],
+            )?;
             tx.execute("UPDATE outbox SET status='cancelled',note='Source edited or deleted before delivery' WHERE status='ready' AND job_id IN (SELECT id FROM jobs WHERE json_extract(trigger,'$.channel')=?1 AND json_extract(trigger,'$.ts')=?2)",params![m.channel,m.ts])?;
         }
         // A root edit also changes the source snapshot of its child thread.
         if old.is_some() && m.thread.is_empty() {
             let thread_ctx = crate::model::context_id(&m.team, &m.channel, &m.ts);
             tx.execute(
-                "UPDATE contexts SET version=version+1,human_version=version+1 WHERE id=?1",
+                "UPDATE contexts SET version=version+1,human_version=version+1,control_version=version+1 WHERE id=?1",
                 [thread_ctx],
             )?;
         }
@@ -303,20 +314,31 @@ impl Store {
             tx.execute("UPDATE followups SET status='cancelled' WHERE parent IN (SELECT id FROM jobs WHERE context=?1) AND status IN ('proposed','queued')",[&ctx])?;
         }
         if wake && !m.deleted {
-            let existing: Option<String> = tx
+            let busy: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE context=?1 AND status='running')",
+                [&ctx],
+                |r| r.get(0),
+            )?;
+            if busy && !m.bot {
+                let id = Uuid::new_v4().to_string();
+                tx.execute("INSERT INTO jobs(id,context,trigger,status,created,updated) VALUES(?1,?2,?3,'pending',?4,?4)",params![id,ctx,serde_json::to_string(m)?,now_ms()])?;
+                tx.execute("INSERT INTO steering_inputs(input_id,context,source_id,revision,state,created) VALUES(?1,?2,?3,?4,'queued',?5)",params![id,ctx,event_id,m.revision,now_ms()])?;
+            } else {
+                let existing: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM jobs WHERE context=?1 AND status='pending'",
+                    "SELECT id FROM jobs WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs)",
                     [&ctx],
                     |r| r.get(0),
                 )
                 .optional()?;
-            if let Some(id) = existing {
-                tx.execute(
-                    "UPDATE jobs SET trigger=?1,updated=?2 WHERE id=?3",
-                    params![serde_json::to_string(m)?, now_ms(), id],
-                )?;
-            } else {
-                tx.execute("INSERT INTO jobs(id,context,trigger,status,created,updated) VALUES(?1,?2,?3,'pending',?4,?4)",params![Uuid::new_v4().to_string(),ctx,serde_json::to_string(m)?,now_ms()])?;
+                if let Some(id) = existing {
+                    tx.execute(
+                        "UPDATE jobs SET trigger=?1,updated=?2 WHERE id=?3",
+                        params![serde_json::to_string(m)?, now_ms(), id],
+                    )?;
+                } else {
+                    tx.execute("INSERT INTO jobs(id,context,trigger,status,created,updated) VALUES(?1,?2,?3,'pending',?4,?4)",params![Uuid::new_v4().to_string(),ctx,serde_json::to_string(m)?,now_ms()])?;
+                }
             }
         }
         if m.deleted {
@@ -404,18 +426,27 @@ impl Store {
     pub fn prepare(&self, mut job: Job) -> Result<Job> {
         // Backfill and messages received while fetching are folded into one
         // snapshot before the model starts. Later events get their own turn.
-        let pending: Option<(String, String)> = self
+        let queued_input: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM steering_inputs WHERE input_id=?1)",
+            [&job.id],
+            |r| r.get(0),
+        )?;
+        let pending: Option<(String, String)> = if queued_input {
+            None
+        } else {
+            self
             .db
             .query_row(
-                "SELECT trigger,note FROM jobs WHERE context=?1 AND status='pending'",
+                "SELECT trigger,note FROM jobs WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs)",
                 [&job.context],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?;
+            .optional()?
+        };
         if let Some((p, note)) = pending {
             job.trigger = serde_json::from_str(&p)?;
             job.reconsidered |= note.starts_with("Reconsider");
-            self.db.execute("UPDATE jobs SET status='superseded',note='Coalesced into the current turn' WHERE context=?1 AND status='pending'",[&job.context])?;
+            self.db.execute("UPDATE jobs SET status='superseded',note='Coalesced into the current turn' WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs)",[&job.context])?;
         }
         job.version = self.db.query_row(
             "SELECT version FROM contexts WHERE id=?1",
@@ -436,13 +467,13 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let candidate:Option<(String,String,String,String)>=tx.query_row("SELECT id,context,trigger,note FROM jobs j WHERE status='pending' AND available<=?2 AND updated<=?1 AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.context=j.context AND x.status='running') ORDER BY created LIMIT 1",params![now-a.settle_ms as i64,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let candidate:Option<(String,String,String,String)>=tx.query_row("SELECT id,context,trigger,note FROM jobs j WHERE status='pending' AND available<=?2 AND updated<=?1 AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.context=j.context AND x.status='running') ORDER BY created,j.rowid LIMIT 1",params![now-a.settle_ms as i64,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let Some((id, context, trigger, note)) = candidate else {
             return Ok(None);
         };
-        let decisions:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE status NOT IN ('pending','superseded','budget') AND updated>?1",[now-3600000],|r|r.get(0))?;
+        let decisions:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE status NOT IN ('pending','superseded','budget') AND NOT EXISTS(SELECT 1 FROM steering_inputs i WHERE i.input_id=jobs.id AND COALESCE(i.target_job,'')<>jobs.id) AND updated>?1",[now-3600000],|r|r.get(0))?;
         if decisions >= a.max_decisions_per_agent_per_hour as i64 {
-            let oldest:i64=tx.query_row("SELECT MIN(updated) FROM jobs WHERE status NOT IN ('pending','superseded','budget') AND updated>?1",[now-3600000],|r|r.get(0))?;
+            let oldest:i64=tx.query_row("SELECT MIN(updated) FROM jobs WHERE status NOT IN ('pending','superseded','budget') AND NOT EXISTS(SELECT 1 FROM steering_inputs i WHERE i.input_id=jobs.id AND COALESCE(i.target_job,'')<>jobs.id) AND updated>?1",[now-3600000],|r|r.get(0))?;
             tx.execute("UPDATE jobs SET available=?2,note='Waiting for hourly model capacity; resumes automatically' WHERE id=?1",params![id,oldest+3600001])?;
             tx.commit()?;
             return Ok(None);
@@ -456,6 +487,10 @@ impl Store {
             "UPDATE jobs SET status='running',version=?1,updated=?2 WHERE id=?3",
             params![version, now, id],
         )?;
+        tx.execute(
+            "UPDATE steering_inputs SET state='prompt',target_job=?1 WHERE input_id=?1",
+            [&id],
+        )?;
         tx.commit()?;
         Ok(Some(Job {
             id,
@@ -466,6 +501,14 @@ impl Store {
         }))
     }
     pub fn finish(&mut self, job: &Job, result: Result<Decision>, _a: &Attention) -> Result<()> {
+        let running: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND status='running')",
+            [&job.id],
+            |r| r.get(0),
+        )?;
+        if !running {
+            return Ok(());
+        }
         let d = match result {
             Ok(d) => d,
             Err(error) => {
@@ -491,7 +534,7 @@ impl Store {
             }
         };
         let version: i64 = self.db.query_row(
-            "SELECT human_version FROM contexts WHERE id=?1",
+            "SELECT control_version FROM contexts WHERE id=?1",
             [&job.context],
             |r| r.get(0),
         )?;
@@ -517,6 +560,10 @@ impl Store {
             params![state, now_ms(), note, job.id],
         )?;
         tx.execute(
+            "UPDATE steering_inputs SET state='completed' WHERE input_id=?1 AND state='prompt'",
+            [&job.id],
+        )?;
+        tx.execute(
             "INSERT INTO audit(time,kind,data) VALUES(?1,'decision',?2)",
             params![
                 now_ms(),
@@ -534,7 +581,7 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.human_version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
+        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.control_version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
             let raw:String=r.get(7)?;
             let media=serde_json::from_str(&raw).map_err(|e|rusqlite::Error::FromSqlConversionFailure(7,rusqlite::types::Type::Text,Box::new(e)))?;
             Ok((Outgoing{id:r.get(0)?,channel:r.get(1)?,thread:r.get(2)?,text:r.get(3)?,media},r.get(4)?,r.get(5)?,r.get(6)?,r.get(8)?))
@@ -678,7 +725,7 @@ impl Store {
             )
             .optional()?;
         Ok(
-            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
+            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"steering":crate::steering::status(self)?,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
                 "connection" => serde_json::from_str::<Value>(&data).ok(),
                 "process_started" => Some(json!({"state":"connecting"})),
                 "process_stopped" => Some(json!({"state":"stopped"})),

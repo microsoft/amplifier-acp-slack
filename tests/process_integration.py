@@ -430,14 +430,14 @@ async def main():
             await fixture.send("Cbeta", "<@Ubeta> slow REQUEST-SURVIVES-ASIDE")
             await until(lambda: has_prompt("beta", "REQUEST-SURVIVES-ASIDE"), "direct request in progress")
             await fixture.send("Cbeta", "An unmentioned aside with UPDATED-CONTEXT")
-            await until(lambda: has_post("REQUEST-SURVIVES-ASIDE"), "direct request re-evaluated after aside")
+            await until(lambda: has_post("REQUEST-SURVIVES-ASIDE"), "direct request completed despite aside")
             contributions = [p for p in fixture.posts if "REQUEST-SURVIVES-ASIDE" in p["markdown_text"]]
             assert len(contributions) == 1
             reevaluations = [p for p in protocol(homes["beta"], "prompt")
                             if "REQUEST-SURVIVES-ASIDE" in p["input"]["trigger"]["text"]]
-            assert len(reevaluations) >= 2
-            assert any("UPDATED-CONTEXT" in message["text"] for message in reevaluations[-1]["input"]["history"])
-            passed("An unmentioned aside updates a direct request without silently abandoning its answer")
+            assert len(reevaluations) == 1
+            assert count(homes["beta"], "SELECT COUNT(*) FROM messages WHERE channel='Cbeta' AND body LIKE '%UPDATED-CONTEXT%'") == 1
+            passed("An unmentioned aside is retained without restarting active work or withholding its answer")
 
             alpha_prompts = [p for p in protocol(homes["alpha"], "prompt")
                              if p["input"]["conversation"]["channel"] == "Calpha"]
