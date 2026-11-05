@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.9.1
+
+- Compatible Instance installations can push peer replies as awareness into the current authorized turn. Peer input preserves the original requester and reply location, and never starts an idle turn or claims a new attention slot.
+- Agent-facing context excludes progress, permission and question controls while keeping the human Slack indicators visible. Bounded history backfill prevents controls from displacing the requested conversation messages.
+- Pending peer awareness is bounded by count and bytes. Overflow stays in source history; explicitly remote-queued input without incorporation remains unknown and is never replayed.
+- Private delivery traces connect source message IDs, input receipt stages, final context coverage and outgoing replies. Final results survive late peer arrivals; this release does not guarantee a final model reconsideration or add extra model calls.
+
 ## 0.9.0
 
 - New human messages preserve in-flight approvals, completed effects and final replies. Source retraction, explicitly stopped jobs and policy revocation still apply.

@@ -43,9 +43,12 @@ impl Slack {
     pub async fn call(
         &self,
         method: &str,
-        body: Value,
+        mut body: Value,
         app: bool,
     ) -> std::result::Result<Value, ApiError> {
+        if matches!(method, "conversations.history" | "conversations.replies") {
+            body["include_all_metadata"] = true.into();
+        }
         let token = if app {
             &self.secrets.app_token
         } else {
@@ -649,7 +652,36 @@ impl Slack {
     }
 }
 
+/// Structured connector UI is not conversation evidence, regardless of author.
+/// Never infer controls from visible text: a person may discuss "Thinking".
+pub fn control_message(e: &Value) -> bool {
+    [e, &e["message"], &e["previous_message"]].iter().any(|m| {
+        matches!(
+            m["metadata"]["event_type"].as_str(),
+            Some("acp_permission" | "acp_question" | "acp_work_status")
+        )
+    })
+}
+
+pub fn known_control(store: &Store, channel: &str, ts: &str) -> Result<bool> {
+    let known: bool = store.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ignored_activity WHERE channel=?1 AND ts=?2 UNION ALL SELECT 1 FROM permissions WHERE channel=?1 AND slack_ts=?2)",
+        rusqlite::params![channel, ts], |r| r.get(0),
+    )?;
+    let indicators: bool = store.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='response_indicators')", [], |r| r.get(0))?;
+    Ok(known
+        || (indicators
+            && store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM response_indicators WHERE channel=?1 AND slack_ts=?2)",
+                rusqlite::params![channel, ts],
+                |r| r.get::<_, bool>(0),
+            )?))
+}
+
 pub fn normalize(team: &str, channel: &str, e: &Value, prior: Option<Message>) -> Option<Message> {
+    if control_message(e) {
+        return None;
+    }
     let subtype = e["subtype"].as_str().unwrap_or("");
     let changed = subtype == "message_changed";
     if subtype == "message_deleted" {
@@ -740,16 +772,22 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
         .or_else(|| e["message"]["ts"].as_str())
         .or_else(|| e["ts"].as_str())
         .unwrap_or("");
-    let known_activity: bool = store.db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ignored_activity WHERE channel=?1 AND ts=?2)",
-        rusqlite::params![channel, activity_ts],
-        |r| r.get(0),
-    )?;
-    if known_activity
-        || e["metadata"]["event_type"] == "acp_work_status"
-        || e["message"]["metadata"]["event_type"] == "acp_work_status"
-        || e["previous_message"]["metadata"]["event_type"] == "acp_work_status"
+    // Keep UI delivery reconciliation before model-context filtering. An own
+    // permission echo can confirm a post whose HTTP response was lost.
+    let raw = if e["subtype"] == "message_changed" {
+        &e["message"]
+    } else {
+        e
+    };
+    if (raw["user"] == c.slack.bot_user_id || raw["bot_id"] == c.slack.bot_id)
+        && let (Some(id), Some(ts)) = (raw["client_msg_id"].as_str(), raw["ts"].as_str())
     {
+        store.db.execute(
+            "UPDATE permissions SET slack_ts=COALESCE(slack_ts,?2) WHERE id=?1 AND channel=?3",
+            rusqlite::params![id, ts, channel],
+        )?;
+    }
+    if known_control(store, channel, activity_ts)? || control_message(e) {
         if !activity_ts.is_empty() {
             store.db.execute(
                 "INSERT OR REPLACE INTO ignored_activity VALUES(?1,?2,?3)",
@@ -800,7 +838,17 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
         store.echo(id, &m.ts)?;
     }
     if let Some(id) = p["event_id"].as_str() {
-        store.ingest(id, &m, !own && c.should_wake(&m.channel, &m.text))?;
+        let active_peer: bool = m.bot
+            && store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE context=?1 AND status='running')",
+                [m.context()],
+                |r| r.get(0),
+            )?;
+        store.ingest(
+            id,
+            &m,
+            !own && (c.should_wake(&m.channel, &m.text) || active_peer),
+        )?;
     }
     Ok(())
 }

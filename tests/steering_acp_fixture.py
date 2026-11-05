@@ -2,6 +2,8 @@
 import json,sys,time,threading
 from pathlib import Path
 root=Path.cwd();mode=sys.argv[1];lock=threading.Lock();waits={};updates=[];active=None
+peer_mode=mode.startswith('peer')
+ambient_modes=('attention','attentionRestore','attentionConsumed','attentionContinuation','attentionRace','attentionHold')
 
 def send(v):
  with lock:print(json.dumps({'jsonrpc':'2.0',**v}),flush=True)
@@ -30,15 +32,16 @@ def run(req,data):
    assert time.monotonic()<deadline
    time.sleep(.01)
   permission(sid,'second');log('effect',{'name':'second'});text='Finished original work'+(' with '+','.join(u['text'] for u in updates) if updates else '')
- update(sid,sessionUpdate='agent_message_chunk',messageId='final',content={'type':'text','text':json.dumps({'decision':'speak','text':text,'reason':'fixture'}) if mode in ('attention','attentionRestore','attentionConsumed','attentionContinuation','attentionRace','attentionHold') else text})
- receipts=[{'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':n}for n,u in enumerate(updates)] if is_root else []
+ update(sid,sessionUpdate='agent_message_chunk',messageId='final',content={'type':'text','text':json.dumps({'decision':'speak','text':text,'reason':'fixture'}) if (mode in ambient_modes or peer_mode) else text})
+ receipts=[{'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':n}for n,u in enumerate(updates)] if is_root and mode!='peerRemoteQueued' else []
  send({'id':req['id'],'result':{'stopReason':'end_turn','_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipts':receipts}}}});active=None
 for line in sys.stdin:
  req=json.loads(line);method=req.get('method');p=req.get('params',{});rid=req.get('id')
  if method is None and rid in waits:waits[rid][1]=req;waits[rid][0].set();continue
  if method=='initialize':
   meta={} if mode=='fallback' else {'steering':{'supported':True,'idleBehavior':['promptRequired'],'version':1}}
-  if mode in ('attention','attentionRestore','attentionConsumed','attentionContinuation','attentionRace','attentionHold'):meta['com.microsoft.amplifier.attention']={'version':1,'enabled':True,'method':'_amplifier/attention'}
+  if peer_mode and mode != 'peerFallback':meta['io.github.bkrabach.agent-instance']={'inputContinuity':{'awareness':{'version':1,'activeOnly':True,'promptIdRequired':True}}}
+  if (mode in ambient_modes or peer_mode):meta['com.microsoft.amplifier.attention']={'version':1,'enabled':True,'method':'_amplifier/attention'}
   result={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'_meta':meta}
  elif method in ('session/new','session/load'):
   root=Path(p['cwd']);result={'sessionId':'fixture-'+str(root)}
@@ -55,8 +58,18 @@ for line in sys.stdin:
   data=json.loads(''.join(b.get('text','')for b in p['prompt']).split('Latest conversation projection:\n',1)[1]);threading.Thread(target=run,args=(req,data),daemon=True).start();continue
  elif method=='_session/steering':
   assert p['_meta']['steering']['idleBehavior']=='promptRequired';assert p['_meta']['steering']['inputId']
-  if mode in ('attention','attentionRestore','attentionConsumed','attentionContinuation','attentionRace','attentionHold'):assert p['_meta']['com.microsoft.amplifier.attention']=={'id':'offer','ticket':'ticket'}
-  data=json.loads(''.join(b.get('text','')for b in p['prompt']).split('Latest conversation projection:\n',1)[1]);u={'id':p['_meta']['steering']['inputId'],'text':data['trigger']['text'],'sender':data['trigger']['sender'],'channel':data['trigger']['channel'],'thread':data['trigger']['thread']};log('steer',u)
+  if mode in ambient_modes:assert p['_meta']['com.microsoft.amplifier.attention']=={'id':'offer','ticket':'ticket'}
+  data=json.loads(''.join(b.get('text','')for b in p['prompt']).split('Latest conversation projection:\n',1)[1])
+  source=data.get('awareness_input',data['trigger'])
+  u={'id':p['_meta']['steering']['inputId'],'text':source['text'],'sender':source['sender'],'channel':source['channel'],'thread':source['thread']}
+  if peer_mode:
+   assert p['_meta']['steering']['intent']=='awareness' and p['_meta']['steering']['activePromptId']==active['id']
+   assert 'com.microsoft.amplifier.attention' not in p['_meta']
+   assert data['trigger']['text']=='Build' and data['trigger']['sender']=='UHUMAN' and not data['trigger']['bot']
+   assert source['bot'] and 'not a new human request' in p['prompt'][0]['text']
+   assert all('CONTROL' not in m['text'] and 'Thinking' not in m['text'] for m in data['history'])
+   u['authority']=data['trigger']['sender'];u['intent']='awareness'
+  log('steer',u)
   if active is None:
    result={'outcome':'promptRequired','reason':'noRunningTurn'}
    if mode=='attentionRace':result['_meta']={'com.microsoft.amplifier.attention':{'id':'offer','ticketState':'restored','expiresAt':int(time.time()*1000)+60000}}
@@ -67,13 +80,15 @@ for line in sys.stdin:
    result={'outcome':'promptRequired','reason':'noRunningTurn','_meta':{'com.microsoft.amplifier.attention':{'id':'offer','ticketState':'consumed'}}}
   elif mode=='attentionRestore':
    result={'outcome':'promptRequired','reason':'noRunningTurn','_meta':{'com.microsoft.amplifier.attention':{'id':'offer','ticketState':'restored','expiresAt':int(time.time()*1000)+60000}}}
+  elif mode=='peerIdle':result={'outcome':'promptRequired','reason':'noRunningTurn'}
+  elif mode=='peerUnknown':result={'outcome':'unrecognized'}
   elif mode in ('failed','promptRequired','startedNewTurn'):result={'outcome':mode,'reason':'noRunningTurn' if mode=='promptRequired' else 'fixture'}
   elif mode in ('invalid','recovery'):result={'outcome':'unrecognized'}
   else:
-   updates.append(u);result={'outcome':'injected','_meta':{'steering':{'inputId':u['id'],'state':'received','turnId':'fixture-turn','sequence':len(updates)}}}
-   receipt={'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':len(updates)}
+   updates.append(u);result={'outcome':'injected','_meta':{'steering':{'inputId':u['id'],'state':'remoteQueued' if mode=='peerRemoteQueued' else 'received','turnId':'fixture-turn','sequence':len(updates)}}}
+   receipt={'inputId':u['id'],'state':'remoteQueued' if mode=='peerRemoteQueued' else 'incorporated','turnId':'fixture-turn','sequence':len(updates)}
    update(p['sessionId'],sessionUpdate='agent_message_chunk',content={'type':'text','text':''},_meta={'io.github.bkrabach.agent-runtime':{'inputReceipt':receipt}})
-   if mode=='race':
+   if mode in ('race','peerRace'):
     (root/'finish').write_text('go')
     def late_ack(request_id=rid,result=result):
      while active is not None:time.sleep(.01)

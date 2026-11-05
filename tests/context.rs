@@ -1297,3 +1297,81 @@ async fn unavailable_thread_refresh_keeps_parent_context_without_cached_reply_te
         false
     );
 }
+
+#[tokio::test]
+async fn controls_do_not_displace_requested_messages_or_enter_search_and_thread_candidates() {
+    let f = Fixture::new().await;
+    let mut raw: Vec<Value> = (1..=4)
+        .map(|n| {
+            message(
+                &format!("1000.00000{n}"),
+                "UPEER",
+                &format!("Real proposal {n}"),
+            )
+        })
+        .collect();
+    for (n, kind) in ["acp_work_status", "acp_permission", "acp_question"]
+        .iter()
+        .enumerate()
+    {
+        let mut item = message(&format!("1000.00000{}", n + 5), "UBOT", "PRIVATE CONTROL");
+        item["metadata"] = json!({"event_type":kind});
+        item["reply_count"] = 9.into();
+        raw.push(item);
+    }
+    // A known owned control remains excluded if Slack omits metadata later.
+    raw.push(message(
+        "1000.000008",
+        "UBOT",
+        "PRIVATE CONTROL WITHOUT METADATA",
+    ));
+    Store::open(f.home.path())
+        .unwrap()
+        .db
+        .execute(
+            "INSERT INTO ignored_activity VALUES('CSHARED','1000.000008',0)",
+            [],
+        )
+        .unwrap();
+    f.fake.lock().unwrap().history.insert("CSHARED".into(), raw);
+    let (status,read)=f.query(json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED","limit":4})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(read["complete"], true);
+    assert!(!read.to_string().contains("PRIVATE CONTROL"));
+    let (_,search)=f.query(json!({"operation":"search","access":{"mode":"owner"},"conversation_id":"CSHARED","query":"CONTROL","limit":4})).await;
+    assert_eq!(search["messages"], json!([]));
+    assert_eq!(search["coverage"]["search"]["scanned_messages"], 4);
+    let orientation = context::orientation_for(
+        &f.state.instance_config(),
+        f.home.path(),
+        &Fixture::input("CSHARED", "", "UPEER", false),
+    )
+    .await
+    .unwrap();
+    assert!(!orientation.to_string().contains("PRIVATE CONTROL"));
+    assert!(!orientation.to_string().contains("1000.000005"));
+}
+
+#[tokio::test]
+async fn control_backfill_is_bounded_and_keeps_exact_continuation() {
+    let f = Fixture::new().await;
+    let mut raw = vec![message("1000.000001", "UPEER", "Real proposal")];
+    for n in 2..=8 {
+        let mut item = message(&format!("1000.00000{n}"), "UBOT", "Thinking");
+        item["metadata"] = json!({"event_type":"acp_work_status"});
+        raw.push(item);
+    }
+    f.fake.lock().unwrap().history.insert("CSHARED".into(), raw);
+    let request =
+        json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED","limit":1});
+    let (_, first) = f.query(request.clone()).await;
+    assert_eq!(first["messages"], json!([]));
+    assert_eq!(first["complete"], false);
+    assert_eq!(first["next_cursor"], "page:4");
+    let mut next = request;
+    next["cursor"] = first["next_cursor"].clone();
+    let (_, last) = f.query(next).await;
+    assert_eq!(last["messages"][0]["text"], "Real proposal");
+    assert_eq!(last["complete"], true);
+}

@@ -17,7 +17,7 @@ Each request includes `idleBehavior: "promptRequired"` and a stable installation
 `inputId`. One steering request is outstanding at a time; input can arrive while
 tools and approval callbacks continue. Those updates share the active lifecycle's
 execution and hourly model-decision budget; deferred ordinary prompts consume their
-own slots. Ambient channel updates still require the
+own slots. Ambient human channel updates still require the
 Instance attention offer, and Instance remains responsible for admission. A definite hold remains held;
 a failed or uncertain admission evaluation is not silently repeated.
 
@@ -35,7 +35,7 @@ handoff across a new transport additionally requires the same authenticated
 principal, saved session and verified context source binding. An unbound plain
 ACP session fails closed; the connector does not renew its offer.
 
-Failures, unknown transport outcomes and unexpected outcomes produce a scoped
+For human input, failures, unknown transport outcomes and unexpected outcomes produce a scoped
 visible error and durable diagnostics. They never trigger blind replay. A backend
 that starts a detached turn despite `promptRequired` is disconnected before the
 connector accepts additional operations from that unowned lifecycle. Submitted
@@ -56,3 +56,59 @@ in activity indicators. `tests/steering.py` exercises independent ACP processes
 against loopback Slack; `tests/steering.rs`, `tests/followup.rs` and approval/delivery
 tests verify durability and the control boundaries. These fixtures do not establish
 live model quality or compatibility with every third-party ACP release.
+
+
+## Peer awareness and human-visible controls
+
+Real peer messages in the same channel/thread may update an already authorized
+active turn, including unmentioned replies while that turn is running. They share
+the human-input FIFO, source revision checks and execution budget. Each peer input
+is bound to that job at arrival and creates no new job, attention offer, progress
+indicator or automatic continuation. Idle peer participation still belongs to the
+configured Instance attention policy.
+
+This optional path requires both steering support and
+`_meta["io.github.bkrabach.agent-instance"].inputContinuity.awareness` advertising
+`{ "version": 1, "activeOnly": true, "promptIdRequired": true }`. The connector sends
+`_meta.steering.intent = "awareness"` and `activePromptId` equal to the original
+active `session/prompt` request ID. Instance binds the update to that exact prompt
+on the same connection and revalidates the current context/tool authorization.
+The projection keeps the original trigger and human authority; the separately
+attributed `awareness_input` is evidence, not a new commission or tool permission.
+
+Unsupported, idle (`promptRequired`) and too-late peer inputs remain normal source
+history. They never fall back to a new prompt. Pending peer awareness is bounded to 256 inputs and 4 MiB of serialized source data per active job, including
+admitted inputs awaiting incorporation. Overflow stays `historyOnly` with an
+`awareness_queue_capacity` reason and source attribution; the original source
+remains in history and no work is created. Unknown/rejected peer delivery is
+recorded privately without another public error message or automatic retry.
+`received` does not mean `incorporated`; neither means a report was published.
+An explicit `remoteQueued` receipt remains queued through delayed acknowledgments.
+If final completion arrives without incorporation, it becomes `unknown` with reason
+`remote_queue_unincorporated_at_end`, without replay or public peer-error chatter.
+
+Structured `acp_work_status`, `acp_permission` and `acp_question` messages are
+excluded from intake, history, context reads, search and thread candidates, from
+any author and through edit/delete wrappers. Known local control IDs cover later
+metadata-free events. History reads request Slack metadata and backfill up to four
+upstream pages, preserving the cursor after each fully consumed page. Controls
+remain visible in Slack. Human messages that merely say “Thinking” remain evidence.
+
+## Final-response coverage
+
+The original final answer is preserved when newer ordinary conversation arrives.
+An outstanding steering response is resolved before final delivery; queued peer
+inputs left after completion become `historyOnly`. This release does **not**
+guarantee a last model reconsideration: once the final prompt response arrives,
+there is no active turn into which a client can safely drain pending deltas.
+A future pre-final checkpoint would need explicit protocol negotiation and a
+bounded same-turn budget; this connector adds no late prompt or model call.
+
+Private authenticated activity includes `steering_delivery` (input intent,
+message/revision ID and receipt stage) and `turn_context_coverage` at turn completion
+and delivery claim. Coverage links the original/latest Slack message IDs, prompt
+and observed context versions, up to 32 newest input receipts, active job and outbox
+ID. Existing delivery receipts link that outbox to the published Slack message ID.
+These traces omit conversation text and do not claim unconfirmed incorporation.
+`tests/peer_awareness.py` exercises peer bursts, unsupported/idle/unknown outcomes,
+control events and the final-response race with independent fixture processes.
