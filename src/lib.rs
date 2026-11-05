@@ -1,4 +1,5 @@
 pub mod acp_auth;
+mod answer;
 pub mod attention;
 pub mod auth;
 pub mod client_tools;
@@ -35,3 +36,7 @@ pub mod handoff;
 pub mod reconnect;
 
 pub mod steering;
+
+pub mod reactions;
+
+pub mod diagnostics;

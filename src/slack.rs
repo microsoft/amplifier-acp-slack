@@ -758,6 +758,12 @@ pub fn normalize(team: &str, channel: &str, e: &Value, prior: Option<Message>) -
 
 pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
     let e = &p["event"];
+    if matches!(
+        e["type"].as_str(),
+        Some("reaction_added" | "reaction_removed")
+    ) {
+        return crate::reactions::receive(c, store, p);
+    }
     if !["message", "app_mention"].contains(&e["type"].as_str().unwrap_or("")) {
         return Ok(());
     }
@@ -976,8 +982,8 @@ pub fn media_readiness(c: &Config, scopes: Option<&[String]>) -> Value {
 pub fn manifest(label: &str) -> Value {
     json!({"display_information":{"name":label.chars().take(80).collect::<String>(),"description":"Connect this agent to Slack through its ACP endpoint.","background_color":"#176d64"},
       "features":{"bot_user":{"display_name":label.chars().take(80).collect::<String>(),"always_online":false},"app_home":{"home_tab_enabled":false,"messages_tab_enabled":true,"messages_tab_read_only_enabled":false}},
-      "oauth_config":{"scopes":{"bot":["app_mentions:read","channels:history","channels:read","chat:write","files:read","files:write","groups:history","groups:read","im:history","im:read","im:write","mpim:history","mpim:read","users:read"]}},
-      "settings":{"org_deploy_enabled":false,"interactivity":{"is_enabled":true},"socket_mode_enabled":true,"token_rotation_enabled":false,"event_subscriptions":{"bot_events":["app_mention","message.channels","message.groups","message.im","message.mpim"]}}})
+      "oauth_config":{"scopes":{"bot":["app_mentions:read","channels:history","channels:read","chat:write","reactions:read","reactions:write","files:read","files:write","groups:history","groups:read","im:history","im:read","im:write","mpim:history","mpim:read","users:read"]}},
+      "settings":{"org_deploy_enabled":false,"interactivity":{"is_enabled":true},"socket_mode_enabled":true,"token_rotation_enabled":false,"event_subscriptions":{"bot_events":["app_mention","message.channels","message.groups","message.im","message.mpim","reaction_added","reaction_removed"]}}})
 }
 
 #[cfg(test)]

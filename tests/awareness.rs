@@ -482,3 +482,51 @@ fn peer_byte_limit_counts_utf8_bytes_and_already_admitted_unincorporated_input()
     assert!(trace.contains("awareness_queue_capacity"));
     assert!(!trace.contains('é'));
 }
+
+#[test]
+fn reactions_do_not_wake_idle_work_and_are_once_only_active_observations() {
+    let home = tempfile::tempdir().unwrap();
+    let mut s = Store::open(home.path()).unwrap();
+    let c = Config::new("Test".into(), "tester".into());
+    let event = |id: &str, user: &str, ts: &str| json!({"event_id":id,"event":{"type":"reaction_added","user":user,"reaction":"eyes","item":{"type":"message","channel":"C","ts":ts}}});
+    s.ingest("root", &message(1, false), true).unwrap();
+    acp_slack_adapter::reactions::receive(&c, &mut s, &event("idle", "UH", "1.000")).unwrap();
+    assert_eq!(
+        s.db.query_row(
+            "SELECT count(*) FROM steering_inputs WHERE intent='awareness'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let root = s.claim(&attention()).unwrap().unwrap();
+    for _ in 0..2 {
+        acp_slack_adapter::reactions::receive(&c, &mut s, &event("active", "UH", "1.000")).unwrap();
+    }
+    acp_slack_adapter::reactions::receive(&c, &mut s, &event("unknown", "UH", "99.000")).unwrap();
+    let input = steering::next(&s, &root.context, &root.id)
+        .unwrap()
+        .unwrap();
+    assert!(input.awareness);
+    assert!(input.message.text.contains("not a new request or approval"));
+    assert!(steering::submit(&s, &input, &root.id, "session").unwrap());
+    assert_eq!(
+        s.db.query_row(
+            "SELECT count(*) FROM steering_inputs WHERE intent='awareness'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.db.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.message("C", "1.000").unwrap().unwrap().text,
+        message(1, false).text
+    );
+}

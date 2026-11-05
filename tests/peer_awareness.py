@@ -21,16 +21,24 @@ async def case(mode):
      await f.deliver({'type':'message','subtype':'message_deleted','channel':channel,'deleted_ts':control['ts'],'previous_message':control,'event_ts':f.timestamp()})
     peer_ids=[]
     for n in range(3):
-     m=await f.send(channel,f'peer-{n}',user=f'UPEER{n}',bot_id=f'BPEER{n}',thread=thread);peer_ids.append(m['ts'])
+     if mode=='peerReactions':
+      original=next(m for m in f.messages if m.get('text')=='Build')
+      event={'type':'reaction_added','user':f'UPEER{n}','reaction':'eyes','item':{'type':'message','channel':channel,'ts':original['ts']}}
+      event_id=await f.deliver(event);await f.deliver(event,event_id=event_id)
+     else:
+      m=await f.send(channel,f'peer-{n}',user=f'UPEER{n}',bot_id=f'BPEER{n}',thread=thread);peer_ids.append(m['ts'])
     if mode=='peerFallback':await until(lambda:len(rows(home,"SELECT * FROM steering_inputs WHERE state='historyOnly'"))==3,'unsupported peers retained in source history')
     else:await until(lambda:len([e for e in events(work) if e['kind']=='steer'])>=(1 if mode in ('peerRace','peerIdle','peerUnknown') else 3),'ordered awareness intake')
-    (work/'finish').write_text('go');await until(lambda:len(f.posts)==1,'single original report')
+    (work/'finish').write_text('go');await until(lambda:len(rows(home,"SELECT * FROM jobs WHERE status IN ('running','pending')"))==0,'original turn finished')
+    if mode!='peerRevision':await until(lambda:len(f.posts)==1,'single original report')
     await until(lambda:all(i.get('deleted') for i in f.indicators),'single status cleared')
     es=events(work);assert [e['text'] for e in es if e['kind']=='prompt']==['Build'];assert [e['name'] for e in es if e['kind']=='effect']==['first','second'];assert not [e for e in es if e['kind']=='cancel'];assert len([e for e in es if e['kind']=='attention'])==1
     steers=[e for e in es if e['kind']=='steer'];assert len({e['id'] for e in steers})==len(steers);assert all(e['authority']=='UHUMAN' and e['channel']==channel and e['thread']==thread for e in steers)
+    if mode=='peerReactions':assert len(steers)==3 and all('reaction observation' in e['text'] for e in steers)
+    if mode=='peerRevision':assert not f.posts and not rows(home,"SELECT * FROM audit WHERE kind='driver_failed'")
     if mode=='peerSupported':assert [e['text'] for e in steers]==['peer-0','peer-1','peer-2']
     if mode=='peerFallback':assert not steers
-    assert len(rows(home,'SELECT * FROM jobs'))==1;assert len(rows(home,'SELECT * FROM outbox'))==1;assert len(f.indicators)==1
+    assert len(rows(home,'SELECT * FROM jobs'))==1;assert len(rows(home,'SELECT * FROM outbox'))==(0 if mode=='peerRevision' else 1);assert len(f.indicators)==1
     assert not rows(home,"SELECT * FROM messages WHERE body LIKE '%PRIVATE CONTROL%'")
     assert all(p['channel']==channel and p['thread_ts']==thread for p in f.posts)
     trace=rows(home,"SELECT data FROM audit WHERE kind='turn_context_coverage' ORDER BY seq DESC LIMIT 1")[0][0];assert 'private source' not in trace and 'PRIVATE CONTROL' not in trace
@@ -45,5 +53,5 @@ async def case(mode):
     log.close()
  finally:await runner.cleanup()
 async def main():
- for mode in ('peerSupported','peerFallback','peerIdle','peerUnknown','peerRace','peerRemoteQueued'):await case(mode)
+ for mode in ('peerSupported','peerFallback','peerIdle','peerUnknown','peerRace','peerRemoteQueued','peerRevision','peerReactions'):await case(mode)
 if __name__=='__main__':asyncio.run(main())
