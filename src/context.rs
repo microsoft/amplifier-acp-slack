@@ -199,6 +199,7 @@ struct SlackReader {
     client: reqwest::Client,
     base: String,
     token: String,
+    home: std::path::PathBuf,
 }
 
 impl SlackReader {
@@ -215,10 +216,54 @@ impl SlackReader {
                 .map_err(|_| unavailable())?,
             base: c.slack.api_base.clone(),
             token: secrets.bot_token,
+            home: home.into(),
         })
     }
 
-    async fn get(&self, method: &str, args: Value) -> ApiResult<Value> {
+    async fn get(&self, method: &str, mut args: Value) -> ApiResult<Value> {
+        if !matches!(method, "conversations.history" | "conversations.replies") {
+            return self.raw_get(method, args).await;
+        }
+        args["include_all_metadata"] = true.into();
+        let limit = args["limit"].as_u64().unwrap_or(40).min(100) as usize;
+        let channel = args["channel"].as_str().unwrap_or("").to_owned();
+        let store = Store::open(&self.home)?;
+        let mut items = Vec::new();
+        let mut removed = 0;
+        // Consume whole upstream pages so a continuation cursor never skips
+        // real messages. Bound backfill even in a room full of UI controls.
+        for page_number in 0..4 {
+            args["limit"] = (limit.saturating_sub(items.len()).max(1)).into();
+            let mut page = self.raw_get(method, args.clone()).await?;
+            let raw = page["messages"].as_array().ok_or_else(unavailable)?;
+            for message in raw {
+                if crate::slack::control_message(message)
+                    || crate::slack::known_control(
+                        &store,
+                        &channel,
+                        message["ts"].as_str().unwrap_or(""),
+                    )?
+                {
+                    removed += 1;
+                } else {
+                    items.push(message.clone());
+                }
+            }
+            let cursor = next_cursor(&page);
+            if items.len() >= limit || cursor.is_empty() || page_number == 3 {
+                page["messages"] = items.into();
+                page["filtered_controls"] = removed.into();
+                return Ok(page);
+            }
+            if args["cursor"].as_str() == Some(cursor.as_str()) {
+                return Err(unavailable());
+            }
+            args["cursor"] = cursor.into();
+        }
+        unreachable!()
+    }
+
+    async fn raw_get(&self, method: &str, args: Value) -> ApiResult<Value> {
         let mut response = self
             .client
             .get(format!("{}{method}", self.base))

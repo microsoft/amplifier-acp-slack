@@ -291,6 +291,7 @@ impl Store {
             )?;
         }
         if old.is_some() {
+            tx.execute("UPDATE steering_inputs SET state='retracted' WHERE intent='awareness' AND state='queued' AND json_extract(body,'$.channel')=?1 AND json_extract(body,'$.ts')=?2", params![m.channel,m.ts])?;
             // Busy inputs retain distinct triggers, so edits must retire the
             // previous pending revision instead of relying on coalescing.
             tx.execute("UPDATE jobs SET status='superseded',note='Source revision replaced before execution' WHERE status='pending' AND json_extract(trigger,'$.channel')=?1 AND json_extract(trigger,'$.ts')=?2 AND json_extract(trigger,'$.revision')<>?3",params![m.channel,m.ts,m.revision])?;
@@ -314,12 +315,20 @@ impl Store {
             tx.execute("UPDATE followups SET status='cancelled' WHERE parent IN (SELECT id FROM jobs WHERE context=?1) AND status IN ('proposed','queued')",[&ctx])?;
         }
         if wake && !m.deleted {
-            let busy: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM jobs WHERE context=?1 AND status='running')",
-                [&ctx],
-                |r| r.get(0),
-            )?;
-            if busy && !m.bot {
+            let busy: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM jobs WHERE context=?1 AND status='running' LIMIT 1",
+                    [&ctx],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if m.bot
+                && let Some(active) = &busy
+            {
+                // Peer evidence belongs only to the authorized turn that was
+                // active at arrival. It never commissions a new work job.
+                tx.execute("INSERT INTO steering_inputs(input_id,context,source_id,revision,state,created,target_job,intent,body) VALUES(?1,?2,?3,?4,'queued',?5,?6,'awareness',?7)",params![Uuid::new_v4().to_string(),ctx,event_id,m.revision,now_ms(),active,serde_json::to_string(m)?])?;
+            } else if busy.is_some() && !m.bot {
                 let id = Uuid::new_v4().to_string();
                 tx.execute("INSERT INTO jobs(id,context,trigger,status,created,updated) VALUES(?1,?2,?3,'pending',?4,?4)",params![id,ctx,serde_json::to_string(m)?,now_ms()])?;
                 tx.execute("INSERT INTO steering_inputs(input_id,context,source_id,revision,state,created) VALUES(?1,?2,?3,?4,'queued',?5)",params![id,ctx,event_id,m.revision,now_ms()])?;
@@ -357,7 +366,7 @@ impl Store {
         let mut bytes = 0;
         for row in rows {
             let msg: Message = serde_json::from_str(&row?)?;
-            if msg.deleted {
+            if msg.deleted || crate::slack::known_control(self, &msg.channel, &msg.ts)? {
                 continue;
             }
             bytes += msg.text.len();
@@ -530,6 +539,8 @@ impl Store {
                     },
                     json!({"job":job.id,"context":job.context,"reason":note}),
                 )?;
+                crate::steering::retire_awareness(self, &job.id)?;
+                crate::steering::coverage(self, &job.id, "turn_failed", None)?;
                 return Ok(());
             }
         };
@@ -541,6 +552,8 @@ impl Store {
         if version > job.version {
             self.db.execute("UPDATE jobs SET status='superseded',updated=?1,note='Conversation changed during this turn; contribution withheld' WHERE id=?2",params![now_ms(),job.id])?;
             self.audit("stale_contribution_withheld", json!({"job":job.id}))?;
+            crate::steering::retire_awareness(self, &job.id)?;
+            crate::steering::coverage(self, &job.id, "source_changed", None)?;
             if let Some(current) = self.message(&job.trigger.channel, &job.trigger.ts)?
                 && !current.deleted
             {
@@ -572,6 +585,8 @@ impl Store {
             ],
         )?;
         tx.commit()?;
+        crate::steering::retire_awareness(self, &job.id)?;
+        crate::steering::coverage(self, &job.id, "turn_finished", None)?;
         Ok(())
     }
     pub fn claim_outgoing(&mut self, c: &Config) -> Result<Option<Outgoing>> {
@@ -657,6 +672,12 @@ impl Store {
             params![out.id,now],
         )?;
         tx.commit()?;
+        let job: String =
+            self.db
+                .query_row("SELECT job_id FROM outbox WHERE id=?1", [&out.id], |r| {
+                    r.get(0)
+                })?;
+        crate::steering::coverage(self, &job, "delivery_claimed", Some(&out.id))?;
         Ok(Some(out))
     }
     /// Recheck the human source between multipart sends. New messages and our
