@@ -69,8 +69,8 @@ fn current(store: &Store, id: &str) -> Result<Option<Value>> {
 }
 /// Match the callback's trusted turn input to the current persisted source.
 /// No caller-supplied identity can replace the sender recorded by Slack ingress.
-/// Peer-agent replies do not revoke an active turn. A newer human instruction,
-/// source edit/removal, stopped job, or configuration change still invalidates it.
+/// New participant input does not revoke an active operation. Source edit/removal,
+/// explicitly stopped jobs and configuration changes still invalidate it.
 pub(crate) fn live_turn(db: &rusqlite::Connection, c: &Config, input: &Value) -> Result<bool> {
     if !c.enabled {
         return Ok(false);
@@ -82,7 +82,7 @@ pub(crate) fn live_turn(db: &rusqlite::Connection, c: &Config, input: &Value) ->
         return Ok(false);
     };
     let source: Option<String> = db.query_row(
-        "SELECT j.trigger FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND j.context=?2 AND m.context=j.context AND j.status='running' AND j.version>=x.human_version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted') AND json_extract(m.body,'$.sender')=json_extract(j.trigger,'$.sender') AND json_extract(m.body,'$.bot')=json_extract(j.trigger,'$.bot')",
+        "SELECT j.trigger FROM jobs j JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.id=?1 AND j.context=?2 AND m.context=j.context AND j.status='running' AND j.version>=x.control_version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted') AND json_extract(m.body,'$.sender')=json_extract(j.trigger,'$.sender') AND json_extract(m.body,'$.bot')=json_extract(j.trigger,'$.bot')",
         params![job,ctx], |r| r.get(0)).optional()?;
     let Some(source) = source else {
         return Ok(false);
@@ -108,7 +108,7 @@ fn prune(store: &Store) -> Result<()> {
     Ok(())
 }
 fn live(store: &Store, c: &Config, id: &str) -> Result<bool> {
-    Ok(c.enabled && store.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions p JOIN jobs j ON j.id=p.job_id JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE p.id=?1 AND p.config_revision=?2 AND p.context=j.context AND m.context=j.context AND p.channel=m.channel AND p.thread=json_extract(j.trigger,'$.thread') AND p.approver=json_extract(j.trigger,'$.sender') AND NOT json_extract(j.trigger,'$.bot') AND json_extract(m.body,'$.sender')=p.approver AND NOT json_extract(m.body,'$.bot') AND j.status='running' AND j.version>=x.human_version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))", params![id,c.revision as i64], |r|r.get(0))?)
+    Ok(c.enabled && store.db.query_row("SELECT EXISTS(SELECT 1 FROM permissions p JOIN jobs j ON j.id=p.job_id JOIN contexts x ON x.id=j.context JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE p.id=?1 AND p.config_revision=?2 AND p.context=j.context AND m.context=j.context AND p.channel=m.channel AND p.thread=json_extract(j.trigger,'$.thread') AND p.approver=json_extract(j.trigger,'$.sender') AND NOT json_extract(j.trigger,'$.bot') AND json_extract(m.body,'$.sender')=p.approver AND NOT json_extract(m.body,'$.bot') AND j.status='running' AND j.version>=x.control_version AND m.revision=json_extract(j.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))", params![id,c.revision as i64], |r|r.get(0))?)
 }
 pub fn cancel_all(store: &Store, reason: &str) -> Result<()> {
     let changed = store.db.execute(
@@ -189,7 +189,7 @@ pub fn resolve(
         None => "cancelled",
         _ => anyhow::bail!("Persistent grants are not supported by this connector"),
     };
-    let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4,closed_at=?5 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version>=x.human_version)", params![id,status,option,actor,now_ms()])?;
+    let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4,closed_at=?5 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version>=x.control_version)", params![id,status,option,actor,now_ms()])?;
     ensure!(n == 1, "Permission changed before the decision was applied");
     store.audit(
         "permission_resolved",

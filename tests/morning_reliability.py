@@ -25,10 +25,10 @@ async def main():
     await until(lambda:'alpha' not in f.sockets,'stopped')
    try:
     await start();await f.send('Dwork','Build a branch and PR');await until(lambda:(work/'branches').exists(),'branch completed');await f.send('Dwork','Can I ask questions while you work?')
-    await until(lambda:any(p['channel']=='Dwork' for p in f.posts),'successor reply',35);assert (work/'branches').read_text()=='1';assert (work/'prs').read_text()=='1';assert len([p for p in f.posts if p['channel']=='Dwork'])==1
-    print('PASS follow-up preserves accepted work, rejects old callback, performs each effect once, publishes only successor',flush=True)
-    (work/'branches').unlink();(work/'prs').unlink();await f.send('Dstop','Build a branch and PR');await until(lambda:(work/'branches').exists(),'second branch');await f.send('Dstop','Stop; do not open the PR')
-    await until(lambda:any(p['channel']=='Dstop' for p in f.posts),'stop acknowledged');assert not (work/'prs').exists();print('PASS explicit cancellation is honored',flush=True)
+    await until(lambda:any(p['channel']=='Dwork' for p in f.posts),'successor reply',35);assert (work/'branches').read_text()=='1';assert (work/'prs').read_text()=='1';await until(lambda:len([p for p in f.posts if p['channel']=='Dwork'])==2,'queued follow-up reply')
+    print('PASS ordinary follow-up preserves work, approvals, both replies and single effects',flush=True)
+    (work/'branches').unlink();(work/'prs').unlink();source=await f.send('Dstop','Build a branch and PR');await until(lambda:(work/'branches').exists(),'second branch');await f.edit(source,'Stop; do not open the PR')
+    await until(lambda:any(p['channel']=='Dstop' for p in f.posts),'stop acknowledged');assert not (work/'prs').exists();print('PASS source retraction stops remaining effects',flush=True)
     await stop();missed=await f.send('Doffline','Hello while offline');await f.send('Doffline','bot chatter',user='Uother',bot_id='Bother');await start()
     await until(lambda:any(p['channel']=='Doffline' for p in f.posts),'missed human DM',35);assert len([p for p in f.posts if p['channel']=='Doffline'])==1
     print('PASS reconnect answers unseen human DM without requiring a fresh message',flush=True)

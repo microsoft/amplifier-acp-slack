@@ -1,0 +1,222 @@
+//! Durable client ownership for optional, ordered ACP steering. No prompt replay
+//! follows an ambiguous transmission, and input never changes its reply scope.
+use crate::{
+    model::{Message, now_ms},
+    store::Store,
+};
+use anyhow::{Result, ensure};
+use rusqlite::{OptionalExtension, params};
+use serde_json::{Value, json};
+pub const METHOD: &str = "_session/steering";
+pub const RECEIPTS: &str = "io.github.bkrabach.agent-runtime";
+#[derive(Clone)]
+pub struct Input {
+    pub id: String,
+    pub message: Message,
+}
+pub fn supported(init: &Value) -> bool {
+    init["_meta"]["steering"]["supported"] == true
+}
+pub fn initialize(s: &Store) -> Result<()> {
+    s.db.execute_batch("CREATE TABLE IF NOT EXISTS steering_inputs(seq INTEGER PRIMARY KEY AUTOINCREMENT,input_id TEXT NOT NULL UNIQUE,context TEXT NOT NULL,source_id TEXT NOT NULL,revision TEXT NOT NULL,state TEXT NOT NULL,created INTEGER NOT NULL,target_job TEXT,session_id TEXT,receipt TEXT); CREATE INDEX IF NOT EXISTS steering_queue ON steering_inputs(context,seq);")?;
+    let has_attention =
+        s.db.prepare("PRAGMA table_info(steering_inputs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .any(|v| v.is_ok_and(|v| v == "attention_offer"));
+    if !has_attention {
+        s.db.execute(
+            "ALTER TABLE steering_inputs ADD COLUMN attention_offer TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+pub fn next(s: &Store, context: &str, active: &str) -> Result<Option<Input>> {
+    // An unresolved earlier submission blocks later steering; normal queued
+    // prompts still have their own durable lifecycle after this one finishes.
+    let row:Option<(String,String)>=s.db.query_row("SELECT i.input_id,j.trigger FROM steering_inputs i JOIN jobs j ON j.id=i.input_id WHERE i.context=?1 AND j.status='pending' AND i.state IN ('queued','promptRequired') AND COALESCE(i.target_job,'')<>?2 ORDER BY i.seq LIMIT 1",params![context,active],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    row.map(|(id, body)| {
+        Ok(Input {
+            id,
+            message: serde_json::from_str(&body)?,
+        })
+    })
+    .transpose()
+}
+pub fn offering(s: &Store, id: &str, active: &str, sid: &str) -> Result<()> {
+    // Admission itself consumes a source-trigger evaluation. A disconnect must
+    // not blindly evaluate the same trigger again even before steering is sent.
+    s.db.execute(
+        "UPDATE steering_inputs SET state='offering',target_job=?2,session_id=?3 WHERE input_id=?1",
+        params![id, active, sid],
+    )?;
+    Ok(())
+}
+pub fn submit(s: &Store, input: &Input, active: &str, sid: &str) -> Result<bool> {
+    let tx = s.db.unchecked_transaction()?;
+    let n=tx.execute("UPDATE jobs SET status='steering',version=(SELECT version FROM contexts WHERE id=jobs.context) WHERE id=?1 AND status='pending' AND EXISTS(SELECT 1 FROM jobs a WHERE a.id=?2 AND a.status='running' AND a.context=jobs.context AND a.version>=(SELECT control_version FROM contexts WHERE id=a.context)) AND EXISTS(SELECT 1 FROM messages m WHERE m.channel=json_extract(jobs.trigger,'$.channel') AND m.ts=json_extract(jobs.trigger,'$.ts') AND m.revision=json_extract(jobs.trigger,'$.revision') AND NOT json_extract(m.body,'$.deleted'))",params![input.id,active])?;
+    if n == 1 {
+        tx.execute("UPDATE steering_inputs SET state='submitted',target_job=?2,session_id=?3 WHERE input_id=?1",params![input.id,active,sid])?;
+    }
+    tx.commit()?;
+    Ok(n == 1)
+}
+pub fn defer(s: &Store, id: &str, active: &str) -> Result<()> {
+    let tx = s.db.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE steering_inputs SET state='promptRequired',target_job=?2 WHERE input_id=?1",
+        params![id, active],
+    )?;
+    tx.execute(
+        "UPDATE jobs SET status='pending' WHERE id=?1 AND status='steering'",
+        [id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+pub fn held(s: &Store, id: &str, active: &str) -> Result<()> {
+    let tx = s.db.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE steering_inputs SET state='held',target_job=?2 WHERE input_id=?1",
+        params![id, active],
+    )?;
+    tx.execute("UPDATE jobs SET status='pass',note='Host attention held this update; it was not resubmitted' WHERE id=?1 AND status='pending'",[id])?;
+    tx.commit()?;
+    s.audit("steering_held", json!({"input_id":id}))
+}
+pub fn injected(s: &Store, id: &str, receipt: &Value) -> Result<()> {
+    s.db.execute(
+        "UPDATE steering_inputs SET state=CASE WHEN state='incorporated' THEN state ELSE 'received' END,receipt=?2 WHERE input_id=?1 AND state IN ('submitted','received','remoteQueued','incorporated')",
+        params![id, receipt.to_string()],
+    )?;
+    s.db.execute("UPDATE jobs SET status='steered',note='Input admitted to the existing ACP turn; incorporation is not yet confirmed' WHERE id=?1 AND status='steering'",[id])?;
+    s.audit("steering_received", json!({"input_id":id}))
+}
+pub fn fail(s: &Store, id: &str, state: &str) -> Result<()> {
+    ensure!(
+        ["failed", "unknown", "startedNewTurn", "notAccepted"].contains(&state),
+        "Invalid steering failure"
+    );
+    let note = if state == "notAccepted" || state == "failed" {
+        "The agent could not accept your update. It is saved but has not been sent again."
+    } else {
+        "Your update is saved, but I could not confirm whether it reached the running work. It was not sent again because that could repeat work."
+    };
+    failure_notice(s, id, state, note)
+}
+pub fn recovery_required(s: &Store, id: &str) -> Result<()> {
+    failure_notice(
+        s,
+        id,
+        "notAccepted",
+        "The agent needs an explicit review of an earlier input whose outcome is uncertain before it can accept more work. This request was not run or retried. Review the agent's input receipts through its installation controls before continuing.",
+    )
+}
+fn failure_notice(s: &Store, id: &str, state: &str, note: &str) -> Result<()> {
+    let tx = s.db.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE steering_inputs SET state=?2 WHERE input_id=?1",
+        params![id, state],
+    )?;
+    tx.execute("UPDATE jobs SET status='failed',note=?2,version=(SELECT version FROM contexts WHERE id=jobs.context) WHERE id=?1",params![id,format!("Steering {state}; input was not automatically replayed")])?;
+    tx.execute("INSERT OR IGNORE INTO outbox(id,job_id,context,channel,thread,text,status,created,available) SELECT ?1,id,context,json_extract(trigger,'$.channel'),json_extract(trigger,'$.thread'),?2,'ready',?3,?3 FROM jobs WHERE id=?1",params![id,note,now_ms()])?;
+    tx.commit()?;
+    s.audit("steering_failed", json!({"input_id":id,"state":state}))
+}
+pub fn receipt(s: &Store, active: &str, value: &Value) -> Result<()> {
+    let Some(id) = value["inputId"].as_str() else {
+        return Ok(());
+    };
+    let Some(state) = value["state"].as_str() else {
+        return Ok(());
+    };
+    let matches:bool=s.db.query_row("SELECT EXISTS(SELECT 1 FROM steering_inputs WHERE input_id=?1 AND target_job=?2 AND state IN ('received','submitted','remoteQueued','incorporated'))",params![id,active],|r|r.get(0))?;
+    if !matches {
+        return Ok(());
+    }
+    if ["unknown", "notAccepted"].contains(&state) {
+        return fail(s, id, state);
+    }
+    if !["received", "submitted", "remoteQueued", "incorporated"].contains(&state) {
+        return Ok(());
+    }
+    // Do not let delayed/duplicate receipts move incorporated input backwards.
+    s.db.execute("UPDATE steering_inputs SET state=?2,receipt=?3 WHERE input_id=?1 AND state<>'incorporated'",params![id,state,json!({"inputId":id,"state":state,"turnId":value["turnId"],"sequence":value["sequence"]}).to_string()])?;
+    Ok(())
+}
+pub fn recover(s: &Store) -> Result<()> {
+    let ids=s.db.prepare("SELECT input_id FROM steering_inputs WHERE state IN ('offering','submitted','received','remoteQueued')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        fail(s, &id, "unknown")?;
+    }
+    Ok(())
+}
+pub fn abandon(s: &Store, active: &str) -> Result<()> {
+    let ids=s.db.prepare("SELECT input_id FROM steering_inputs WHERE target_job=?1 AND state IN ('offering','submitted','received','remoteQueued')")?.query_map([active],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        fail(s, &id, "unknown")?;
+    }
+    Ok(())
+}
+pub fn complete(s: &Store, active: &str) -> Result<()> {
+    s.db.execute("UPDATE steering_inputs SET state='completed' WHERE target_job=?1 AND state IN ('received','remoteQueued')",[active])?;
+    Ok(())
+}
+/// Tickets are private installation state. Only a definite backend idle result
+/// may restore the original offer, and its expiry is never extended here.
+pub fn save_attention(s: &Store, id: &str, offer: &Value) -> Result<()> {
+    s.db.execute(
+        "UPDATE steering_inputs SET attention_offer=?2 WHERE input_id=?1",
+        params![id, offer.to_string()],
+    )?;
+    Ok(())
+}
+pub fn restore_attention(s: &Store, id: &str, result: &Value) -> Result<()> {
+    let notice = &result["_meta"][crate::attention::META];
+    if notice["ticketState"] != "restored" {
+        return Ok(());
+    }
+    let raw: Option<String> = s.db.query_row(
+        "SELECT attention_offer FROM steering_inputs WHERE input_id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if let Some(raw) = raw {
+        let mut offer: Value = serde_json::from_str(&raw)?;
+        if notice["id"] == offer["id"] && notice["expiresAt"].as_i64().is_some_and(|t| t > now_ms())
+        {
+            offer["restoredUntil"] = notice["expiresAt"].clone();
+            save_attention(s, id, &offer)?;
+        }
+    }
+    Ok(())
+}
+pub fn restored_attention(s: &Store, id: &str) -> Result<Option<Value>> {
+    let raw: Option<String> =
+        s.db.query_row(
+            "SELECT attention_offer FROM steering_inputs WHERE input_id=?1 AND state='prompt'",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(raw) = raw else { return Ok(None) };
+    let offer: Value = serde_json::from_str(&raw)?;
+    // This offer was already forwarded. Missing restoration is a consumed
+    // ticket, not permission to request a new offer for the same source.
+    ensure!(
+        offer["restoredUntil"]
+            .as_i64()
+            .is_some_and(|t| t > now_ms()),
+        "Attention offer was not restored or has expired; input was not resubmitted"
+    );
+    Ok(Some(json!({"id":offer["id"],"ticket":offer["ticket"]})))
+}
+pub fn status(s: &Store) -> Result<Value> {
+    let counts =
+        s.db.prepare("SELECT i.state,COUNT(*) FROM steering_inputs i GROUP BY i.state")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+    let oldest:Option<i64>=s.db.query_row("SELECT MIN(i.created) FROM steering_inputs i JOIN jobs j ON j.id=i.input_id WHERE j.status IN ('pending','steering')",[],|r|r.get(0))?;
+    Ok(json!({"states":counts,"oldest_queued_age_ms":oldest.map(|t|(now_ms()-t).max(0))}))
+}

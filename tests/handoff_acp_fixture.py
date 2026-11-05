@@ -31,14 +31,16 @@ for line in sys.stdin:
    assert permission(sid,'branch')['outcome']['outcome']=='selected';effect('branches');update(sid,sessionUpdate='tool_call_update',toolCallId='branch',status='completed')
    time.sleep(2)
    update(sid,sessionUpdate='tool_call',toolCallId='old-pr',title='Opening PR',kind='execute',status='pending')
-   denied=permission(sid,'old-pr');assert denied['outcome']['outcome']=='cancelled';assert denied['_meta']['com.microsoft.amplifier.permission']['reason']=='source_changed'
-   update(sid,sessionUpdate='tool_call_update',toolCallId='old-pr',status='failed');answer='Old draft, must not publish'
+   result=permission(sid,'old-pr')
+   if result['outcome']['outcome']=='selected':
+    effect('prs');update(sid,sessionUpdate='tool_call_update',toolCallId='old-pr',status='completed');answer='Branch and PR completed.'
+   else:
+    assert result['_meta']['com.microsoft.amplifier.permission']['reason']=='source_changed'
+    update(sid,sessionUpdate='tool_call_update',toolCallId='old-pr',status='failed');answer='Source changed; no PR opened.'
   elif trigger.startswith('Can I'):
-   handoff=data['work_handoff'];assert handoff['earlier_requests'][0]['observed_tools'][0]['status']=='completed'
-   assert (root/'branches').read_text()=='1';update(sid,sessionUpdate='tool_call',toolCallId='new-pr',title='Opening PR',kind='execute',status='pending')
-   assert permission(sid,'new-pr')['outcome']['outcome']=='selected';effect('prs');update(sid,sessionUpdate='tool_call_update',toolCallId='new-pr',status='completed');answer='Yes, and the existing branch now has a PR.'
+   assert (root/'branches').read_text()=='1';assert (root/'prs').read_text()=='1';answer='Yes, the existing branch and PR are complete.'
   elif trigger.startswith('Stop'):
-   assert data.get('work_handoff');answer='Stopped the remaining work.'
+   answer='Stopped the remaining work.'
   else:answer='Recovered message answered.'
   update(sid,sessionUpdate='agent_message_chunk',content={'type':'text','text':answer});result={'stopReason':'end_turn'}
  else:result={}

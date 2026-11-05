@@ -265,7 +265,7 @@ fn legacy_configuration_requires_approval_but_questions_do_not_require_an_allowl
 }
 
 #[tokio::test]
-async fn teammate_replies_preserve_active_permissions_but_human_followups_revoke_them() {
+async fn participant_messages_preserve_unchanged_active_permissions() {
     for initial_bot in [false, true] {
         for newcomer_bot in [false, true] {
             let f = Fixture::new("wait", initial_bot);
@@ -285,7 +285,7 @@ async fn teammate_replies_preserve_active_permissions_but_human_followups_revoke
             peer.text = if newcomer_bot {
                 "I can review the candidate when ready"
             } else {
-                "Stop before the next action"
+                "Can I ask a question while you work?"
             }
             .into();
             f.store().ingest("new-message", &peer, true).unwrap();
@@ -295,12 +295,7 @@ async fn teammate_replies_preserve_active_permissions_but_human_followups_revoke
                 serde_json::from_slice(&std::fs::read(f.home.join("response.json")).unwrap())
                     .unwrap();
             assert_eq!(
-                reply["result"]["outcome"]["outcome"],
-                if newcomer_bot {
-                    "selected"
-                } else {
-                    "cancelled"
-                },
+                reply["result"]["outcome"]["outcome"], "selected",
                 "initial_bot={initial_bot} newcomer_bot={newcomer_bot}: {reply}"
             );
         }

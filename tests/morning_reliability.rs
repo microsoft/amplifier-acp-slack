@@ -67,6 +67,15 @@ fn unfinished_work_follows_latest_question_but_not_edits_or_other_endpoints() {
     )
     .unwrap();
     s.finish(&old, decision(), &a).unwrap();
+    // A real previously withheld draft still carries a handoff. Ordinary new
+    // input no longer produces this state by itself.
+    s.db.execute(
+        "UPDATE jobs SET status='superseded',note='Source context changed' WHERE id=?1",
+        [&old.id],
+    )
+    .unwrap();
+    s.db.execute("DELETE FROM outbox WHERE job_id=?1", [&old.id])
+        .unwrap();
     let next = s.claim(&a).unwrap().unwrap();
     let h = handoff::attach(&s, &next, "endpoint").unwrap().unwrap();
     assert_eq!(
@@ -166,8 +175,16 @@ async fn automatic_approvals_survive_activity_writes_and_still_reject_stale_sour
     for outcome in outcomes {
         assert_eq!(outcome.unwrap()["outcome"]["outcome"], "selected");
     }
-    s.ingest("followup", &message("2.000001", "Stop the work"), true)
+    s.ingest("followup", &message("2.000001", "How is it going?"), true)
         .unwrap();
+    let live = acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
+        .await
+        .unwrap();
+    assert_eq!(live["outcome"]["outcome"], "selected");
+    let mut edit = first.clone();
+    edit.revision = "3.000001".into();
+    edit.text = "Retracted source request".into();
+    s.ingest("retract", &edit, false).unwrap();
     let stale =
         acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
             .await
