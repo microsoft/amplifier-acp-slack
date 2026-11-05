@@ -28,6 +28,8 @@ struct FakeSlack {
     calls: Vec<(String, String)>,
     unavailable_members: bool,
     unavailable_replies: bool,
+    reaction_writes: Vec<Value>,
+    reaction_error: Option<String>,
 }
 
 fn message(ts: &str, actor: &str, text: &str) -> Value {
@@ -52,6 +54,19 @@ async fn slack_api(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let value = match method.as_str() {
+        "reactions.get" => {
+            let item = fake
+                .history
+                .get(&channel)
+                .into_iter()
+                .flatten()
+                .find(|m| m["ts"].as_str() == args.get("timestamp").map(String::as_str))
+                .cloned();
+            match item {
+                Some(message) => json!({"ok":true,"type":"message","message":message}),
+                None => json!({"ok":false,"error":"message_not_found"}),
+            }
+        }
         "conversations.info" => match fake.info.get(&channel) {
             Some(info) => json!({"ok":true,"channel":info}),
             None => json!({"ok":false,"error":"channel_not_found"}),
@@ -142,6 +157,24 @@ impl Drop for Fixture {
         self.task.abort();
     }
 }
+async fn slack_write(
+    State(fake): State<Arc<Mutex<FakeSlack>>>,
+    Path(method): Path<String>,
+    Json(args): Json<Value>,
+) -> Json<Value> {
+    assert!(matches!(
+        method.as_str(),
+        "reactions.add" | "reactions.remove"
+    ));
+    let mut fake = fake.lock().unwrap();
+    fake.reaction_writes
+        .push(json!({"method":method,"args":args}));
+    Json(match &fake.reaction_error {
+        Some(error) => json!({"ok":false,"error":error}),
+        None => json!({"ok":true}),
+    })
+}
+
 impl Fixture {
     async fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
@@ -171,7 +204,7 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
-            .route("/api/{method}", get(slack_api))
+            .route("/api/{method}", get(slack_api).post(slack_write))
             .with_state(fake.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -590,7 +623,7 @@ async fn thread_orientation_contains_parent_predecessor_latest_parent_and_thread
 }
 
 #[tokio::test]
-async fn mcp_requires_grant_and_exposes_only_read_tools_with_current_permissions() {
+async fn mcp_requires_grant_and_exposes_scoped_tools_with_current_permissions() {
     let f = Fixture::new().await;
     let request = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}});
     assert_eq!(
@@ -610,7 +643,7 @@ async fn mcp_requires_grant_and_exposes_only_read_tools_with_current_permissions
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
     let search = tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -1218,7 +1251,7 @@ async fn recent_thread_windows_are_bounded_and_never_replay_deleted_cached_repli
             .iter()
             .filter(|(method, _)| method == "conversations.replies")
             .count(),
-        3
+        6
     );
 }
 
@@ -1374,4 +1407,111 @@ async fn control_backfill_is_bounded_and_keeps_exact_continuation() {
     let (_, last) = f.query(next).await;
     assert_eq!(last["messages"][0]["text"], "Real proposal");
     assert_eq!(last["complete"], true);
+}
+
+#[tokio::test]
+async fn referenced_error_root_remains_visible_but_unrelated_controls_do_not() {
+    let f = Fixture::new().await;
+    let mut root = message(
+        "1000.000002",
+        "UBOT",
+        "The agent finished but its answer could not be read.",
+    );
+    root["metadata"] = json!({"event_type":"acp_work_status"});
+    let mut unrelated = message("1000.000003", "UBOT", "UNRELATED STATUS");
+    unrelated["metadata"] = json!({"event_type":"acp_work_status"});
+    f.fake.lock().unwrap().replies.insert(
+        ("CSHARED".into(), "1000.000002".into()),
+        vec![
+            root,
+            unrelated,
+            message("1000.000004", "UPEER", "Explain this error"),
+        ],
+    );
+    let value = context::orientation_for(
+        &f.state.instance_config(),
+        f.home.path(),
+        &Fixture::input("CSHARED", "1000.000002", "UPEER", false),
+    )
+    .await
+    .unwrap();
+    assert!(value.to_string().contains("answer could not be read"));
+    assert!(!value.to_string().contains("UNRELATED STATUS"));
+    let grant = f.grant("CSHARED", "1000.000002", "UPEER", false);
+    let (_,read)=f.call("/context/mcp",Some(&grant),json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slack_context_read","arguments":{}}})).await;
+    assert_eq!(
+        read["result"]["structuredContent"]["root"]["connector_notice"],
+        true
+    );
+}
+#[tokio::test]
+async fn reactions_are_current_scoped_and_writes_only_use_the_bots_identity() {
+    let f = Fixture::new().await;
+    f.fake.lock().unwrap().history.get_mut("CSHARED").unwrap()[0]["reactions"] =
+        json!([{"name":"eyes","count":3,"users":["UPEER"]}]);
+    let grant = f.grant("CSHARED", "", "UPEER", false);
+    let call = |name: &str, args: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}});
+    let args = json!({"message_id":"1000.000001"});
+    let (_, r) = f
+        .call(
+            "/context/mcp",
+            Some(&grant),
+            call("slack_reactions_get", args.clone()),
+        )
+        .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert!(r.to_string().contains("eyes"));
+    let (_, r) = f
+        .call(
+            "/context/mcp",
+            Some(&grant),
+            call(
+                "slack_reactions_add",
+                json!({"message_id":"1000.000001","name":"white_check_mark"}),
+            ),
+        )
+        .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(
+        f.fake.lock().unwrap().reaction_writes[0]["args"],
+        json!({"channel":"CSHARED","timestamp":"1000.000001","name":"white_check_mark"})
+    );
+    for args in [
+        json!({"message_id":"1000.000001","name":"eyes","conversation_id":"CPRIVATE"}),
+        json!({"message_id":"1000.000001","name":"eyes","user":"UOWNER"}),
+    ] {
+        let (_, r) = f
+            .call(
+                "/context/mcp",
+                Some(&grant),
+                call("slack_reactions_add", args),
+            )
+            .await;
+        assert!(
+            r["result"]["isError"] == true || r.get("error").is_some(),
+            "{r}"
+        );
+    }
+    f.fake
+        .lock()
+        .unwrap()
+        .members
+        .get_mut("CSHARED")
+        .unwrap()
+        .retain(|u| u != "UPEER");
+    let (_, r) = f
+        .call(
+            "/context/mcp",
+            Some(&grant),
+            call(
+                "slack_reactions_remove",
+                json!({"message_id":"1000.000001","name":"eyes"}),
+            ),
+        )
+        .await;
+    assert!(
+        r["result"]["isError"] == true || r.get("error").is_some(),
+        "{r}"
+    );
+    assert_eq!(f.fake.lock().unwrap().reaction_writes.len(), 1);
 }

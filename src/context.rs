@@ -1,6 +1,7 @@
-//! Read-only Slack conversation context, with fresh audience checks at every use.
+//! Slack conversation context and own reactions, with fresh audience checks at every use.
 //!
-//! The provider never reads agent history or publishes Slack messages. A grant is
+//! The provider never reads agent history or publishes Slack messages. Reactions
+//! are explicit, current-conversation-only bot actions through separate MCP tools. A grant is
 //! a short-lived reference to an adapter-observed trigger, not a cached permission.
 
 use crate::{
@@ -237,12 +238,15 @@ impl SlackReader {
             let mut page = self.raw_get(method, args.clone()).await?;
             let raw = page["messages"].as_array().ok_or_else(unavailable)?;
             for message in raw {
-                if crate::slack::control_message(message)
-                    || crate::slack::known_control(
-                        &store,
-                        &channel,
-                        message["ts"].as_str().unwrap_or(""),
-                    )?
+                let referenced_root =
+                    method == "conversations.replies" && message["ts"] == args["ts"];
+                if !referenced_root
+                    && (crate::slack::control_message(message)
+                        || crate::slack::known_control(
+                            &store,
+                            &channel,
+                            message["ts"].as_str().unwrap_or(""),
+                        )?)
                 {
                     removed += 1;
                 } else {
@@ -570,7 +574,8 @@ fn messages(
         result.push(json!({"id":ts,"message_id":ts,"conversation_id":channel,"text":text,
             "actor":actor,"actor_id":actor,"at":ts,"url":source_url(c,channel,Some(ts)),
             "thread_id":thread,"reply_count":message["reply_count"].as_u64().unwrap_or(0),
-            "latest_reply":message["latest_reply"].as_str().filter(|s|timestamp(s)),"truncated":text_truncated}));
+            "latest_reply":message["latest_reply"].as_str().filter(|s|timestamp(s)),"truncated":text_truncated,
+            "reactions":crate::reactions::projection(message),"connector_notice":crate::slack::control_message(message)}));
     }
     truncated |= raw.len() > limit;
     result.sort_by(|a, b| a["at"].as_str().cmp(&b["at"].as_str()));
@@ -607,13 +612,38 @@ async fn read_page(
     let page = slack.get(method, args).await?;
     let (messages, truncated) = messages(c, &conversation.id, &page, limit)?;
     let cursor = next_cursor(&page);
+    let root = if let Some(thread) = thread {
+        if let Some(root) = messages.iter().find(|m| m["id"] == thread) {
+            root.clone()
+        } else {
+            thread_root(c, slack, &conversation.id, thread).await
+        }
+    } else {
+        Value::Null
+    };
     Ok(
-        json!({"conversation_id":conversation.id,"thread_id":thread,"label":conversation.label,
+        json!({"root":root,"conversation_id":conversation.id,"thread_id":thread,"label":conversation.label,
         "messages":messages,"complete":cursor.is_empty()&&page["has_more"]!=true&&!truncated,
         "next_cursor":if cursor.is_empty(){None}else{Some(cursor)},"observed_at":now_ms(),
         "coverage":{"scope":if thread.is_some(){"thread"}else{"conversation_roots"},"bounded":true,
             "text_truncated":truncated,"requested_limit":limit,"has_more":page["has_more"]==true}}),
     )
+}
+
+async fn thread_root(c: &Config, slack: &SlackReader, channel: &str, thread: &str) -> Value {
+    let result = slack
+        .get(
+            "conversations.replies",
+            json!({"channel":channel,"ts":thread,"limit":1}),
+        )
+        .await;
+    if let Ok(page) = result
+        && let Ok((items, _)) = messages(c, channel, &page, 1)
+        && let Some(item) = items.into_iter().find(|m| m["id"] == thread)
+    {
+        return item;
+    }
+    json!({"id":thread,"available":false,"url":source_url(c,channel,Some(thread)),"notice":"Thread root unavailable; no text was assumed."})
 }
 
 fn thread_index(pages: &[&Value]) -> Vec<Value> {
@@ -706,6 +736,7 @@ async fn recent_thread_activity(
     let mut budget: usize = 6000;
     for (thread, oldest, _) in hints {
         let page = tokio::time::timeout(Duration::from_secs(2), slack.get("conversations.replies", json!({"channel":conversation.id,"ts":thread,"oldest":oldest,"inclusive":true,"limit":4}))).await.unwrap_or_else(|_| Err(unavailable()));
+        let root = thread_root(c, slack, &conversation.id, &thread).await;
         let window = match page {
             Ok(mut page) => {
                 // Slack can include the parent in addition to the requested reply
@@ -729,7 +760,7 @@ async fn recent_thread_activity(
                     budget -= text.chars().count();
                     item["text"] = text.into();
                 }
-                json!({"thread_id":thread,"url":source_url(c,&conversation.id,Some(&thread)),"messages":items,
+                json!({"root":root,"thread_id":thread,"url":source_url(c,&conversation.id,Some(&thread)),"messages":items,
                     "complete":false,"next_cursor":next_cursor(&page),"available":true,
                     "coverage":{"scope":"recent_thread_window","oldest":oldest,"has_more":page["has_more"]==true,"text_truncated":truncated}})
             }
@@ -931,7 +962,7 @@ fn mcp_tools() -> Value {
     let properties = json!({"conversation_id":{"type":"string","description":"Slack conversation ID from discovery or the current conversation"},
         "thread_id":{"type":"string","description":"Optional Slack root-message timestamp"},"limit":{"type":"integer","minimum":1,"maximum":40},
         "cursor":{"type":"string","description":"Opaque next_cursor from a previous result"}});
-    let tools:Vec<Value> = [
+    let mut tools:Vec<Value> = [
         ("slack_context_list","Find conversations this identity and audience may access; never publishes messages."),
         ("slack_context_read","Read a bounded conversation or thread with source references; never publishes messages."),
         ("slack_context_orientation","Inspect the relationship between this thread and its surrounding conversation."),
@@ -946,6 +977,30 @@ fn mcp_tools() -> Value {
         json!({"name":name,"description":description,"inputSchema":schema,
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":true}})
     }).collect();
+    for (name, description, read_only) in [
+        (
+            "slack_reactions_get",
+            "Read current reactions on a message in this conversation; listed actors may be incomplete.",
+            true,
+        ),
+        (
+            "slack_reactions_add",
+            "Add this agent's own emoji reaction to a message in this conversation. A reaction is not approval or a work request.",
+            false,
+        ),
+        (
+            "slack_reactions_remove",
+            "Remove this agent's own emoji reaction from a message in this conversation.",
+            false,
+        ),
+    ] {
+        let mut schema = json!({"type":"object","properties":{"message_id":{"type":"string"},"conversation_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false});
+        if !read_only {
+            schema["properties"]["name"] = json!({"type":"string","description":"Emoji name without wrapping colons, for example thumbsup"});
+            schema["required"] = json!(["message_id", "name"]);
+        }
+        tools.push(json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":read_only,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
+    }
     json!({"tools":tools})
 }
 
@@ -1049,6 +1104,20 @@ pub async fn mcp(
         "tools/call" => {
             if let Some(name) = body["params"]["name"]
                 .as_str()
+                .filter(|n| n.starts_with("slack_reactions_"))
+            {
+                return reaction_tool(
+                    &config,
+                    &slack,
+                    &authority,
+                    id,
+                    name,
+                    &body["params"]["arguments"],
+                )
+                .await;
+            }
+            if let Some(name) = body["params"]["name"]
+                .as_str()
                 .filter(|n| n.starts_with("slack_connector_update_"))
             {
                 if !(authority.owner && authority.origin.as_ref().is_some_and(|c| c.direct))
@@ -1136,4 +1205,117 @@ pub async fn mcp(
         }
         _ => Ok(rpc_error(id, -32601, "Method not found")),
     }
+}
+
+async fn reaction_tool(
+    c: &Config,
+    slack: &SlackReader,
+    auth: &Authority,
+    id: Value,
+    name: &str,
+    args: &Value,
+) -> ApiResult<Response> {
+    let operation = match name {
+        "slack_reactions_get" => "get",
+        "slack_reactions_add" => "add",
+        "slack_reactions_remove" => "remove",
+        _ => return Ok(rpc_error(id, -32602, "Unknown reaction tool")),
+    };
+    let Some(object) = args.as_object() else {
+        return Ok(rpc_error(id, -32602, "Invalid reaction arguments"));
+    };
+    if object
+        .keys()
+        .any(|k| !["message_id", "conversation_id", "name"].contains(&k.as_str()))
+    {
+        return Ok(rpc_error(id, -32602, "Invalid reaction arguments"));
+    }
+    let Some(ts) = args["message_id"].as_str().filter(|s| timestamp(s)) else {
+        return Ok(rpc_error(id, -32602, "Invalid message ID"));
+    };
+    let emoji = args["name"].as_str().unwrap_or("");
+    if operation != "get" && !crate::reactions::name(emoji) {
+        return Ok(rpc_error(id, -32602, "Invalid emoji name"));
+    }
+    let Some(origin) = auth.origin.as_ref() else {
+        return Err(ApiError::forbidden());
+    };
+    let channel = args["conversation_id"].as_str().unwrap_or(&origin.id);
+    if channel != origin.id {
+        return Err(ApiError::forbidden());
+    }
+    let conversation = target(c, slack, auth, Some(channel)).await?;
+    let snapshot = match slack
+        .raw_get(
+            "reactions.get",
+            json!({"channel":channel,"timestamp":ts,"full":true}),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(rpc(
+                id,
+                json!({"isError":true,"content":[{"type":"text","text":"Reaction access is unavailable. This Slack app needs reactions:read and reactions:write; reconnect its installation if these permissions have not been approved."}]}),
+            ));
+        }
+    };
+    if snapshot["message"]["ts"] != ts {
+        return Err(unavailable());
+    }
+    if c.context.thread_only_grants
+        && !auth.owner
+        && !auth.thread.is_empty()
+        && ts != auth.thread
+        && snapshot["message"]["thread_ts"] != auth.thread
+    {
+        return Err(ApiError::forbidden());
+    }
+    if operation == "get" {
+        let result = json!({"conversation_id":conversation.id,"message_id":ts,"reactions":crate::reactions::projection(&snapshot["message"]),"observed_at":now_ms()});
+        return Ok(rpc(
+            id,
+            json!({"structuredContent":result,"content":[{"type":"text","text":result.to_string()}],"isError":false}),
+        ));
+    }
+    // Recheck audience immediately before the side effect. Never impersonate
+    // another user and never automatically retry an uncertain write.
+    target(c, slack, auth, Some(channel)).await?;
+    let response = slack
+        .client
+        .post(format!("{}reactions.{operation}", slack.base))
+        .bearer_auth(&slack.token)
+        .json(&json!({"channel":channel,"timestamp":ts,"name":emoji}))
+        .send()
+        .await;
+    let mut response = match response {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(reaction_unknown(id)),
+    };
+    let mut data = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if data.len() + chunk.len() <= 65536 => data.extend_from_slice(&chunk),
+            Ok(None) => break,
+            _ => return Ok(reaction_unknown(id)),
+        }
+    }
+    let result: Value = match serde_json::from_slice(&data) {
+        Ok(v) => v,
+        Err(_) => return Ok(reaction_unknown(id)),
+    };
+    let success = result["ok"] == true
+        || operation == "add" && result["error"] == "already_reacted"
+        || operation == "remove" && result["error"] == "no_reaction";
+    let value = json!({"conversation_id":channel,"message_id":ts,"name":emoji,"operation":operation,"outcome":if success{"confirmed"}else{"rejected"},"reason":if success{"completed"}else if result["error"]=="missing_scope"{"reconnect_required"}else{"slack_rejected"}});
+    Ok(rpc(
+        id,
+        json!({"structuredContent":value,"content":[{"type":"text","text":value.to_string()}],"isError":!success}),
+    ))
+}
+fn reaction_unknown(id: Value) -> Response {
+    rpc(
+        id,
+        json!({"isError":true,"content":[{"type":"text","text":"Reaction outcome is unknown; it was not retried. Read current reactions before deciding whether another action is needed."}]}),
+    )
 }

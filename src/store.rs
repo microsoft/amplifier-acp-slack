@@ -543,10 +543,11 @@ impl Store {
             Ok(d) => d,
             Err(error) => {
                 let auth = crate::acp_auth::authentication_required(&error);
+                let (stage, category, delivery, summary) = crate::diagnostics::details(&error);
                 let note = if auth {
                     error.to_string()
                 } else {
-                    "Driver failed; see local diagnostic category in audit".into()
+                    format!("{summary} Reference: {}", &job.id[..job.id.len().min(8)])
                 };
                 self.db.execute(
                     "UPDATE jobs SET status='failed',updated=?1,note=?3 WHERE id=?2",
@@ -558,7 +559,7 @@ impl Store {
                     } else {
                         "driver_failed"
                     },
-                    json!({"job":job.id,"context":job.context,"reason":note}),
+                    json!({"job":job.id,"context":job.context,"source_message":job.trigger.ts,"source_revision":job.trigger.revision,"stage":stage,"category":category,"delivery":delivery,"reason":note}),
                 )?;
                 crate::steering::retire_awareness(self, &job.id)?;
                 crate::steering::coverage(self, &job.id, "turn_failed", None)?;

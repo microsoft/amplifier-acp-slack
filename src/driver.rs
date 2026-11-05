@@ -725,7 +725,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut output = String::new();
     let mut media = Vec::new();
     let mut media_omitted = false;
-    let mut message_id: Option<String> = None;
+    let mut answer = crate::answer::Answer::default();
     let mut permissions = 0;
     let mut retried_direct = false;
     let mut callbacks = tokio::task::JoinSet::new();
@@ -957,7 +957,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 client.peer.next += 1;
                 id = client.peer.next;
                 output.clear();
-                message_id = None;
+                answer = crate::answer::Answer::default();
                 media.clear();
                 media_omitted = false;
                 client.peer.write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":response_blocks}})).await?;
@@ -973,7 +973,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 client.peer.next += 1;
                 id = client.peer.next;
                 output.clear();
-                message_id = None;
+                answer = crate::answer::Answer::default();
                 media.clear();
                 media_omitted = false;
                 client.peer.write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"This is a direct conversation or explicit address. Provide a brief final reply to the latest user message; do not silently apply a previous group participation rule. Do not repeat any work or tools already performed. If and only if the user explicitly asked for no response, return the explicit_silence_request pass described above."}]}})).await?;
@@ -1041,21 +1041,8 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 }
             }
             if u["sessionUpdate"] == "agent_message_chunk" {
-                if let Some(mid) = u["messageId"].as_str()
-                    && message_id.as_deref() != Some(mid)
-                {
-                    output.clear();
-                    media.clear();
-                    media_omitted = false;
-                    message_id = Some(mid.to_owned());
-                }
-                if let Some(t) = u["content"]["text"].as_str() {
-                    ensure!(
-                        output.len() + t.len() <= 2 * 1024 * 1024,
-                        "ACP answer too large"
-                    );
-                    output.push_str(t);
-                }
+                answer.observe(u)?;
+                output = answer.text().to_owned();
                 match crate::media::output(&u["content"], media.len()) {
                     Ok(Some(file))
                         if c.media.outgoing
@@ -1233,9 +1220,9 @@ pub fn parse_decision(text: &str) -> Result<Decision> {
         .or_else(|| s.strip_prefix("```"))
         .map(|v| v.trim().strip_suffix("```").unwrap_or(v).trim())
         .unwrap_or(s);
-    let d: Decision = serde_json::from_str(s)
-        .context("Agent did not return a participation decision; no message published")?;
-    d.validate()?;
+    let d: Decision = serde_json::from_str(s).context(crate::diagnostics::Failure::answer())?;
+    d.validate()
+        .map_err(|e| e.context(crate::diagnostics::Failure::answer()))?;
     Ok(d)
 }
 fn direct_reply(text: &str) -> Result<Decision> {
