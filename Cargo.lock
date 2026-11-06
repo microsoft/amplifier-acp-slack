@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acp-slack-adapter"
-version = "0.11.4"
+version = "0.12.0"
 dependencies = [
  "amplifier-acp-connection",
  "anyhow",
@@ -97,6 +97,7 @@ dependencies = [
 [[package]]
 name = "amplifier-acp-connection"
 version = "0.1.0"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=e0d6a03fd342b295d349b633d400376efbbe2c40#e0d6a03fd342b295d349b633d400376efbbe2c40"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

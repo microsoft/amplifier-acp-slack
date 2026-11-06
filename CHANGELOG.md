@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.12.0
+
+Use the official ACP Rust SDK for protocol connections, preserving Slack policies and negotiated extensions. See [release notes](docs/releases/0.12.0.md).
+
 ## 0.11.4
 
 - Preserve a fresh attention candidate when peer messages arrive while an earlier participation decision is still running, before any ACP prompt is dispatched. Bursts coalesce and remain subject to ordinary Instance attention.
