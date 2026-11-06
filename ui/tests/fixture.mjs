@@ -15,7 +15,7 @@ let dropSessionCookie=true,failConfig=false,failView=false,failAcp=false,failIma
 const viewBodies=[];
 let beforeViewCommand=null;
 let config={schema:1,id:"fixture-connector",label:"Helper in Slack",revision:1,enabled:false,setup_complete:false,participation:"mentions",context:{enabled:false,owner_slack_user_id:""},media:{incoming:false,outgoing:false,max_files:4,max_file_bytes:2097152},acp:{command:"/installed/agent-instance",args:["acp","--home","/installed/helper"],env:{},secret_env:{},cwd:"/installed/helper/workspace",timeout_seconds:180,client:{read_text_file:false,write_text_file:false,terminal:false,workspace_roots:[],approvals_required:true,approval_users:[],permission_timeout_seconds:180,max_file_bytes:1048576,terminal_output_bytes:262144,terminal_timeout_seconds:120}},slack:{team_id:"",app_id:"",bot_user_id:"",bot_id:"",channels:[],allow_dms:true,api_base:"https://slack.com/api/",loopback_test:false},attention:{settle_ms:1500,max_replies_per_agent_per_hour:30,max_replies_per_context_per_hour:12,max_bot_replies_without_human:2,bot_exchange_cooldown_seconds:0,max_decisions_per_agent_per_hour:120,minimum_reply_interval_seconds:6},server:{bind:"0.0.0.0",port:41337,owner:"fixture-owner",pam_service:"login",public_url:null,embed_origins:[]}};
-let permissions=[],mediaChecked=null,fileScopes=false,portrait={},guidedAuthorized=false,guidedExpired=false,guidedDeploys=0;
+let permissions=[],mediaChecked=null,fileScopes=false,portrait={},guidedAuthorized=false,guidedExpired=false,guidedDeploys=0,guidedWorkspace="test-workspace",guidedTeam="T_WORKSHOP";
 const mediaResult=()=>({verified:true,checked_at:Date.now(),ready:fileScopes,granted_scopes:fileScopes?["files:read","files:write"]:[],missing_scopes:fileScopes?[]:["files:read","files:write"],settings_url:"https://api.slack.com/apps/A_FIXTURE/oauth",note:fileScopes?"Slack file permissions are installed.":"Add the missing Bot Token Scopes and reinstall this existing app."});
 const events=[{id:5,time:Date.now(),kind:"decision",data:{decision:"pass",reason:"The humans are already working through the question."}},{id:4,time:Date.now(),kind:"delivery",data:{status:"sent",note:""}},{id:3,time:Date.now(),kind:"delivery",data:{status:"uncertain",note:"Inspect Slack before resending."}},{id:2,time:Date.now(),kind:"connection",data:{state:"connected"}},{id:1,time:Date.now(),kind:"view.ack",data:{}}];
 const conversations=[{id:"context-one",channel:"C_FIRST",thread:"",session_id:"session-one",resumable:true,updated_at:Date.now(),turns:3,last_outcome:"pass"},{id:"context-two",channel:"C_SECOND",thread:"1234.1",session_id:"session-two",resumable:true,updated_at:Date.now(),turns:2,last_outcome:"speak"}];
@@ -41,7 +41,7 @@ const server=http.createServer(async(req,res)=>{
     if(data.action==="authorize")return send({command:"/slackauthticket private-ticket"});
     if(data.action==="confirm"){assert.equal(data.challenge,"private-challenge");guidedAuthorized=true;guidedExpired=false;if(!config.setup_complete){credentials=true;config.setup_complete=true;config.enabled=true;config.revision++;}}
     if(data.action==="connect"){guidedDeploys++;assert(guidedAuthorized);credentials=true;config.setup_complete=true;config.enabled=true;config.revision++;}
-    return send({authorized:guidedAuthorized,authorization:guidedExpired?"needs_attention":guidedAuthorized?"managed":"missing",team_id:"T_WORKSHOP",workspace:"test-workspace",setup_complete:config.setup_complete,next_action:config.setup_complete?"done":guidedAuthorized&&!guidedExpired?"connect":"authorize",connection_reused:config.setup_complete});
+    return send({authorized:guidedAuthorized,authorization:guidedExpired?"needs_attention":guidedAuthorized?"managed":"missing",team_id:guidedTeam,workspace:guidedWorkspace,setup_complete:config.setup_complete,next_action:config.setup_complete?"done":guidedAuthorized&&!guidedExpired?"connect":"authorize",connection_reused:config.setup_complete});
   }
   if(endpoint==="status")return send(status());
   if(endpoint==="media/readiness"){mediaChecked=mediaResult();return send(mediaChecked);}
@@ -256,15 +256,30 @@ try{
   await page.evaluate(()=>{window.openedSlack=[];window.open=(...args)=>window.openedSlack.push(args);});
   await page.locator('[data-action="slack.setup.copy-open"]').click();await waitIdle();
   assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),"/slackauthticket private-ticket");
-  assert.deepEqual(await page.evaluate(()=>window.openedSlack),[["https://app.slack.com/client/T_WORKSHOP","_blank","noopener,noreferrer"]]);
+  assert.deepEqual(await page.evaluate(()=>window.openedSlack),[["https://test-workspace.slack.com/messages/@slackbot","_blank","noopener,noreferrer"]]);
   assert(await page.locator('[data-control="slack.setup.workspace"]').isVisible());
-  assert((await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href")).startsWith("https://app.slack.com/client/"));
+  assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://test-workspace.slack.com/messages/@slackbot");
+  assert((await page.locator('.authorization-steps').innerText()).includes("Paste into Slackbot’s message box and press Enter"));
+  assert((await page.locator('.authorization-steps').innerText()).includes("Confirm"));
   await page.evaluate(()=>{navigator.clipboard.writeText=async()=>{throw new Error("Clipboard denied");};});
   await page.locator('[data-action="slack.setup.copy-open"]').click();await waitIdle();
   assert((await page.locator('body').innerText()).includes("Copy the command shown below"));
   assert((await page.locator('[data-sensitive-display]').textContent()).includes("private-ticket"));
   assert.equal(await page.evaluate(()=>window.openedSlack.length),2);
   assert(await page.locator('[data-sensitive-display]').isVisible());
+  guidedWorkspace="teamwork";await page.evaluate(()=>window.slackConnector.act("refresh"));
+  assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://teamwork.slack.com/messages/@slackbot");
+  for(const workspace of ["", "T1234567890", "test.slack.com.evil.invalid", "https://evil.invalid/"]){
+    guidedWorkspace=workspace;await page.evaluate(()=>window.slackConnector.act("refresh"));
+    assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://app.slack.com/client/T_WORKSHOP");
+  }
+  const savedTeam=config.slack.team_id;guidedWorkspace="";guidedTeam="";config.slack.team_id="";
+  await page.evaluate(()=>window.slackConnector.act("refresh"));
+  assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://app.slack.com/");
+  assert((await page.locator('[data-control="setup.connect-screen"]').innerText()).includes("Choose your workspace in Slack"));
+  config.slack.team_id=savedTeam;guidedTeam="T_WORKSHOP";guidedWorkspace="test-workspace";
+  await page.evaluate(()=>window.slackConnector.act("refresh"));
+  ok("Known workspace opens its private Slackbot conversation; missing or invalid metadata has an explicit workspace fallback");
   ok("Expired authorization guides renewal, copies and opens the workspace, and keeps a usable clipboard fallback");
   await page.screenshot({path:path.join(artifacts,"slack-authorization.png"),fullPage:true});
   await page.locator('[data-control="slack.setup.challenge"]').fill("private-challenge");
