@@ -9,6 +9,7 @@ repository = "https://github.com/microsoft/amplifier-acp-slack"
 description = "Generic ACP integration with Slack conversations and presentation."
 
 [dependencies]
+amplifier-acp-connection = { path = "../contracts/crates/acp-connection" }
 anyhow = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
