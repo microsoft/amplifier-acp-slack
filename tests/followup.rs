@@ -183,6 +183,59 @@ fn malformed_footer_preserves_the_answer_without_scheduling_work() {
 }
 
 #[test]
+fn peer_control_is_private_even_when_malformed_or_after_a_pass() {
+    for answer in [
+        "The updated plan is ready.",
+        r#"{"decision":"pass","reason":"already settled"}"#,
+    ] {
+        for footer in [r#"{"after_seconds":60,"goal":"Check delivery"}"#, "invalid"] {
+            let (dir, c, s, j) = fixture();
+            let mut trigger = j.trigger.clone();
+            trigger.bot = true;
+            s.db.execute(
+                "UPDATE jobs SET trigger=?2 WHERE id=?1",
+                rusqlite::params![j.id, serde_json::to_string(&trigger).unwrap()],
+            )
+            .unwrap();
+            let result = followup::capture(
+                dir.path(),
+                &c,
+                &json!({"job_id":j.id}),
+                &format!("{answer}\nSLACK_FOLLOW_UP {footer}"),
+            )
+            .unwrap();
+            assert_eq!(result, answer);
+            assert_eq!(
+                s.db.query_row("SELECT count(*) FROM followups", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            let event: String =
+                s.db.query_row(
+                    "SELECT data FROM audit WHERE kind='continuation_not_scheduled'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            assert_eq!(event, json!({"job":j.id,"reason":"bot_origin"}));
+        }
+    }
+}
+
+#[test]
+fn followup_control_is_offered_only_for_a_known_human_source() {
+    assert!(followup::guidance(&json!({"trigger":{"bot":false}})).contains("SLACK_FOLLOW_UP"));
+    for input in [
+        json!({"trigger":{"bot":true}}),
+        json!({}),
+        json!({"trigger":{"bot":"false"}}),
+    ] {
+        assert!(followup::guidance(&input).is_empty());
+    }
+}
+
+#[test]
 fn incorporated_update_preserves_a_later_continuation_without_changing_authority_version() {
     let (dir, c, mut s, j) = fixture();
     let original_version = j.version;
