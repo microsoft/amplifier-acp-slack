@@ -32,3 +32,5 @@
 @media(max-width:760px){.connection-card.hero{padding:22px;flex-direction:row;gap:14px}.connection-avatar{width:44px;height:44px;border-radius:12px;font-size:23px}.connection-copy h1{font-size:25px}.connection-copy p{font-size:13px}.connection-status{padding:8px 18px}.connection-status .health-row{flex-wrap:wrap}.connection-status .health-row>div{min-width:110px}.connection-status .health-row>span{max-width:170px}.authorization-command{align-items:stretch;flex-direction:column}.connection-home .field-grid{grid-template-columns:1fr}}
 
 .authorization-fallback{margin-top:16px;color:var(--muted)}.authorization-fallback summary{cursor:pointer}.authorization-fallback pre{margin-top:10px;user-select:all}.connect-authorization form h2{margin-bottom:16px}
+
+.authorization-steps{padding-left:24px;margin:20px 0;font-size:15px;line-height:1.7}.authorization-steps li+li{margin-top:10px}.authorization-steps strong{color:var(--ink)}

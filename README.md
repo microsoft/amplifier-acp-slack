@@ -66,8 +66,10 @@ Supported Slack attachments now become capability-checked ACP content, and nativ
 ## Connect Slack
 
 1. Open the printed URL and sign in. The installed agent is already selected.
-2. Choose **Connect to Slack**, then **Copy & open Slack**. Paste into a conversation in your
-   Slack workspace, approve Slack’s request, and enter its confirmation code here.
+2. Choose **Connect to Slack**, then **Copy command & open Slack**. In Slackbot,
+   paste into the message box and press Enter. Choose **Confirm**, then bring the
+   confirmation code back to this page. When the workspace is known, the connector
+   opens its Slackbot conversation directly; otherwise choose the workspace first.
 3. The connector creates the agent’s app, obtains its message credentials, checks
    the ACP connection, and starts listening. Image updates use the same authorization.
 4. Invite the agent into a channel or open its direct messages.

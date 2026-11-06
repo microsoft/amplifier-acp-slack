@@ -2,7 +2,7 @@
 
 The default setup authorizes the connector once using Slack’s CLI login flow:
 a private `/slackauthticket` command, Slack approval, then a confirmation code.
-**Copy & open Slack** copies that command and opens the selected workspace; the
+**Copy command & open Slack** copies that command and opens the selected workspace; the
 confirmation field remains on the connector page. If clipboard access or a new
 tab is blocked, the same page offers the command and a direct workspace link.
 Expired saved access goes directly to renewal instead of another failing install.
@@ -48,3 +48,18 @@ The normal connected page shows the agent and
 **Open in Slack**. Preferences and troubleshooting stay under **Settings**, with
 credentials and connection internals under **Advanced**. Saved views from an
 older version cannot reopen a completed authorization flow.
+
+### Slack authorization destination
+
+A workspace-only Slack link can restore any previously opened channel. When the
+CLI status supplies a workspace domain, the browser opens
+`https://<workspace>.slack.com/messages/@slackbot` instead. Slack resolves the
+private conversation for the signed-in person. This route was verified in a live
+browser; if sign-in loses the destination, the page offers **Open Slack again**.
+The setup command is copied to the clipboard, never included in the destination
+URL. An unknown workspace falls back to Slack’s workspace selection, with explicit
+instructions to open Slackbot.
+
+The approval and challenge code appear only after the person sends the command
+in Slack. The connector labels that step explicitly and keeps the manual copy
+fallback available. See Slack’s [CLI authorization flow](https://docs.slack.dev/tools/slack-cli/guides/authorizing-the-slack-cli/).
