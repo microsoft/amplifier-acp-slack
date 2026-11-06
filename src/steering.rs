@@ -224,6 +224,28 @@ pub fn history_only(s: &Store, id: &str) -> Result<()> {
     trace(s, id, "historyOnly")
 }
 pub(crate) fn retire_awareness(s: &Store, active: &str) -> Result<()> {
+    // A claimed job may still be evaluating attention, without an ACP prompt.
+    // New peer evidence in that interval has never reached a model turn. Keep
+    // one fresh candidate for ordinary attention instead of dropping the burst.
+    // An attempted/ambiguous prompt is deliberately ineligible for this path.
+    let tx = s.db.unchecked_transaction()?;
+    let candidate: Option<(String, String, String, i64)> = tx.query_row(
+        "SELECT i.input_id,i.context,i.body,i.created FROM steering_inputs i
+         JOIN jobs j ON j.id=i.target_job JOIN contexts c ON c.id=i.context
+         JOIN messages m ON m.channel=json_extract(i.body,'$.channel') AND m.ts=json_extract(i.body,'$.ts')
+         WHERE i.target_job=?1 AND i.intent='awareness' AND i.state='queued'
+         AND j.status='pass' AND j.version>=c.control_version
+         AND NOT EXISTS(SELECT 1 FROM prompt_attempts p WHERE p.job_id=j.id)
+         AND m.revision=i.revision AND NOT json_extract(m.body,'$.deleted')
+         ORDER BY i.seq DESC LIMIT 1",
+        [active], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+    ).optional()?;
+    if let Some((id, context, body, created)) = candidate {
+        tx.execute("INSERT INTO jobs(id,context,trigger,status,created,updated,note) VALUES(?1,?2,?3,'pending',?4,?5,'Fresh evidence arrived before ACP admission; evaluate attention again')", params![id,context,body,created,now_ms()])?;
+        tx.execute("UPDATE steering_inputs SET intent='input',target_job=NULL,reason='attention_snapshot_changed_before_prompt' WHERE input_id=?1", [&id])?;
+        tx.execute("INSERT INTO audit(time,kind,data) VALUES(?1,'attention_candidate_preserved',?2)", params![now_ms(),json!({"previous_job":active,"candidate_job":id,"context":context,"reason":"new_evidence_before_prompt","prompt_attempted":false}).to_string()])?;
+    }
+    tx.commit()?;
     let ids = s.db.prepare("SELECT input_id FROM steering_inputs WHERE intent='awareness' AND target_job=?1 AND state='queued'")?.query_map([active], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for id in ids {
         history_only(s, &id)?;
