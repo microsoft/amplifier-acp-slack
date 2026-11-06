@@ -2,6 +2,11 @@
 
 The default setup authorizes the connector once using Slack’s CLI login flow:
 a private `/slackauthticket` command, Slack approval, then a confirmation code.
+**Copy & open Slack** copies that command and opens the selected workspace; the
+confirmation field remains on the connector page. If clipboard access or a new
+tab is blocked, the same page offers the command and a direct workspace link.
+Expired saved access goes directly to renewal instead of another failing install.
+The page follows `next_action` rather than treating a stored credential as valid.
 The connector creates a separate Slack app for the agent and privately receives
 its Socket Mode and bot tokens through the CLI’s documented deploy hook. The
 same local authorization manages the app icon; there is no separate image-token
@@ -39,7 +44,7 @@ References: [CLI authorization](https://docs.slack.dev/tools/slack-cli/guides/au
 [deploy hook](https://docs.slack.dev/tools/slack-cli/reference/hooks/#deploy-optional),
 [app distribution](https://docs.slack.dev/app-management/distribution/).
 
-The normal connected page shows the agent, message/file/image readiness, and
+The normal connected page shows the agent and
 **Open in Slack**. Preferences and troubleshooting stay under **Settings**, with
 credentials and connection internals under **Advanced**. Saved views from an
 older version cannot reopen a completed authorization flow.
