@@ -9,7 +9,7 @@ for line in sys.stdin:
   assert p['clientCapabilities']['elicitation']=={'form':{},'url':{}}
   result={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'authMethods':[{'id':'browser','name':'Browser login'}]}
  elif m in ['session/new','session/load'] and not authed:
-  send({'id':i,'error':{'code':-32000}});continue
+  send({'id':i,'error':{'code':-32000,'message':'Authentication required'}});continue
  elif m=='authenticate':
   assert p['methodId']=='browser'
   assert call('login',{'requestId':i,'mode':'url','url':'https://example.test/login?state=private-login-value','elicitationId':'auth','message':'Authorize fixture'})['result']=={'action':'accept'}
