@@ -20,7 +20,9 @@ async def case(mode):
     for n in range(1 if mode in ('attentionRestore','attentionConsumed','attentionContinuation','attentionRace','attentionHold') else 3):await f.send(channel,f'update-{n}',user=f'UHUMAN{n}',thread=thread)
     if mode=='attentionHold':await until(lambda:len(rows(home,"SELECT * FROM steering_inputs WHERE state='held'"))==1,'attention held')
     elif mode=='fallback':await until(lambda:len(rows(home,'SELECT * FROM steering_inputs'))==3,'durable fallback queue')
-    else:await until(lambda:len([e for e in events(work)if e['kind']=='steer'])==(3 if mode in ('supported','attention') else 1),'steering intake')
+    # A failed first stream can settle while later burst messages enter a new
+    # job; their steering must not make us miss the already observed first call.
+    else:await until(lambda:len([e for e in events(work)if e['kind']=='steer'])>=(3 if mode in ('supported','attention') else 1),'steering intake')
     if mode in ('supported','attention'):
      es=[e for e in events(work)if e['kind']=='steer'];assert [e['text']for e in es]==['update-0','update-1','update-2'];assert [e['sender']for e in es]==['UHUMAN0','UHUMAN1','UHUMAN2'];assert all(e['channel']==channel and e['thread']==thread for e in es)
      assert len({e['id']for e in es})==3
