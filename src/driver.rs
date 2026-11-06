@@ -633,13 +633,18 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             let source: Message = serde_json::from_value(input["trigger"].clone())?;
             let mut fresh = input.clone();
             fresh["history"] = json!(store.history(&source)?);
-            if offer["action"] != "engage"
-                || crate::attention::context_for(c, &fresh, &init)? != evidence
-            {
+            let evidence_changed = crate::attention::context_for(c, &fresh, &init)? != evidence;
+            if offer["action"] != "engage" || evidence_changed {
+                store.audit("attention_not_admitted",json!({"context":ctx,"job":input["job_id"],"offer_id":offer["id"],"evidence_changed":evidence_changed,"host_action":offer["action"],"prompt_attempted":false}))?;
                 return Ok(Decision {
                     decision: "pass".into(),
                     text: String::new(),
-                    reason: "No current host attention offer".into(),
+                    reason: if evidence_changed {
+                        "Attention evidence changed before admission"
+                    } else {
+                        "Host attention held this candidate"
+                    }
+                    .into(),
                     media: vec![],
                 });
             }

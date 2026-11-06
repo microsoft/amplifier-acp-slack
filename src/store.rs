@@ -99,6 +99,12 @@ impl Store {
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
+        // Finish the durable pre-admission handoff if a restart occurred after
+        // attention settled but before the newer candidate was retained.
+        let unsettled = self.db.prepare("SELECT DISTINCT j.id FROM jobs j JOIN steering_inputs i ON i.target_job=j.id WHERE j.status='pass' AND i.intent='awareness' AND i.state='queued'")?.query_map([], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in unsettled {
+            crate::steering::retire_awareness(self, &id)?;
+        }
         // A completed ACP result may have reached us just before a crash. Its
         // durable receipt can finish delivery without running the agent again.
         let recovered=self.db.prepare("SELECT j.id,j.context,j.trigger,j.version,t.result FROM jobs j JOIN turn_receipts t ON t.job_id=j.id WHERE j.status='running'")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;

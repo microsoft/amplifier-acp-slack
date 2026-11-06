@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.11.4
+
+- Preserve a fresh attention candidate when peer messages arrive while an earlier participation decision is still running, before any ACP prompt is dispatched. Bursts coalesce and remain subject to ordinary Instance attention.
+- Recover this handoff after a restart without replaying attempted or ambiguous prompts. Edited, deleted, or stopped sources remain ineligible.
+- Distinguish a changed attention snapshot from an actual host hold in private delivery diagnostics.
+
 ## 0.10.2
 
 - Mid-turn updates send only the new source and its conversation/authority information. Full history remains available to attention judgment and context tools instead of being repeated on every message or reaction.
