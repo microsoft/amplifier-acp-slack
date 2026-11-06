@@ -65,7 +65,7 @@ fn producer_present_tense_title_is_not_repeated() {
 }
 
 #[test]
-fn explicit_public_commentary_is_bounded_but_private_thoughts_and_arguments_are_never_status() {
+fn public_speech_and_private_thoughts_never_become_mutable_status() {
     let mut progress = acp_slack_adapter::work_status::PublicProgress::default();
     let mut event = serde_json::json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"private reasoning canary"},"_meta":{"com.microsoft.amplifier.message":{"phase":"commentary"}}});
     assert!(progress.update(&event).is_none());
@@ -74,17 +74,10 @@ fn explicit_public_commentary_is_bounded_but_private_thoughts_and_arguments_are_
     event["sessionUpdate"] = "agent_message_chunk".into();
     event["messageId"] = "public-1".into();
     event["content"]["text"] = "Checking the repository\nfor the reported issue.".into();
-    assert_eq!(
-        progress.update(&event).unwrap(),
-        "Checking the repository for the reported issue."
-    );
     assert!(
         progress.update(&event).is_none(),
-        "rapid chunks are coalesced"
+        "public speech never replaces activity"
     );
-    event["messageId"] = "public-2".into();
-    event["content"]["text"] = serde_json::json!("x".repeat(1000));
-    assert_eq!(progress.update(&event).unwrap().chars().count(), 180);
     event["_meta"]["com.microsoft.amplifier.message"]["phase"] = "final_answer".into();
     assert!(progress.update(&event).is_none());
     assert_eq!(

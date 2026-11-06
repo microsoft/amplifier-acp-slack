@@ -342,60 +342,25 @@ fn single_line(text: &str, limit: usize) -> String {
     }
 }
 
-/// Public assistant commentary only. Never inspect thought chunks or arguments.
+/// Activity remains separate from immutable public contributions.
 #[derive(Default)]
 pub struct PublicProgress {
-    id: String,
-    text: String,
-    last: Option<std::time::Instant>,
+    _activity: (),
 }
 impl PublicProgress {
     pub fn update(&mut self, u: &Value) -> Option<String> {
-        if u["sessionUpdate"] == "compaction_update" {
-            return Some(
-                match u["status"].as_str() {
-                    Some("in_progress") => "Compacting conversation…",
-                    Some("completed") => "Thinking…",
-                    Some("failed" | "cancelled") => "Conversation compaction stopped…",
-                    _ => "Checking conversation context…",
-                }
-                .into(),
-            );
-        }
-        if u["sessionUpdate"] != "agent_message_chunk"
-            || u["_meta"]["com.microsoft.amplifier.message"]["phase"] != "commentary"
-        {
+        if u["sessionUpdate"] != "compaction_update" {
             return None;
         }
-        let text = u["content"]["text"].as_str()?;
-        if text.is_empty() {
-            return None;
-        }
-        let id = u["messageId"].as_str().unwrap_or("");
-        if id.len() > 1024 {
-            return None;
-        }
-        if self.id != id {
-            self.id = id.into();
-            self.text.clear();
-            self.last = None;
-        }
-        if self.text.len() + text.len() > 8192 {
-            return None;
-        }
-        self.text.push_str(text);
-        if self
-            .last
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
-        {
-            return None;
-        }
-        let label = single_line(&self.text, 180);
-        if label.chars().count() < 12 {
-            return None;
-        }
-        self.last = Some(std::time::Instant::now());
-        Some(label)
+        Some(
+            match u["status"].as_str() {
+                Some("in_progress") => "Compacting conversation…",
+                Some("completed") => "Thinking…",
+                Some("failed" | "cancelled") => "Conversation compaction stopped…",
+                _ => "Checking conversation context…",
+            }
+            .into(),
+        )
     }
 }
 

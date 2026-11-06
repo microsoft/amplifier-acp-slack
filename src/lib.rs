@@ -40,3 +40,5 @@ pub mod steering;
 pub mod reactions;
 
 pub mod diagnostics;
+
+pub mod public_speech;

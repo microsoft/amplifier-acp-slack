@@ -96,9 +96,11 @@ impl Store {
         crate::followup::initialize(&store)?;
         crate::handoff::initialize(&store)?;
         crate::steering::initialize(&store)?;
+        crate::public_speech::initialize(&store)?;
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
+        crate::public_speech::recover(self)?;
         // Finish the durable pre-admission handoff if a restart occurred after
         // attention settled but before the newer candidate was retained.
         let unsettled = self.db.prepare("SELECT DISTINCT j.id FROM jobs j JOIN steering_inputs i ON i.target_job=j.id WHERE j.status='pass' AND i.intent='awareness' AND i.state='queued'")?.query_map([], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -630,7 +632,7 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.control_version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 ORDER BY o.created LIMIT 1",[now_ms()],|r| {
+        let candidate:Option<(Outgoing,String,i64,i64,i64)>=tx.query_row("SELECT o.id,o.channel,o.thread,o.text,j.trigger,j.version,c.control_version,o.media,(SELECT COUNT(*) FROM outbox_parts p WHERE p.outbox_id=o.id AND p.status='sent') FROM outbox o JOIN jobs j ON o.job_id=j.id JOIN contexts c ON c.id=o.context WHERE o.status='ready' AND o.available<=?1 AND NOT EXISTS(SELECT 1 FROM public_speech p WHERE p.job_id=o.job_id AND p.status IN ('ready','sending')) ORDER BY o.created LIMIT 1",[now_ms()],|r| {
             let raw:String=r.get(7)?;
             let media=serde_json::from_str(&raw).map_err(|e|rusqlite::Error::FromSqlConversionFailure(7,rusqlite::types::Type::Text,Box::new(e)))?;
             Ok((Outgoing{id:r.get(0)?,channel:r.get(1)?,thread:r.get(2)?,text:r.get(3)?,media},r.get(4)?,r.get(5)?,r.get(6)?,r.get(8)?))
@@ -673,7 +675,11 @@ impl Store {
             tx.query_row("SELECT attempted FROM outbox WHERE id=?1", [&out.id], |r| {
                 r.get(0)
             })?;
-        if attempted == 0 {
+        let budget_job: String =
+            tx.query_row("SELECT job_id FROM outbox WHERE id=?1", [&out.id], |r| {
+                r.get(0)
+            })?;
+        if attempted == 0 && !crate::public_speech::reserved(&tx, &budget_job)? {
             if let Some((why, until)) = delivery_wait(&tx, &trigger, &c.attention, now)? {
                 let available = until.unwrap_or(now + 30_000);
                 let changed = tx.execute(
@@ -696,10 +702,7 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            let last:i64=tx.query_row("SELECT COALESCE(MAX(attempted),0) FROM outbox WHERE context=?1 AND status IN ('sent','sending','uncertain')",[trigger.context()],|r|r.get(0))?;
-            let reset = c.attention.bot_exchange_cooldown_seconds > 0
-                && now - last >= c.attention.bot_exchange_cooldown_seconds as i64 * 1000;
-            tx.execute("UPDATE contexts SET bot_replies=CASE WHEN ?2 THEN 1 ELSE bot_replies+1 END WHERE id=?1",params![trigger.context(),reset])?;
+            reserve_reply(&tx, &trigger, &c.attention, now)?;
         }
         tx.execute(
             "UPDATE outbox SET status='sending',note='',attempted=CASE WHEN attempted=0 THEN ?2 ELSE attempted END WHERE id=?1 AND status='ready'",
@@ -751,6 +754,7 @@ impl Store {
         )
     }
     pub fn echo(&self, id: &str, ts: &str) -> Result<()> {
+        crate::public_speech::echo(self, id, ts)?;
         // A matching Slack echo resolves a lost HTTP reply without sending again.
         self.db.execute("UPDATE outbox SET status='sent',slack_ts=?1,note='Confirmed by Slack event' WHERE id=?2 AND status IN ('sending','uncertain') AND media='[]'",params![ts,id])?;
         Ok(())
@@ -768,6 +772,11 @@ impl Store {
         let counts = outgoing
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+        let speech_counts = self
+            .db
+            .prepare("SELECT status,COUNT(*) FROM public_speech GROUP BY status")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
         let contexts: i64 = self
             .db
             .query_row("SELECT COUNT(*) FROM contexts", [], |r| r.get(0))?;
@@ -780,7 +789,7 @@ impl Store {
             )
             .optional()?;
         Ok(
-            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"steering":crate::steering::status(self)?,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
+            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"public_speech":speech_counts,"steering":crate::steering::status(self)?,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
                 "connection" => serde_json::from_str::<Value>(&data).ok(),
                 "process_started" => Some(json!({"state":"connecting"})),
                 "process_stopped" => Some(json!({"state":"stopped"})),
@@ -800,14 +809,14 @@ fn schedule_reconsider(db: &Connection, m: &Message) -> Result<()> {
 
 // Budgets are checked when reserving delivery, rather than throwing away a
 // completed model turn. Retries never replay its tools or count as a new reply.
-fn delivery_wait(
+pub(crate) fn delivery_wait(
     db: &Connection,
     m: &Message,
     a: &Attention,
     now: i64,
 ) -> Result<Option<(String, Option<i64>)>> {
     let ctx = m.context();
-    let (total,room,last,oldest,room_oldest):(i64,i64,i64,i64,i64)=db.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN context=?1 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN context=?1 THEN attempted ELSE 0 END),0),COALESCE(MIN(attempted),0),COALESCE(MIN(CASE WHEN context=?1 THEN attempted END),0) FROM outbox WHERE attempted>?2 AND status IN ('sent','sending','uncertain')",params![ctx,now-3600000],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let (total,room,last,oldest,room_oldest):(i64,i64,i64,i64,i64)=db.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN context=?1 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN context=?1 THEN attempted ELSE 0 END),0),COALESCE(MIN(attempted),0),COALESCE(MIN(CASE WHEN context=?1 THEN attempted END),0) FROM reply_activity WHERE attempted>?2",params![ctx,now-3600000],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     if total >= a.max_replies_per_agent_per_hour as i64 {
         return Ok(Some((
             "Waiting for agent reply capacity".into(),
@@ -846,4 +855,24 @@ fn delivery_wait(
         )));
     }
     Ok(None)
+}
+
+pub(crate) fn reserve_reply(
+    db: &Connection,
+    trigger: &Message,
+    a: &Attention,
+    now: i64,
+) -> Result<()> {
+    let last: i64 = db.query_row(
+        "SELECT COALESCE(MAX(attempted),0) FROM reply_activity WHERE context=?1",
+        [trigger.context()],
+        |r| r.get(0),
+    )?;
+    let reset = a.bot_exchange_cooldown_seconds > 0
+        && now - last >= a.bot_exchange_cooldown_seconds as i64 * 1000;
+    db.execute(
+        "UPDATE contexts SET bot_replies=CASE WHEN ?2 THEN 1 ELSE bot_replies+1 END WHERE id=?1",
+        params![trigger.context(), reset],
+    )?;
+    Ok(())
 }
