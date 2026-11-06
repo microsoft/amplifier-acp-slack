@@ -30,15 +30,6 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
     let Some((answer, tail)) = output.rsplit_once("\nSLACK_FOLLOW_UP ") else {
         return Ok(output.into());
     };
-    let request: Value = serde_json::from_str(tail.trim()).unwrap_or(Value::Null);
-    let seconds = request["after_seconds"].as_i64().unwrap_or(0);
-    let goal = request["goal"].as_str().unwrap_or("");
-    if !(5..=3600).contains(&seconds) || goal.trim().is_empty() || goal.len() > 2000 {
-        return Ok(notice(
-            answer,
-            "The follow-up request was invalid, so no later turn was scheduled.",
-        ));
-    }
     let id = input["job_id"].as_str().unwrap_or("");
     let mut s = Store::open(home)?;
     initialize(&s)?;
@@ -59,9 +50,25 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
     let trigger: Message = serde_json::from_str(&trigger)?;
     // Bots may collaborate, but cannot manufacture an unbounded autonomous loop.
     if trigger.bot {
+        // This private control is unavailable on peer-origin turns. Record the
+        // refusal for operators without inserting connector prose into speech.
+        tx.execute(
+            "INSERT INTO audit(time,kind,data) VALUES(?1,'continuation_not_scheduled',?2)",
+            params![
+                now_ms(),
+                json!({"job":id,"reason":"bot_origin"}).to_string()
+            ],
+        )?;
+        tx.commit()?;
+        return Ok(answer.into());
+    }
+    let request: Value = serde_json::from_str(tail.trim()).unwrap_or(Value::Null);
+    let seconds = request["after_seconds"].as_i64().unwrap_or(0);
+    let goal = request["goal"].as_str().unwrap_or("");
+    if !(5..=3600).contains(&seconds) || goal.trim().is_empty() || goal.len() > 2000 {
         return Ok(notice(
             answer,
-            "No automatic follow-up was scheduled for this agent-to-agent message.",
+            "The follow-up request was invalid, so no later turn was scheduled.",
         ));
     }
     let prior: Option<(String, i64, i64)> = tx
@@ -101,6 +108,15 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
     tx.execute("INSERT OR IGNORE INTO followups(parent,root,depth,deadline,available,goal,endpoint,source_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c),source_version])?;
     tx.commit()?;
     Ok(answer.into())
+}
+
+/// Offer the control only where the scheduler can honor its source authority.
+/// An absent/unknown source is not a human request.
+pub fn guidance(input: &Value) -> &'static str {
+    if input["trigger"]["bot"] != false {
+        return "";
+    }
+    "For a concrete next step on the same accepted goal, you may append SLACK_FOLLOW_UP {\"after_seconds\":60,\"goal\":\"next bounded step\"} on its own final line. Delay 5–3600 seconds; at most eight continuations in 24 hours per human request. New human input supersedes queued follow-ups: reassess unfinished commitments. Stop on completion, cancellation, a real blocker or budget. Do not schedule turns just to announce delivery, agreement, record closure or continued availability."
 }
 pub fn input(home: &Path, id: &str) -> Result<Option<Value>> {
     let s = Store::open(home)?;

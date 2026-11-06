@@ -51,6 +51,18 @@ reassess outstanding work rather than silently dropping it. No model is assumed
 to obey this convention perfectly; deterministic protocol tests and actual-model
 behavior are separate evidence.
 
+The continuation control is offered only on human-origin turns. If a peer-origin
+response nevertheless includes one (for example from older session instructions),
+the connector strips it and records `continuation_not_scheduled` with reason
+`bot_origin` privately. It does not append a scheduling notice to the agent's
+public contribution or turn a pass into speech. This changes presentation, not
+continuation eligibility, authority or budgets.
+
+Routine delivery verification and work-record closure stay internal. A useful
+result, changed plan, question or actionable blocker belongs in the conversation;
+a successful bookkeeping operation alone does not require a message. These are
+generation instructions, not keyword filters that delete model-written replies.
+
 Completed ACP results are saved before delivery processing. Restart can finish a
 saved response without rerunning its tools. A Slack text send with a lost receipt
 is reconciled against the original client ID, including individually delivered
