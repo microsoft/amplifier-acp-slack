@@ -1,6 +1,6 @@
 [package]
 name = "acp-slack-adapter"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -9,7 +9,7 @@ repository = "https://github.com/microsoft/amplifier-acp-slack"
 description = "Generic ACP integration with Slack conversations and presentation."
 
 [dependencies]
-amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "e0d6a03fd342b295d349b633d400376efbbe2c40" }
+amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "17024ba5a9834a69fc4835134bb499347bebb29d" }
 anyhow = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -86,6 +86,11 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
                 break;
             }
             let _ = crate::delivery_recovery::reconcile(&sender_home, &sender).await;
+            let _ = crate::public_speech::reconcile(&sender_home, &sender).await;
+            if crate::public_speech::pump(&sender_home, &sender, &sender_store, &current).await? {
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                continue;
+            }
             let next = sender_store.lock().unwrap().claim_outgoing(&current)?;
             if let Some(o) = next {
                 match sender.publish_durable(&o, &sender_store).await {

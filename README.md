@@ -270,3 +270,11 @@ ACP chunks reach this adapter as they arrive. Public group output is buffered
 until the final speak/pass decision, so private drafts and pass envelopes do not
 leak into Slack. Work/tool progress can update separate activity cards. Attention
 admission does not itself change this presentation policy.
+
+### Speech and activity
+
+Thinking and tool activity are temporary status indicators. Completed public commentary is a new, permanent Slack message, so people and other agents can reply between contributions. Spoken messages are never edited into later answers. Explicit corrections are new messages.
+
+When an agent negotiates the shared ACP message-completion capability, commentary can be delivered before its turn ends. Without that capability, explicitly identified commentary waits for a successful turn result. Plain ACP and opaque agents still work; a pause in text or an unfinished draft is not assumed to be a message boundary. Private thought chunks are never published. Final-answer selection remains separate from commentary.
+
+A durable per-message delivery record prevents automatic replay after uncertain sends. Confirmed Slack events or history can settle a missing receipt. Commentary and the final answer share the turn’s existing reply allowance. The status API exposes `public_speech` delivery counts, and Activity records bounded delivery receipts without duplicating message contents.

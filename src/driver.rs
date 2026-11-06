@@ -316,6 +316,7 @@ impl Client {
         crate::client_tools::validate_local(c)?;
         let mut caps = crate::client_tools::advertised(c);
         caps["session"]["compaction"] = json!({});
+        amplifier_acp_connection::speech::advertise(&mut caps);
         let r=self.peer.request("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"acp-slack-adapter","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":caps})).await?;
         ensure!(r["protocolVersion"] == 1, "ACP version mismatch");
         self.peer.auth_methods = r["authMethods"].clone();
@@ -717,6 +718,9 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut tool_calls: HashMap<String, Value> = HashMap::new();
     let mut activity = crate::work_status::ToolActivity::default();
     let mut public_progress = crate::work_status::PublicProgress::default();
+    let mut public_speech = amplifier_acp_connection::speech::Commentary::default();
+    let speech_completed = amplifier_acp_connection::speech::supported(&init);
+    let mut public_utterances = 0;
     let mut steering_open = crate::steering::supported(&init);
     let mut pending_steer: Option<PendingSteer> = None;
     let mut terminal: Option<Value> = None;
@@ -969,11 +973,20 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 output = "The agent returned attachment content.".into();
             }
             output = crate::followup::capture(home, c, input, &output)?;
-            let mut d = if ambient {
-                parse_decision(&output)?
-            } else {
-                direct_reply(&output)?
-            };
+            let late_speech = public_speech.terminal(true);
+            let mut d =
+                if output.trim().is_empty() && (public_utterances > 0 || !late_speech.is_empty()) {
+                    Decision {
+                        decision: "pass".into(),
+                        text: String::new(),
+                        reason: "Public contributions completed".into(),
+                        media: vec![],
+                    }
+                } else if ambient {
+                    parse_decision(&output)?
+                } else {
+                    direct_reply(&output)?
+                };
             if d.decision == "speak" {
                 d.media = media;
                 if media_omitted {
@@ -984,11 +997,26 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 }
             }
             d.validate()?;
+            for utterance in late_speech {
+                crate::public_speech::enqueue(
+                    &store,
+                    input["job_id"].as_str().unwrap_or(""),
+                    &utterance,
+                )?;
+            }
             store.audit("acp_turn_finished",json!({"context":ctx,"session_id":sid,"decision":d.decision,"permission_requests":permissions}))?;
             return Ok(d);
         }
         if v["method"] == "session/update" && v["params"]["sessionId"] == sid {
             let u = &v["params"]["update"];
+            if !deciding && let Some(utterance) = public_speech.observe(u, speech_completed)? {
+                public_utterances += 1;
+                crate::public_speech::enqueue(
+                    &store,
+                    input["job_id"].as_str().unwrap_or(""),
+                    &utterance,
+                )?;
+            }
             if !deciding && let Some(label) = public_progress.update(u) {
                 let _ =
                     crate::work_status::phase(home, input["job_id"].as_str().unwrap_or(""), &label);
