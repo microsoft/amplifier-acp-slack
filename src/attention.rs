@@ -80,3 +80,32 @@ pub fn context(c: &Config, input: &Value) -> Result<Value> {
         json!({"conversation_id":input["conversation"]["channel"],"thread_id":input["conversation"]["thread"].as_str().unwrap_or(""),"agent":me,"participants":people.into_values().collect::<Vec<_>>(),"messages":messages,"trigger_id":trigger["ts"],"responsibilities":""}),
     )
 }
+
+pub fn source_delivery_supported(init: &Value) -> bool {
+    init["_meta"]["io.github.bkrabach.agent-instance"]["inputContinuity"]["sourceDelivery"]["version"]
+        == 1
+}
+pub fn context_for(c: &Config, input: &Value, init: &Value) -> Result<Value> {
+    let mut ctx = context(c, input)?;
+    if source_delivery_supported(init) {
+        for m in ctx["messages"].as_array_mut().unwrap() {
+            let source = input["history"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(std::iter::once(&input["trigger"]))
+                .find(|s| s["ts"] == m["id"]);
+            if let Some(source) = source
+                && source["revision"].is_string()
+                && let Some(ts) = source["ts"]
+                    .as_str()
+                    .and_then(|t| t.parse::<f64>().ok())
+                    .filter(|n| n.is_finite() && *n > 0.)
+            {
+                m["revision"] = source["revision"].clone();
+                m["occurred_at"] = json!((ts * 1000.) as i64);
+            }
+        }
+    }
+    Ok(ctx)
+}
