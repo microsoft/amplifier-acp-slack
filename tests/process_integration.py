@@ -491,7 +491,7 @@ async def main():
             for handshake in protocol(homes["alpha"], "initialize"):
                 params = handshake["params"]
                 observing = params.get("_meta", {}).get("com.microsoft.amplifier.identity", {}).get("mode") == "observe"
-                expected = {} if observing else {"elicitation": {"form": {}, "url": {}}}
+                expected = {} if observing else {"elicitation": {"form": {}, "url": {}}, "session": {"compaction": {}}}
                 assert params["clientCapabilities"] == expected, params
             assert count(homes["alpha"], "SELECT COUNT(*) FROM permissions") == 0
             passed("Bot turns without a human approver cancel permission; local tools remain disabled and private output stays private")

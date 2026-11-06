@@ -45,11 +45,14 @@ for line in sys.stdin:
  if method=='initialize':
   meta={} if mode=='fallback' else {'steering':{'supported':True,'idleBehavior':['promptRequired'],'version':1}}
   if peer_mode and mode != 'peerFallback':meta['io.github.bkrabach.agent-instance']={'inputContinuity':{'awareness':{'version':1,'activeOnly':True,'promptIdRequired':True}}}
+  if mode=='peerSupported':meta['io.github.bkrabach.agent-instance']['inputContinuity']['sourceDelivery']={'version':1}
   if (mode in ambient_modes or peer_mode):meta['com.microsoft.amplifier.attention']={'version':1,'enabled':True,'method':'_amplifier/attention'}
   result={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'_meta':meta}
  elif method in ('session/new','session/load'):
   root=Path(p['cwd']);result={'sessionId':'fixture-'+str(root)}
  elif method=='_amplifier/attention':
+  if mode=='peerSupported':
+   assert all(isinstance(m.get('revision'),str) and isinstance(m.get('occurred_at'),int) for m in p['context']['messages'])
   log('attention',{'trigger':p['context']['trigger_id']});result={'action':'engage','id':'offer','ticket':'ticket'}
   if active is not None and mode=='attentionHold':result={'action':'hold','reason':'fixture'}
   if active is not None and mode=='attentionRace':
@@ -67,6 +70,9 @@ for line in sys.stdin:
   assert 'history' not in data and 'orientation' not in data and 'response_delivery' not in data
   assert 'com.microsoft.amplifier.context-snapshot' not in p['prompt'][0].get('_meta',{})
   source=data.get('awareness_input',data['trigger'])
+  if mode=='peerSupported':
+   sources=p['_meta']['com.microsoft.amplifier.source-delivery']['sources'];assert len(sources)==1 and sources[0]=={'id':source['ts'],'revision':source['revision'],'occurredAt':int(float(source['ts'])*1000)}
+  else:assert 'com.microsoft.amplifier.source-delivery' not in p['_meta']
   u={'id':p['_meta']['steering']['inputId'],'text':source['text'],'sender':source['sender'],'channel':source['channel'],'thread':source['thread']}
   if peer_mode:
    assert p['_meta']['steering']['intent']=='awareness' and p['_meta']['steering']['activePromptId']==active['id']

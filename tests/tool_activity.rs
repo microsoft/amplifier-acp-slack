@@ -63,3 +63,36 @@ fn producer_present_tense_title_is_not_repeated() {
     let mut activity = ToolActivity::default();
     assert_eq!(activity.update(&json!({"sessionUpdate":"tool_call","toolCallId":"a","title":"Reading README.md","kind":"read","status":"in_progress"})).unwrap(), "Reading README.md");
 }
+
+#[test]
+fn explicit_public_commentary_is_bounded_but_private_thoughts_and_arguments_are_never_status() {
+    let mut progress = acp_slack_adapter::work_status::PublicProgress::default();
+    let mut event = serde_json::json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"private reasoning canary"},"_meta":{"com.microsoft.amplifier.message":{"phase":"commentary"}}});
+    assert!(progress.update(&event).is_none());
+    event["sessionUpdate"] = "tool_call".into();
+    assert!(progress.update(&event).is_none());
+    event["sessionUpdate"] = "agent_message_chunk".into();
+    event["messageId"] = "public-1".into();
+    event["content"]["text"] = "Checking the repository\nfor the reported issue.".into();
+    assert_eq!(
+        progress.update(&event).unwrap(),
+        "Checking the repository for the reported issue."
+    );
+    assert!(
+        progress.update(&event).is_none(),
+        "rapid chunks are coalesced"
+    );
+    event["messageId"] = "public-2".into();
+    event["content"]["text"] = serde_json::json!("x".repeat(1000));
+    assert_eq!(progress.update(&event).unwrap().chars().count(), 180);
+    event["_meta"]["com.microsoft.amplifier.message"]["phase"] = "final_answer".into();
+    assert!(progress.update(&event).is_none());
+    assert_eq!(
+        progress
+            .update(
+                &serde_json::json!({"sessionUpdate":"compaction_update","status":"in_progress"})
+            )
+            .unwrap(),
+        "Compacting conversation…"
+    );
+}
