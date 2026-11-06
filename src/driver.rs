@@ -15,10 +15,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-};
+use tokio::process::{Child, Command};
 
 pub fn request(c: &Config, m: &Message, history: Vec<Message>) -> Value {
     json!({"conversation":{"surface":"slack","workspace":m.team,"channel":m.channel,"thread":m.thread,"context":m.context()},"your_slack_user_id":c.slack.bot_user_id,
@@ -26,46 +23,24 @@ pub fn request(c: &Config, m: &Message, history: Vec<Message>) -> Value {
 }
 
 struct Peer {
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    next: u64,
-    read_buffer: Vec<u8>,
+    connection: amplifier_acp_connection::Connection,
     auth_methods: Value,
 }
 impl Peer {
-    async fn write(&mut self, v: Value) -> Result<()> {
-        self.input.write_all(format!("{v}\n").as_bytes()).await?;
-        self.input.flush().await?;
-        Ok(())
+    async fn write(&mut self, value: Value) -> Result<()> {
+        self.connection.sender.send(value)
     }
     async fn read(&mut self) -> Result<Value> {
-        loop {
-            let b = self.output.fill_buf().await?;
-            ensure!(!b.is_empty(), "ACP closed stdout");
-            let n = b
-                .iter()
-                .position(|x| *x == b'\n')
-                .map(|n| n + 1)
-                .unwrap_or(b.len());
-            ensure!(
-                self.read_buffer.len() + n <= 4 * 1024 * 1024,
-                "ACP frame too large"
-            );
-            self.read_buffer.extend_from_slice(&b[..n]);
-            self.output.consume(n);
-            if self.read_buffer.last() == Some(&b'\n') {
-                break;
-            }
-        }
-        let v: Value = serde_json::from_slice(&std::mem::take(&mut self.read_buffer))?;
-        ensure!(v["jsonrpc"] == "2.0", "Invalid ACP frame");
-        Ok(v)
+        self.connection
+            .recv()
+            .await?
+            .context("ACP connection closed")
+    }
+    fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+        self.connection.sender.request(method, params)
     }
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.next += 1;
-        let id = self.next;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
+        let id = self.send_request(method, params)?;
         loop {
             let v = self.read().await?;
             if v.get("method").is_none() && v["id"] == id {
@@ -96,10 +71,7 @@ impl Peer {
                 c, home, sid,
             )?));
         }
-        self.next += 1;
-        let id = self.next;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
+        let id = self.send_request(method, params)?;
         let mut callbacks = tokio::task::JoinSet::new();
         let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
         loop {
@@ -325,15 +297,17 @@ impl Client {
         let mut child = cmd.spawn().context("Could not launch ACP client command")?;
         let tree = process::ProcessTree::attach(&child)?;
         let input = child.stdin.take().context("Missing ACP stdin")?;
-        let output = BufReader::new(child.stdout.take().context("Missing ACP stdout")?);
+        let output = child.stdout.take().context("Missing ACP stdout")?;
         Ok(Self {
             child,
             _tree: tree,
             peer: Peer {
-                input,
-                output,
-                next: 0,
-                read_buffer: Vec::new(),
+                connection: amplifier_acp_connection::Connection::client(
+                    output,
+                    input,
+                    4 * 1024 * 1024,
+                )
+                .await?,
                 auth_methods: Value::Null,
             },
         })
@@ -692,8 +666,6 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     );
     // Validate the local client scope before handing any work to the endpoint.
     let tools = tools.context("Missing callback session")?;
-    client.peer.next += 1;
-    let mut id = client.peer.next;
     let mut blocks = vec![json!({"type":"text","text":prompt})];
     blocks.extend(
         crate::media::prompt(
@@ -733,10 +705,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     if let Some(offer) = &attention_offer {
         params["_meta"] = json!({crate::attention::META:offer});
     }
-    client
-        .peer
-        .write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params}))
-        .await?;
+    let mut id = client.peer.send_request("session/prompt", params)?;
     let mut output = String::new();
     let mut media = Vec::new();
     let mut media_omitted = false;
@@ -770,18 +739,16 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                             Ok(v)=>v,
                             Err(_)=>{crate::steering::fail(&store,&update.id,"failed")?;continue;}
                         };
-                        client.peer.next+=1;
-                        let request_id=client.peer.next;
                         if update.awareness { params["_meta"]["steering"]["activePromptId"] = json!(id); }
                         let attention=!update.awareness && crate::attention::supported(&init) && crate::attention::applies(c,&evidence);
-                        if attention {
+                        let request_id = if attention {
                             crate::steering::offering(&store,&update.id,input["job_id"].as_str().unwrap_or(""),&sid)?;
-                            client.peer.write(json!({"jsonrpc":"2.0","id":request_id,"method":crate::attention::METHOD,"params":{"sessionId":sid,"occurredAt":crate::attention::occurred_at(&evidence)?,"context":crate::attention::context_for(c,&evidence,&init)?}})).await?;
+                            client.peer.send_request(crate::attention::METHOD, json!({"sessionId":sid,"occurredAt":crate::attention::occurred_at(&evidence)?,"context":crate::attention::context_for(c,&evidence,&init)?}))?
                         } else {
                             if !crate::steering::submit(&store,&update,input["job_id"].as_str().unwrap_or(""),&sid)? {continue;}
                             params["_meta"]["steering"]["inputId"]=json!(update.id);
-                            client.peer.write(json!({"jsonrpc":"2.0","id":request_id,"method":crate::steering::METHOD,"params":params})).await?;
-                        }
+                            client.peer.send_request(crate::steering::METHOD, params.clone())?
+                        };
                         pending_steer=Some(PendingSteer{request_id,update,params,attention});
                     }
                     continue;
@@ -841,10 +808,11 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                     &pending.update.id,
                     &pending.params["_meta"][crate::attention::META],
                 )?;
-                client.peer.next += 1;
-                pending.request_id = client.peer.next;
+
                 pending.attention = false;
-                client.peer.write(json!({"jsonrpc":"2.0","id":pending.request_id,"method":crate::steering::METHOD,"params":pending.params})).await?;
+                pending.request_id = client
+                    .peer
+                    .send_request(crate::steering::METHOD, pending.params.clone())?;
                 pending_steer = Some(pending);
                 continue;
             }
@@ -970,13 +938,14 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 }
                 deciding = false;
                 crate::work_status::track_input(home, input)?;
-                client.peer.next += 1;
-                id = client.peer.next;
                 output.clear();
                 answer = crate::answer::Answer::default();
                 media.clear();
                 media_omitted = false;
-                client.peer.write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":response_blocks}})).await?;
+                id = client.peer.send_request(
+                    "session/prompt",
+                    json!({"sessionId":sid,"prompt":response_blocks}),
+                )?;
                 continue;
             }
             if !ambient
@@ -986,13 +955,11 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             {
                 retried_direct = true;
                 store.audit("direct_reply_reconsidered",json!({"context":ctx,"session_id":sid,"reason":"The agent retained a group silence decision in a direct conversation"}))?;
-                client.peer.next += 1;
-                id = client.peer.next;
                 output.clear();
                 answer = crate::answer::Answer::default();
                 media.clear();
                 media_omitted = false;
-                client.peer.write(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"This is a direct conversation or explicit address. Provide a brief final reply to the latest user message; do not silently apply a previous group participation rule. Do not repeat any work or tools already performed. If and only if the user explicitly asked for no response, return the explicit_silence_request pass described above."}]}})).await?;
+                id = client.peer.send_request("session/prompt", json!({"sessionId":sid,"prompt":[{"type":"text","text":"This is a direct conversation or explicit address. Provide a brief final reply to the latest user message; do not silently apply a previous group participation rule. Do not repeat any work or tools already performed. If and only if the user explicitly asked for no response, return the explicit_silence_request pass described above."}]}))?;
                 continue;
             }
             if output.trim().is_empty() && !media.is_empty() && !ambient {
@@ -1147,7 +1114,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     }
 }
 struct PendingSteer {
-    request_id: u64,
+    request_id: Value,
     update: crate::steering::Input,
     params: Value,
     attention: bool,
