@@ -88,6 +88,24 @@ async def main(host_attention=False):
    assert 'Reading · Read Dtools notes <!channel> · +1 tool' in labels,labels
    assert all(u.get('thread_ts')=='1800000000.123456' for u in f.indicator_updates if u['channel']=='Dtools')
    passed('Native enum-only thread status is supplemented by one scoped tool-detail line and cleaned up')
+   # A completed bot reply can wait for the configured human gate. It is not
+   # still generating or sending, and releasing the gate must not rerun ACP.
+   updated=await api('GET','config');updated['attention']['max_bot_replies_without_human']=1
+   await api('PUT','config',{'expected_revision':updated['revision'],'config':updated})
+   await until(lambda:'alpha' in f.sockets,'bot-wait configuration connected')
+   await f.send('Cdeliverywait','<@Ualpha> First peer request',user='Upeer',bot_id='Bpeer',thread='')
+   await until(lambda:len([p for p in f.posts if p['channel']=='Cdeliverywait'])==1,'first peer reply')
+   await f.send('Cdeliverywait','<@Ualpha> Second peer request',user='Upeer',bot_id='Bpeer',thread='')
+   await until(lambda:any(u['channel']=='Cdeliverywait' and u['text']=='Waiting for a person to continue…' for u in f.indicator_updates),'truthful delivery wait')
+   assert len([p for p in f.posts if p['channel']=='Cdeliverywait'])==1
+   assert len(rows(home,"SELECT id FROM jobs WHERE status='speak' AND json_extract(trigger,'$.channel')='Cdeliverywait'"))==2
+   updated=await api('GET','config');updated['attention']['max_bot_replies_without_human']=20
+   await api('PUT','config',{'expected_revision':updated['revision'],'config':updated})
+   # The existing durable wait is retried on its normal 30-second schedule.
+   await until(lambda:len([p for p in f.posts if p['channel']=='Cdeliverywait'])==2,'saved peer reply delivered',timeout=40)
+   await until(lambda:all(i.get('deleted') for i in f.indicators if i['channel']=='Cdeliverywait'),'delivery wait cleaned up')
+   assert len(rows(home,"SELECT p.job_id FROM prompt_attempts p JOIN jobs j ON j.id=p.job_id WHERE json_extract(j.trigger,'$.channel')='Cdeliverywait'"))==2
+   passed('A held completed reply shows its wait, then delivers and cleans up without replaying ACP')
    await f.send('Dpermission','Need permission');await state('Dpermission','suspended');n=len(f.statuses);await asyncio.sleep(.6);assert len(f.statuses)==n
    await f.action(f.approvals[-1],0);await state('Dpermission','active');assert transitions('Dpermission')==['processing','suspended','processing','active']
    passed('Human approvals suspend work and resume it only after a real decision')

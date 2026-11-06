@@ -507,6 +507,23 @@ pub fn phase(home: &Path, job: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+// Delivery notes are private diagnostics. Map known states to public labels;
+// never copy raw error text or transport payloads into a status message.
+fn delivery_label(state: &str, note: &str) -> &'static str {
+    if state != "ready" || note.is_empty() {
+        return "Sending the response…";
+    }
+    match note {
+        "Agent exchange paused until a person responds" => "Waiting for a person to continue…",
+        "Agent collaboration pause; resumes automatically"
+        | "Reply spacing; resumes automatically" => "Waiting briefly before replying…",
+        "Waiting for agent reply capacity" | "Waiting for conversation reply capacity" => {
+            "Waiting for reply capacity…"
+        }
+        _ => "Waiting to send the response…",
+    }
+}
+
 /// Fallback for ordinary Slack apps without agent-session status access. Its
 /// post/update/delete calls use existing chat:write access and exact reply scope.
 /// A lost POST receipt is looked up, never blindly repeated.
@@ -543,8 +560,11 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
             |r| r.get::<_, bool>(0),
         )? || crate::questions::waiting_job_ids(home, &Config::load(home)?)?
             .contains(&id);
-        let failure_note: String =
-            s.db.query_row("SELECT note FROM jobs WHERE id=?1", [&id], |r| r.get(0))?;
+        let (failure_note, delivery_note): (String, String) = s.db.query_row(
+            "SELECT j.note,COALESCE(o.note,'') FROM jobs j LEFT JOIN outbox o ON o.job_id=j.id WHERE j.id=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let text = if failed
             && failure_note.starts_with("The agent finished, but its answer could not be read.")
         {
@@ -554,7 +574,7 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
         } else if notice {
             "Sending the status update…"
         } else if job == "speak" {
-            "Sending the response…"
+            delivery_label(&outbox, &delivery_note)
         } else if waiting {
             "Waiting for your answer…"
         } else {
@@ -661,6 +681,29 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delivery_wait_labels_are_distinct_from_sending_and_keep_diagnostics_private() {
+        assert_eq!(
+            delivery_label("ready", "Agent exchange paused until a person responds"),
+            "Waiting for a person to continue…"
+        );
+        assert_eq!(
+            delivery_label("ready", "Waiting for conversation reply capacity"),
+            "Waiting for reply capacity…"
+        );
+        assert_eq!(
+            delivery_label("ready", "Agent collaboration pause; resumes automatically"),
+            "Waiting briefly before replying…"
+        );
+        assert_eq!(
+            delivery_label("ready", "PRIVATE_ERROR_TOKEN_AND_PAYLOAD"),
+            "Waiting to send the response…"
+        );
+        assert_eq!(
+            delivery_label("sending", "Waiting for agent reply capacity"),
+            "Sending the response…"
+        );
+    }
     #[test]
     fn upgraded_database_starts_with_thinking_and_preserves_specific_activity() {
         let dir = tempfile::tempdir().unwrap();
