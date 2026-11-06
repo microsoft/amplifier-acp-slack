@@ -739,17 +739,16 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                             Ok(v)=>v,
                             Err(_)=>{crate::steering::fail(&store,&update.id,"failed")?;continue;}
                         };
-                        let request_id;
                         if update.awareness { params["_meta"]["steering"]["activePromptId"] = json!(id); }
                         let attention=!update.awareness && crate::attention::supported(&init) && crate::attention::applies(c,&evidence);
-                        if attention {
+                        let request_id = if attention {
                             crate::steering::offering(&store,&update.id,input["job_id"].as_str().unwrap_or(""),&sid)?;
-                            request_id = client.peer.send_request(crate::attention::METHOD, json!({"sessionId":sid,"occurredAt":crate::attention::occurred_at(&evidence)?,"context":crate::attention::context_for(c,&evidence,&init)?}))?;
+                            client.peer.send_request(crate::attention::METHOD, json!({"sessionId":sid,"occurredAt":crate::attention::occurred_at(&evidence)?,"context":crate::attention::context_for(c,&evidence,&init)?}))?
                         } else {
                             if !crate::steering::submit(&store,&update,input["job_id"].as_str().unwrap_or(""),&sid)? {continue;}
                             params["_meta"]["steering"]["inputId"]=json!(update.id);
-                            request_id = client.peer.send_request(crate::steering::METHOD, params.clone())?;
-                        }
+                            client.peer.send_request(crate::steering::METHOD, params.clone())?
+                        };
                         pending_steer=Some(PendingSteer{request_id,update,params,attention});
                     }
                     continue;
