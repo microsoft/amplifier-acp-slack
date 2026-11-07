@@ -137,16 +137,20 @@ pub fn advance(s: &AppState, c: Command) -> ApiResult<Value> {
             json!({"error":"connection_configuration_changed"}),
         ));
     }
-    config::private_dir(&s.home.join("updates"))?;
     let path = s.home.join("updates/admission.lock");
     let gate = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Existing host controls may be a read-only container mount. Opening
+            // the same lock inode is sufficient; do not chmod its parent.
+            config::private_dir(&s.home.join("updates"))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)?
+        }
         Err(e) => return Err(e.into()),
     };
     if gate.try_lock_exclusive().is_err() {
@@ -361,6 +365,37 @@ mod tests {
             action: action.into(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn connection_preserves_host_owned_control_directory_and_lock() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (d, s) = fixture();
+        let root = d.path().join("updates");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("admission.lock");
+        std::fs::write(&path, b"host lock").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let host_lock = std::fs::File::open(&path).unwrap();
+        host_lock.lock_exclusive().unwrap();
+        let command = cmd(&s, "disconnect");
+        assert_eq!(advance(&s, command.clone()).unwrap()["state"], "busy");
+        assert!(!gated(d.path()));
+        drop(host_lock);
+        assert_eq!(advance(&s, command).unwrap()["context_quiesced"], true);
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&path).unwrap(), b"host lock");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     #[test]
     fn disconnect_retains_original_session_and_is_idempotent_after_restart() {
