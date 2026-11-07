@@ -26,6 +26,7 @@ jobs:
       - run: cargo build --locked
       - run: python3 -m venv /tmp/adapter-tests && /tmp/adapter-tests/bin/pip install aiohttp
       - run: /tmp/adapter-tests/bin/python tests/process_integration.py
+      - run: /tmp/adapter-tests/bin/python tests/saved_connection_process.py
       - run: /tmp/adapter-tests/bin/python tests/media.py
       - run: /tmp/adapter-tests/bin/python tests/client_capabilities.py
       - run: /tmp/adapter-tests/bin/python tests/questions.py
@@ -38,6 +39,7 @@ jobs:
       - run: python3 tests/slack_setup.py
       - run: python3 tests/management_service.py
       - run: python3 tests/updates.py
+      - run: python3 tests/saved_connection_setup.py
       - uses: actions/setup-node@v4
         if: matrix.os == 'ubuntu-24.04'
         with:
