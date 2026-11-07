@@ -5,7 +5,7 @@ No host path, command, credential or endpoint is accepted from the web form.
 The existing domain installer creates a separate paused Slack connection. Its
 own web setup performs Slack authorization. No model or Slack message is sent.
 """
-import argparse,fcntl,hashlib,json,os,re,subprocess,sys,tempfile,urllib.request,urllib.parse,ssl
+import argparse,fcntl,hashlib,json,os,re,stat,subprocess,sys,tempfile,urllib.request,urllib.parse,ssl
 from pathlib import Path
 
 def read(path):return json.loads(Path(path).read_text())
@@ -25,6 +25,7 @@ def load(path):
     for slot in c['slots']:
         if not re.fullmatch('[a-z][a-z0-9-]{0,40}',slot['id']) or slot['id'] in ids or not isinstance(slot['port'],int) or not 1024<=slot['port']<=65535 or slot['port'] in ports:raise ValueError('invalid_or_duplicate_slot')
         home=Path(c['data_root'])/slot['id'];ids.add(slot['id']);homes.add(str(home));ports.add(slot['port'])
+        credential(slot) # Explicit owner-prepared ACP scope; never inherit local owner credentials.
         url=urllib.parse.urlparse(slot['public_url'])
         if url.scheme!='https' or not url.hostname or url.username or url.password or url.query or url.fragment:raise ValueError('approved_https_setup_route_required')
     c['revision']=hashlib.sha256(data).hexdigest();return c
@@ -33,11 +34,45 @@ def enrollment(c,path):
     script=str(Path(__file__).resolve());args=[sys.executable,script,'--config',str(Path(path).resolve())]
     return {'id':'slack','label':'Slack','add':{'revision':c['revision'],'fields':[{'name':'label','label':'Connection name','kind':'text','required':True,'max_length':120},{'name':'slot','label':'Installation','kind':'choice','required':True,'choices':[{'value':s['id'],'label':s['label']} for s in c['slots']]}]},'add_commands':{a:args+['--action',a] for a in ['add','status']}}
 
-def observed(c,home):
-    configuration=read(home/'adapter.json');endpoints=read(home/'endpoints.json')
+def credential(slot):
+    binding=slot.get('acp_credential',{});p=Path(binding.get('file',''))
+    if not p.is_absolute() or not p.is_file() or p.is_symlink() or stat.S_IMODE(p.stat().st_mode)&0o077:raise ValueError('private_scoped_acp_credential_required')
+    raw=p.read_bytes()
+    if len(raw)>16384 or hashlib.sha256(raw).hexdigest()!=binding.get('sha256'):raise ValueError('prepared_acp_credential_changed')
+    value=json.loads(raw)
+    if set(value.get('scopes',[]))!={'acp','tools:use'} or not isinstance(value.get('token'),str) or not 16<=len(value['token'])<=8192 or any(x.isspace() for x in value['token']):raise ValueError('scoped_acp_credential_required')
+    return value['token']
+
+def local_api(home,path,body=None,method=None):
+    endpoints=read(home/'endpoints.json')
     context=ssl.create_default_context(cafile=endpoints.get('trust_certificate_file',endpoints.get('certificate_file')))
-    request=urllib.request.Request(endpoints['base_url'].rstrip('/')+'/api/v1/status',headers={'Authorization':'Bearer '+(home/'secrets/control-token').read_text().strip()})
-    with urllib.request.urlopen(request,context=context,timeout=3) as response:status=json.loads(response.read(65536))
+    headers={'Authorization':'Bearer '+(home/'secrets/control-token').read_text().strip()}
+    if body is not None:headers['Content-Type']='application/json'
+    request=urllib.request.Request(endpoints['base_url'].rstrip('/')+'/api/v1/'+path,headers=headers,data=None if body is None else json.dumps(body).encode(),method=method)
+    with urllib.request.urlopen(request,context=context,timeout=3) as response:return json.loads(response.read(65536))
+
+def configure_scoped(c,home,api=local_api):
+    slot=next(s for s in c['slots'] if Path(c['data_root'])/s['id']==home)
+    token=credential(slot);path=home/'secrets/agent-acp-token'
+    if path.exists():
+        if path.read_text()!=token:raise ValueError('saved_acp_credential_changed')
+    else:
+        # The exact prepared credential belongs to this unused slot. Lost replies
+        # observe this file and configuration; no token issuance is retried.
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as f:f.write(token);f.flush();os.fsync(f.fileno())
+    configuration=api(home,'config');revision=configuration['revision']
+    old=['acp','--home',c['agent_home']];wanted=old+['--token-file',str(path)]
+    if configuration['enabled'] or configuration['context']['enabled'] or configuration['acp']['command']!=str(Path(c['agent_home'])/'bin/agent-instance') or configuration['acp']['args'] not in [old,wanted]:raise ValueError('prepared_endpoint_changed')
+    if configuration['acp']['args']!=wanted:
+        configuration['acp']['args']=wanted
+        api(home,'config',{'expected_revision':revision,'config':configuration},'PUT')
+    current=api(home,'config')
+    if current['enabled'] or current['acp']['args']!=wanted or current['context']['enabled']:raise ValueError('scoped_configuration_not_confirmed')
+
+def observed(c,home):
+    configure_scoped(c,home)
+    configuration=read(home/'adapter.json');status=local_api(home,'status')
     if status.get('id')!=configuration['id'] or configuration['enabled'] or status['enabled']:raise ValueError('new_connection_must_be_paused')
     binary=home/'bin/acp-slack-adapter'
     result=subprocess.run([str(binary),'--home',str(home),'connection-enrollment'],capture_output=True,timeout=5,check=True)
