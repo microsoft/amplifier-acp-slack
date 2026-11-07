@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Command {
     pub schema: u8,
@@ -202,6 +202,25 @@ pub fn advance(s: &AppState, c: Command) -> ApiResult<Value> {
         return Ok(response);
     }
     let mut cfg = s.instance_config();
+    // A current terminal supervisor failure is distinct from transport silence.
+    // Admission is closed and all delivery above is settled. Return to paused
+    // state before reporting failure, so credentials can be repaired explicitly.
+    let runtime: Value = std::fs::read(s.home.join("runtime.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    if !disconnect
+        && op["phase"] == "observing"
+        && runtime["state"] == "failed"
+        && runtime["config_revision"] == cfg.revision
+        && runtime["updated_at"]
+            .as_i64()
+            .is_some_and(|at| at >= s.started_at)
+    {
+        op["connect_failed"] = json!(true);
+        s.set_record("connection_operations", rid, op.clone())?;
+    }
+    let disconnect = disconnect || op["connect_failed"] == true;
     if cfg.enabled == disconnect {
         // Save intent before config mutation. Config is the durable desired state;
         // on restart a completed config change is observed, never re-issued.
@@ -259,8 +278,10 @@ pub fn advance(s: &AppState, c: Command) -> ApiResult<Value> {
             &state,
             true,
             !disconnect,
-            false,
-            if disconnect {
+            op["connect_failed"] == true,
+            if op["connect_failed"] == true {
+                "Slack could not connect. Saved settings are retained; inspect authorization in Settings before a new Connect."
+            } else if disconnect {
                 "Disconnected. Credentials and conversation history are retained; Slack may still display this app as active."
             } else {
                 "Slack message connection is active."
@@ -431,6 +452,42 @@ mod tests {
         assert!(advance(&s, c).is_err());
         assert!(gated(&s.home));
         assert!(!s.instance_config().enabled);
+    }
+
+    #[test]
+    fn current_supervisor_failure_settles_paused_without_replaying_connect() {
+        let (_d, s) = fixture();
+        let mut cfg = s.instance_config();
+        cfg.enabled = true;
+        cfg.save(&s.home).unwrap();
+        *s.config.write().unwrap() = cfg.clone();
+        let mut c = cmd(&s, "connect");
+        let rid = c.request_id.clone().unwrap();
+        s.set_record(
+            "connection_operations",
+            &rid,
+            json!({"command":c,"phase":"observing","initial_config":cfg}),
+        )
+        .unwrap();
+        config::private_write(
+            &s.home.join("runtime.json"),
+            &serde_json::to_vec(
+                &json!({"state":"failed","config_revision":cfg.revision,"updated_at":s.started_at}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        c.action = "status".into();
+        assert_eq!(advance(&s, c.clone()).unwrap()["settled"], false);
+        let current = s.instance_config();
+        assert!(!current.enabled);
+        config::private_write(&s.home.join("runtime.json"), &serde_json::to_vec(&json!({"state":"stopped","config_revision":current.revision,"updated_at":s.started_at})).unwrap()).unwrap();
+        let r = advance(&s, c.clone()).unwrap();
+        assert_eq!(r["settled"], true);
+        assert_eq!(r["failed"], true);
+        assert_eq!(r["state"], "disconnected");
+        assert!(gated(&s.home));
+        assert_eq!(advance(&s, c).unwrap(), r);
     }
 
     #[test]
