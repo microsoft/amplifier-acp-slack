@@ -251,13 +251,13 @@
       app.config=await api("config");
       if(!app.config.setup_complete)return perform("slack.setup.connect");
       await commands([{type:"set_filter",key:"slack_authorization",value:false},{type:"navigate",route:"dashboard"}],{redraw:false});
-      await refresh();return notice("Connected to Slack.");
+      await refresh();return notice(app.status?.connection_paused?"Slack authorization saved. Use Manage saved connections, then Connect, to start receiving messages.":"Connected to Slack.");
     }
     if(action==="slack.setup.connect"){
       await saveConfig(false);
       try{await api("setup/slack",{method:"POST",body:{action:"connect"}});}
       catch(e){if(e.stale||e.status===401)throw e;await refresh(false);if(app.slackSetup?.authorization==="needs_attention")return perform("slack.setup.authorize");throw e;}
-      app.config=await api("config");await refresh(false);await navigate("dashboard");return notice("Connected. Invite your agent into a Slack conversation.");
+      app.config=await api("config");await refresh(false);await navigate("dashboard");return notice(app.status?.connection_paused?"Slack authorization saved. Use Manage saved connections, then Connect, to start receiving messages.":"Connected. Invite your agent into a Slack conversation.");
     }
     if(action==="setup.connect")return connectSetup(details);
     if(action==="setup.preferences")return commands([{type:"set_filter",key:"setup_preferences",value:state().filters?.setup_preferences!==true}]);

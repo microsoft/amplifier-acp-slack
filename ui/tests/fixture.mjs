@@ -305,6 +305,13 @@ try{
   assert.equal(await page.getByRole('link',{name:'Manage saved connections'}).getAttribute('href'),savedConnections.url);
   assert.equal(await page.getByRole('button',{name:'Start connection',exact:true}).count(),0);
   ok("Saved connection pause is visible and routes to the owning Instance controls");
+  config.enabled=false;config.revision++;
+  await page.evaluate(()=>window.slackConnector.act("slack.setup.authorize"));
+  await page.locator('[data-control="slack.setup.challenge"]').fill("private-challenge");
+  await page.locator('[data-control="slack.setup.confirm"]').click();await waitIdle();
+  assert(!config.enabled);
+  assert((await page.locator('.banner[role="status"]').innerText()).includes("authorization saved"));
+  ok("Guided authorization of a managed saved connection does not claim message delivery started");
   assert.deepEqual(errors,[]);assert(!JSON.stringify(viewBodies).includes("test-password"));assert(!JSON.stringify(viewBodies).includes("one-time-management-secret"));assert(!JSON.stringify(viewBodies).includes("private-agent-value"));ok("No browser errors or secrets in semantic view traffic");
   process.stdout.write(`${passed} browser checks passed. Screenshots: ${artifacts}\n`);
 }finally{await browser.close();await new Promise(r=>server.close(r));}
