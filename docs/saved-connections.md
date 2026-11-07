@@ -37,7 +37,14 @@ agent session. No model prompt is sent by connection control.
 The optional Linux provider `ops/connections/setup.py` uses the existing domain
 installer to create a separate, initially paused connection. The owner preinstalls
 the release binary, installer and PAM policy, and reserves actual reachable HTTPS
-routes and free local ports. This provider does not grant network access or install
+routes and free local ports. Each unused slot also needs its own owner-prepared
+ACP credential receipt with exactly `acp` and `tools:use` scopes. Create it through
+the chosen Instance token API, save its complete response privately (0600), and
+record its SHA256 below. Do not use an owner/control credential or the implicit
+local ACP default. The helper copies this scoped credential into the new paused
+connector and binds its explicit token file before returning a saved connection.
+Other-experience context is not enabled by Add; its audience-bound setup remains
+separate. This provider does not grant network access or install
 system packages. Its control state must be outside connector homes/agent mounts.
 
 Example owner configuration (paths/routes are installation-specific):
@@ -53,7 +60,11 @@ Example owner configuration (paths/routes are installation-specific):
   "slots": [{
     "id": "second-workspace", "label": "Second workspace",
     "bind": "127.0.0.1", "port": 18480,
-    "public_url": "https://approved-route.example"
+    "public_url": "https://approved-route.example",
+    "acp_credential": {
+      "file": "/owner/slack-setup/second-workspace-acp.json",
+      "sha256": "<SHA256 of the private scoped token API response>"
+    }
   }]
 }
 ```
