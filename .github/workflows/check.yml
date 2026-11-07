@@ -38,6 +38,7 @@ jobs:
       - run: python3 tests/slack_setup.py
       - run: python3 tests/management_service.py
       - run: python3 tests/updates.py
+      - run: python3 tests/saved_connection_setup.py
       - uses: actions/setup-node@v4
         if: matrix.os == 'ubuntu-24.04'
         with:

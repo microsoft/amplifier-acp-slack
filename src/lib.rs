@@ -42,3 +42,5 @@ pub mod reactions;
 pub mod diagnostics;
 
 pub mod public_speech;
+
+pub mod connection;

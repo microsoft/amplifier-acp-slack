@@ -278,3 +278,5 @@ Thinking and tool activity are temporary status indicators. Completed public com
 When an agent negotiates the shared ACP message-completion capability, commentary can be delivered before its turn ends. Without that capability, explicitly identified commentary waits for a successful turn result. Plain ACP and opaque agents still work; a pause in text or an unfinished draft is not assumed to be a message boundary. Private thought chunks are never published. Final-answer selection remains separate from commentary.
 
 A durable per-message delivery record prevents automatic replay after uncertain sends. Confirmed Slack events or history can settle a missing receipt. Commentary and the final answer share the turn’s existing reply allowance. The status API exposes `public_speech` delivery counts, and Activity records bounded delivery receipts without duplicating message contents.
+
+[Saved connections](docs/saved-connections.md) documents optional Instance Add/Connect/Disconnect integration and installation-owned setup.

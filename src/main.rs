@@ -41,6 +41,12 @@ enum Action {
         #[arg(long)]
         plan_id: Option<String>,
     },
+    /// Fixed installation-owned connection protocol; bounded JSON from stdin.
+    Connection {
+        action: String,
+    },
+    /// Emit host enrollment for this existing saved Slack installation.
+    ConnectionEnrollment,
     Status,
     Start,
     Stop,
@@ -178,6 +184,39 @@ async fn main() -> Result<()> {
             }
         }
         Action::Serve => acp_slack_adapter::server::serve(home).await?,
+        Action::Connection { action } => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin().take(65537).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 65536, "Connection request too large");
+            let request: acp_slack_adapter::connection::Command = serde_json::from_slice(&bytes)?;
+            ensure!(request.action == action, "Fixed command action mismatch");
+            print(
+                api(
+                    &home,
+                    "POST",
+                    "saved-connection",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+            )?;
+        }
+        Action::ConnectionEnrollment => {
+            let c = Config::load(&home)?;
+            let binary = std::env::current_exe()?;
+            let commands = ["status", "connect", "disconnect"]
+                .into_iter()
+                .map(|action| {
+                    (
+                        action.to_owned(),
+                        json!([binary, "--home", home, "connection", action]),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            print(
+                json!({"id":acp_slack_adapter::connection::id(&c),"service":"slack","label":c.label,"revision":acp_slack_adapter::connection::revision(&c),"context_provider_ids":[format!("slack:{}",c.id)],"settings_url":c.server.public_url,"commands":commands}),
+            )?;
+        }
         Action::Status => print(api(&home, "GET", "status", None).await?)?,
         Action::Start => {
             print(api(&home, "POST", "lifecycle", Some(json!({"action":"start"}))).await?)?

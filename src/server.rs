@@ -71,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config", get(config_get).put(config_put))
         .route("/api/v1/status", get(status))
         .route("/api/v1/lifecycle", post(lifecycle))
+        .route("/api/v1/saved-connection", post(crate::connection::api))
         .route(
             "/api/v1/updates",
             get(crate::updates::get).post(crate::updates::action),
@@ -242,6 +243,15 @@ pub fn replace_config(
             return Err(ApiError::conflict(json!({"revision":old.revision})));
         }
         immutable_identity(state, &old, &config)?;
+        if config.enabled
+            && !old.enabled
+            && crate::connection::gated(&state.home)
+            && actor != "saved-connection"
+        {
+            return Err(ApiError::bad(
+                "This saved connection is paused. Use Connect in the agent's Connections page.",
+            ));
+        }
         if config.enabled && !old.enabled && state.check_gate.available_permits() == 0 {
             return Err(ApiError::bad(
                 "Wait for the connection check to finish before starting",
@@ -289,8 +299,12 @@ pub fn status_value(state: &AppState) -> ApiResult<Value> {
     let runtime = runtime_value(state, &c);
     let observations = Store::open(&state.home)?.status()?;
     let addresses = state.addresses.read().unwrap().clone();
+    let saved_connections: Value = std::fs::read(state.home.join("saved-connections.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
     Ok(
-        json!({"id":c.id,"label":c.label,"version":env!("CARGO_PKG_VERSION"),"enabled":c.enabled,"setup_complete":c.setup_complete,"config_revision":c.revision,"runtime":runtime,"credentials":{"slack":c.secrets(&state.home).is_ok()},"state":observations,"connections":runtime["connections"].as_array().cloned().unwrap_or_default(),"addresses":addresses,"restart_required":addresses.get("effective_server").is_some_and(|s|*s!=json!(c.server)),"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"pending_permissions":Store::open(&state.home)?.db.query_row("SELECT COUNT(*) FROM permissions WHERE status='pending'",[],|r|r.get::<_,i64>(0))?,"uptime_ms":now_ms()-state.started_at}),
+        json!({"saved_connections":saved_connections,"connection_paused":crate::connection::gated(&state.home),"id":c.id,"label":c.label,"version":env!("CARGO_PKG_VERSION"),"enabled":c.enabled,"setup_complete":c.setup_complete,"config_revision":c.revision,"runtime":runtime,"credentials":{"slack":c.secrets(&state.home).is_ok()},"state":observations,"connections":runtime["connections"].as_array().cloned().unwrap_or_default(),"addresses":addresses,"restart_required":addresses.get("effective_server").is_some_and(|s|*s!=json!(c.server)),"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"pending_permissions":Store::open(&state.home)?.db.query_row("SELECT COUNT(*) FROM permissions WHERE status='pending'",[],|r|r.get::<_,i64>(0))?,"uptime_ms":now_ms()-state.started_at}),
     )
 }
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -493,7 +507,7 @@ pub(crate) async fn credentials(
         json!({"connected":true,"identity":identity,"config_revision":c.revision}),
     ))
 }
-fn active_socket_health(state: &AppState, checked: &Config) -> ApiResult<Value> {
+pub(crate) fn active_socket_health(state: &AppState, checked: &Config) -> ApiResult<Value> {
     let current = state.instance_config();
     let runtime = runtime_value(state, &current);
     // Read the same connection audit used by Store::status, together with its
@@ -688,7 +702,12 @@ pub(crate) async fn complete(
     let actor = auth::check(&state, &headers, "admin", true)?.actor;
     let mut c = state.instance_config();
     c.setup_complete = true;
-    c.enabled = true;
+    c.validate_ready()
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    c.secrets(&state.home).map_err(|_| {
+        ApiError::bad("Connect and verify Slack credentials before completing setup")
+    })?;
+    c.enabled = !crate::connection::gated(&state.home);
     Ok(Json(replace_config(&state, c.revision, c, &actor)?))
 }
 async fn activity(

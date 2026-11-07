@@ -9,6 +9,7 @@ import ssl
 import subprocess
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -104,6 +105,18 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
 
         api_schema = api("GET", "/api/v1/openapi.json")[1]
         check(api_schema["paths"]["/api/v1/views/{id}/commands"]["post"]["requestBody"]["required"], "Programmatic UI contract discoverable")
+        entry = cli("connection-enrollment")
+        command = dict(schema=1, connection_id=entry["id"], revision=entry["revision"], action="disconnect", request_id=str(uuid.uuid4()))
+        check(api("POST", "/api/v1/saved-connection", command, issued["token"])[0] == 403, "Observer cannot change a saved connection")
+        def connection_call(command):
+            p = subprocess.run([binary,"--home",str(home),"connection",command["action"]],input=json.dumps(command),capture_output=True,text=True,check=True)
+            return json.loads(p.stdout)
+        check(connection_call(command)["context_quiesced"], "Actual fixed CLI drains before context shutdown")
+        command["action"]="status"
+        terminal=connection_call(command)
+        check(terminal["settled"] and terminal["state"]=="disconnected", "Actual fixed CLI confirms paused state")
+        check((home/"connection-gate.json").exists(), "Disconnect remains paused durably")
+        check((home/"secrets/provider-key").read_text()=="private-service-canary", "Saved credentials retained")
         root_cert = (home / "tls/root-ca.crt").read_bytes()
         port = parsed.port
         process.terminate()
@@ -118,6 +131,12 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
             except (OSError, urllib.error.URLError):
                 assert time.monotonic() < deadline
                 time.sleep(0.05)
+        check(connection_call(command)==terminal, "Original operation reconciles after real service restart")
+        connect=dict(command,action="connect",request_id=str(uuid.uuid4()))
+        check(connection_call(connect)["context_ready"], "Connect exposes context-ready before activation")
+        connect["action"]="status"
+        failure=connection_call(connect)
+        check(failure["settled"] and failure["failed"] and failure["state"]=="disconnected", "Missing authorization is a settled failure, never fake success")
         check((home / "tls/root-ca.crt").read_bytes() == root_cert, "CA stable across restart")
         check(json.loads((home / "endpoints.json").read_text())["base_url"].endswith(f":{port}"), "Port stable across restart")
     finally:

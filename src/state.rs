@@ -14,6 +14,7 @@ use std::{
 use tokio::sync::{Semaphore, watch};
 
 pub struct AppState {
+    pub connection_lock: Mutex<()>,
     pub home: PathBuf,
     pub config: RwLock<Config>,
     pub db: Mutex<Connection>,
@@ -48,6 +49,7 @@ impl AppState {
         db.execute("INSERT OR IGNORE INTO tokens(hash,id,name,scopes,expires_at,created_at) VALUES(?1,'local-control','Local owner control','[\"admin\"]',?2,?3)",params![auth::digest(&control),now_ms()+100_i64*366*86400*1000,now_ms()])?;
         let revision = config.revision;
         Ok(Self {
+            connection_lock: Mutex::new(()),
             home,
             config: RwLock::new(config),
             db: Mutex::new(db),
