@@ -10,6 +10,23 @@ pub fn supported(init: &Value) -> bool {
         && init["_meta"][META]["enabled"] == true
         && init["_meta"][META]["method"] == METHOD
 }
+/// Only the negotiated host attestation for this exact request establishes
+/// non-forwarding. Generic error codes and provider prose establish nothing.
+pub fn not_forwarded(init: &Value, error: &Value, offer: Option<&Value>, session: &str) -> bool {
+    let Some(id) = offer
+        .and_then(|v| v["id"].as_str())
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    let evidence = &error["data"][META];
+    supported(init)
+        && init["_meta"][META]["noForwardRejectionVersion"] == 1
+        && evidence["version"] == 1
+        && evidence["id"] == id
+        && evidence["sessionId"] == session
+        && evidence["outcome"] == "not_forwarded"
+}
 pub fn applies(c: &Config, input: &Value) -> bool {
     c.participation == "ambient"
         && input.get("accepted_work_continuation").is_none()

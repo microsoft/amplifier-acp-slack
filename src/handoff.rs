@@ -94,7 +94,7 @@ pub fn observe(s: &Store, job: &str, u: &Value) -> Result<()> {
     Ok(())
 }
 pub fn attach(s: &Store, job: &Job, endpoint: &str) -> Result<Option<Value>> {
-    let mut q=s.db.prepare("SELECT w.job,w.request,w.inherited,w.plan,j.note FROM work_handoffs w JOIN jobs j ON j.id=w.job JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.context=?1 AND w.endpoint=?2 AND j.status='superseded' AND j.updated>?3 AND (w.child IS NULL OR w.child=?4 OR w.child IN (SELECT id FROM jobs WHERE status IN ('failed','interrupted'))) AND NOT json_extract(m.body,'$.deleted') AND m.revision=json_extract(j.trigger,'$.revision') AND (EXISTS(SELECT 1 FROM observed_tools t WHERE t.job=w.job) OR w.plan!='[]' OR w.inherited!='[]') ORDER BY j.updated DESC LIMIT 4")?;
+    let mut q=s.db.prepare("SELECT w.job,w.request,w.inherited,w.plan,j.note,(SELECT goal FROM followups f WHERE f.parent=j.id AND f.status='cancelled') FROM work_handoffs w JOIN jobs j ON j.id=w.job JOIN messages m ON m.channel=json_extract(j.trigger,'$.channel') AND m.ts=json_extract(j.trigger,'$.ts') WHERE j.context=?1 AND w.endpoint=?2 AND (j.status='superseded' OR (j.status IN ('speak','pass') AND EXISTS(SELECT 1 FROM followups f WHERE f.parent=j.id AND f.status='cancelled' AND f.deadline>0))) AND j.updated>?3 AND (w.child IS NULL OR w.child=?4 OR w.child IN (SELECT id FROM jobs WHERE status IN ('failed','interrupted'))) AND NOT json_extract(m.body,'$.deleted') AND m.revision=json_extract(j.trigger,'$.revision') AND (EXISTS(SELECT 1 FROM observed_tools t WHERE t.job=w.job) OR w.plan!='[]' OR w.inherited!='[]' OR EXISTS(SELECT 1 FROM followups f WHERE f.parent=j.id AND f.status='cancelled')) ORDER BY j.updated DESC LIMIT 4")?;
     let rows = q
         .query_map(
             params![job.context, endpoint, now_ms() - 86400000, job.id],
@@ -105,12 +105,13 @@ pub fn attach(s: &Store, job: &Job, endpoint: &str) -> Result<Option<Value>> {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut handoffs = Vec::new();
-    for (parent, request, inherited, plan, reason) in rows {
+    for (parent, request, inherited, plan, reason, pending_check) in rows {
         let mut q =
             s.db.prepare("SELECT body FROM observed_tools WHERE job=?1 ORDER BY rowid")?;
         let tools = q
@@ -130,13 +131,13 @@ pub fn attach(s: &Store, job: &Job, endpoint: &str) -> Result<Option<Value>> {
                 handoffs.push(request);
             }
         }
-        handoffs.push(json!({"predecessor_job":parent,"request":serde_json::from_str::<Value>(&request)?,"plan":serde_json::from_str::<Value>(&plan)?,"observed_tools":tools,"withheld_reason":reason}));
+        handoffs.push(json!({"predecessor_job":parent,"request":serde_json::from_str::<Value>(&request)?,"plan":serde_json::from_str::<Value>(&plan)?,"observed_tools":tools,"withheld_reason":reason,"pending_check":pending_check}));
     }
     handoffs.truncate(6);
     if handoffs.is_empty() {
         return Ok(None);
     }
     Ok(Some(
-        json!({"earlier_requests":handoffs,"instruction":"Re-evaluate these prior requests against the newest message and current permissions. A question about status or capability does not by itself cancel unfinished work. Answer the new question and continue still-authorized steps in this turn, or request a bounded follow-up. Honor stop/change instructions, source edits, scope and policy changes. Do not rerun completed effects; inspect their receipts/results in this session or verify existing artifacts. Tool lifecycle observations are not independent proof of external success. Explain any real blocker accurately; a cancelled old turn does not establish a GitHub authorization failure."}),
+        json!({"earlier_requests":handoffs,"instruction":"Re-evaluate these prior requests against the newest message and current permissions. A question about status or capability does not by itself cancel unfinished work. A pending_check is a prior commitment whose scheduled wake was superseded, not proof of completion or new authority. Inspect its existing result and report a failure as well as success. Answer the new question and continue still-authorized steps in this turn, or request a bounded follow-up. Honor stop/change instructions, source edits, scope and policy changes. Do not rerun completed effects; inspect their receipts/results in this session or verify existing artifacts. Tool lifecycle observations are not independent proof of external success. Explain any real blocker accurately; a cancelled old turn does not establish a GitHub authorization failure."}),
     ))
 }

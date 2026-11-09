@@ -41,6 +41,8 @@ struct Grant {
     thread: String,
     actor: String,
     actor_bot: bool,
+    #[serde(default)]
+    job_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +148,7 @@ fn grant_from_input(c: &Config, input: &Value) -> Result<Grant> {
         thread: thread.into(),
         actor: actor.into(),
         actor_bot,
+        job_id: input["job_id"].as_str().map(str::to_owned),
     })
 }
 
@@ -1062,6 +1065,14 @@ pub async fn mcp(
         "ping" => Ok(rpc(id, json!({}))),
         "tools/list" => {
             let mut result = mcp_tools();
+            if grant.job_id.is_some() && !grant.actor_bot {
+                result["tools"].as_array_mut().unwrap().push(json!({
+                    "name":"slack_follow_up",
+                    "description":"Schedule this response's next check of unfinished accepted work, or cancel its scheduled check. Use before ending while a background run is pending; inspect the same run and report success or failure, never start it again. One durable follow-up, using the existing conversation and authority. No public progress message is required. A successful receipt remains pending until this turn ends normally. Set after_seconds to 0 to cancel.",
+                    "inputSchema":{"type":"object","properties":{"after_seconds":{"type":"integer","minimum":0,"maximum":3600},"goal":{"type":"string","maxLength":2000}},"required":["after_seconds"],"additionalProperties":false},
+                    "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+                }));
+            }
             if authority.owner && authority.origin.as_ref().is_some_and(|c| c.direct) {
                 for (name, description) in [
                     (
@@ -1102,6 +1113,31 @@ pub async fn mcp(
             Ok(rpc(id, result))
         }
         "tools/call" => {
+            if body["params"]["name"] == "slack_follow_up" {
+                let Some(job) = grant.job_id.as_deref().filter(|_| !grant.actor_bot) else {
+                    return Err(ApiError::forbidden());
+                };
+                let args = &body["params"]["arguments"];
+                if args.as_object().is_none_or(|o| {
+                    o.keys()
+                        .any(|k| !["after_seconds", "goal"].contains(&k.as_str()))
+                }) || args["after_seconds"].as_i64().is_none()
+                    || args.get("goal").is_some_and(|g| !g.is_string())
+                {
+                    return Ok(rpc_error(id, -32602, "Invalid follow-up arguments"));
+                }
+                let value = crate::followup::schedule(
+                    &state.home,
+                    &config,
+                    job,
+                    args["after_seconds"].as_i64().unwrap(),
+                    args["goal"].as_str().unwrap_or(""),
+                )?;
+                return Ok(rpc(
+                    id,
+                    json!({"content":[{"type":"text","text":value.to_string()}],"isError":value["scheduled"]!=true && value["cancelled"]!=true,"structuredContent":value}),
+                ));
+            }
             if let Some(name) = body["params"]["name"]
                 .as_str()
                 .filter(|n| n.starts_with("slack_reactions_"))

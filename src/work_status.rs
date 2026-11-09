@@ -525,17 +525,13 @@ pub async fn fallback_reconcile(home: &Path, slack: &Slack, stopping: bool) -> R
             |r| r.get::<_, bool>(0),
         )? || crate::questions::waiting_job_ids(home, &Config::load(home)?)?
             .contains(&id);
-        let (failure_note, delivery_note): (String, String) = s.db.query_row(
-            "SELECT j.note,COALESCE(o.note,'') FROM jobs j LEFT JOIN outbox o ON o.job_id=j.id WHERE j.id=?1",
+        let delivery_note: String = s.db.query_row(
+            "SELECT COALESCE(o.note,'') FROM jobs j LEFT JOIN outbox o ON o.job_id=j.id WHERE j.id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
-        let text = if failed
-            && failure_note.starts_with("The agent finished, but its answer could not be read.")
-        {
-            failure_note.as_str()
-        } else if failed {
-            "I couldn’t confirm this request finished. Some work or a reply may already exist; I’ll need to check that before repeating it."
+        let text = if failed {
+            crate::diagnostics::recorded_summary(&s,&id)?.unwrap_or("I couldn’t confirm this request finished. Some work or a reply may already exist; I’ll need to check that before repeating it.")
         } else if notice {
             "Sending the status update…"
         } else if job == "speak" {
