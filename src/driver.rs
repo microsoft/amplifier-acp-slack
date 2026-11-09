@@ -647,12 +647,6 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     if prior_delivery.is_array() {
         diagnostic_input["prior_source_delivery"] = prior_delivery;
     }
-    crate::handoff::start(
-        &store,
-        input["job_id"].as_str().unwrap_or(""),
-        &endpoint,
-        input,
-    )?;
     let input = &diagnostic_input;
     let ambient = host_attention || optional_participation(c, input);
     let instruction = if ambient {
@@ -702,6 +696,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     // Track only committed response work. This covers direct replies, accepted
     // continuations, and current host engage offers; quiet evaluation stays hidden.
     if !deciding {
+        crate::handoff::start(
+            &store,
+            input["job_id"].as_str().unwrap_or(""),
+            &endpoint,
+            input,
+        )?;
         crate::work_status::track_input(home, input)?;
     }
     let mut params = json!({"sessionId":sid,"prompt":blocks});
@@ -982,6 +982,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                     });
                 }
                 deciding = false;
+                crate::handoff::start(
+                    &store,
+                    input["job_id"].as_str().unwrap_or(""),
+                    &endpoint,
+                    input,
+                )?;
                 crate::work_status::track_input(home, input)?;
                 output.clear();
                 answer = crate::answer::Answer::default();
@@ -1015,19 +1021,30 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             }
             output = crate::followup::capture(home, c, input, &output)?;
             let late_speech = public_speech.terminal(true);
-            let mut d =
-                if output.trim().is_empty() && (public_utterances > 0 || !late_speech.is_empty()) {
-                    Decision {
-                        decision: "pass".into(),
-                        text: String::new(),
-                        reason: "Public contributions completed".into(),
-                        media: vec![],
+            let scheduled_check: bool = store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM followups WHERE parent=?1 AND status='proposed')",
+                [input["job_id"].as_str().unwrap_or("")],
+                |r| r.get(0),
+            )?;
+            let mut d = if output.trim().is_empty()
+                && (public_utterances > 0 || !late_speech.is_empty() || scheduled_check)
+            {
+                Decision {
+                    decision: "pass".into(),
+                    text: String::new(),
+                    reason: if scheduled_check {
+                        "Result check scheduled"
+                    } else {
+                        "Public contributions completed"
                     }
-                } else if ambient {
-                    parse_decision(&output)?
-                } else {
-                    direct_reply(&output)?
-                };
+                    .into(),
+                    media: vec![],
+                }
+            } else if ambient {
+                parse_decision(&output)?
+            } else {
+                direct_reply(&output)?
+            };
             if d.decision == "speak" {
                 d.media = media;
                 if media_omitted {

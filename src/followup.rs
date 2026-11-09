@@ -34,13 +34,15 @@ pub fn schedule(home: &Path, c: &Config, id: &str, seconds: i64, goal: &str) -> 
         s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let trigger: Option<String> = tx
         .query_row(
-            "SELECT trigger FROM jobs WHERE id=?1 AND status='running'",
+            "SELECT trigger FROM jobs WHERE id=?1 AND status='running' AND EXISTS(SELECT 1 FROM work_handoffs WHERE job=?1)",
             [id],
             |r| r.get(0),
         )
         .optional()?;
     let Some(trigger) = trigger else {
-        return Ok(json!({"scheduled":false,"reason":"This response is no longer active."}));
+        return Ok(
+            json!({"scheduled":false,"reason":"No accepted response is active for this follow-up."}),
+        );
     };
     let trigger: Message = serde_json::from_str(&trigger)?;
     if trigger.bot {

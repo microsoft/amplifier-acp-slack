@@ -37,6 +37,8 @@ fn fixture() -> (
         })
         .unwrap()
         .unwrap();
+    acp_slack_adapter::handoff::start(&s, &j.id, "fixture-endpoint", &json!({"trigger":m}))
+        .unwrap();
     (dir, c, s, j)
 }
 fn propose(dir: &std::path::Path, c: &Config, s: &mut Store, j: &acp_slack_adapter::store::Job) {

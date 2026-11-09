@@ -733,6 +733,9 @@ async fn followup_tool_ack_is_durable_scoped_and_cannot_outlive_its_turn() {
     );
     let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slack_follow_up","arguments":{"after_seconds":5,"goal":"Inspect existing run and report its failure; do not relaunch."}}});
     let (_, first) = f.call("/context/mcp", Some(&grant), request.clone()).await;
+    assert_eq!(first["result"]["isError"], true); // setup/quiet evaluation is not accepted work
+    acp_slack_adapter::handoff::start(&store, &job.id, "fixture-endpoint", &input).unwrap();
+    let (_, first) = f.call("/context/mcp", Some(&grant), request.clone()).await;
     assert_eq!(first["result"]["isError"], false);
     let (_, retry) = f.call("/context/mcp", Some(&grant), request.clone()).await;
     assert_eq!(first, retry); // lost acknowledgement does not move the wake time

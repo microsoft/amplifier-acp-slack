@@ -41,7 +41,7 @@ for line in sys.stdin:
                 args={'name':'slack_follow_up','arguments':{'after_seconds':5,'goal':'Read background-result and report failure or success; never relaunch.'}}
                 first=rpc('tools/call',args);assert first['structuredContent']['scheduled']
                 assert rpc('tools/call',args)==first # repeated call after a lost receipt
-                speak('{"decision":"pass","reason":"explicit_silence_request"}')
+                # The successful schedule is the only output; no public filler or pass envelope.
                 result={'stopReason':'end_turn'}
             elif channel=='Dlimit':
                 update(sessionUpdate='tool_call',toolCallId='single-effect',kind='execute',title='Write artifact',status='completed')
