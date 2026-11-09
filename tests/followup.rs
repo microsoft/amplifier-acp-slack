@@ -37,6 +37,8 @@ fn fixture() -> (
         })
         .unwrap()
         .unwrap();
+    acp_slack_adapter::handoff::start(&s, &j.id, "fixture-endpoint", &json!({"trigger":m}))
+        .unwrap();
     (dir, c, s, j)
 }
 fn propose(dir: &std::path::Path, c: &Config, s: &mut Store, j: &acp_slack_adapter::store::Job) {
@@ -63,16 +65,12 @@ fn propose(dir: &std::path::Path, c: &Config, s: &mut Store, j: &acp_slack_adapt
         .unwrap();
 }
 #[test]
-fn wake_survives_restart_but_waits_for_delivery_and_never_duplicates() {
+fn wake_survives_restart_without_waiting_for_public_delivery_and_never_duplicates() {
     let (dir, c, mut s, j) = fixture();
     propose(dir.path(), &c, &mut s, &j);
-    followup::pump(dir.path(), &c).unwrap();
-    assert_eq!(
-        s.db.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    s.db.execute("UPDATE outbox SET status='sent',slack_ts='2.001'", [])
+    // A pending or unknown public send is a separate delivery concern. The
+    // continuation receives its actual receipt and must not blindly resend it.
+    s.db.execute("UPDATE outbox SET status='uncertain'", [])
         .unwrap();
     drop(s);
     followup::pump(dir.path(), &c).unwrap();
@@ -300,4 +298,73 @@ fn queued_or_unknown_input_prevents_automatic_continuation() {
             0
         );
     }
+}
+
+#[test]
+fn quiet_background_result_check_does_not_require_a_public_progress_message() {
+    let (dir, c, mut s, j) = fixture();
+    let output = followup::capture(dir.path(), &c, &json!({"job_id":j.id}),
+        "{\"decision\":\"pass\",\"reason\":\"The existing process is still running\"}\nSLACK_FOLLOW_UP {\"after_seconds\":5,\"goal\":\"Inspect the existing run and report its result, including failure. Do not start it again.\"}").unwrap();
+    s.finish(
+        &j,
+        Ok(serde_json::from_str(&output).unwrap()),
+        &Attention::default(),
+    )
+    .unwrap();
+    s.db.execute("UPDATE followups SET available=0", [])
+        .unwrap();
+    drop(s);
+    followup::pump(dir.path(), &c).unwrap();
+    let s = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        s.db.query_row(
+            "SELECT count(*) FROM jobs WHERE status='pending'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.db.query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn new_status_question_keeps_existing_result_check_in_the_work_handoff() {
+    use acp_slack_adapter::{driver, handoff};
+    let (dir, c, mut s, j) = fixture();
+    let mut input = driver::request(&c, &j.trigger, s.history(&j.trigger).unwrap());
+    input["job_id"] = json!(j.id);
+    let endpoint = "fixture-endpoint";
+    handoff::start(&s, &j.id, endpoint, &input).unwrap();
+    propose(dir.path(), &c, &mut s, &j);
+    let mut m = j.trigger.clone();
+    m.ts = "3.001".into();
+    m.revision = m.ts.clone();
+    m.text = "Any result yet?".into();
+    s.ingest("status-question", &m, true).unwrap();
+    let next = s
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    let pending = handoff::attach(&s, &next, endpoint).unwrap().unwrap();
+    assert_eq!(
+        pending["earlier_requests"][0]["pending_check"],
+        "Verify the existing artifact"
+    );
+    assert!(followup::input(dir.path(), &next.id).unwrap().is_none());
+    handoff::start(
+        &s,
+        &next.id,
+        endpoint,
+        &json!({"trigger":m,"work_handoff":pending}),
+    )
+    .unwrap();
+    assert!(handoff::attach(&s, &next, endpoint).unwrap().is_some()); // same-job recovery
 }

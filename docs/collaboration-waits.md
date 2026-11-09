@@ -29,15 +29,28 @@ channel scope, or secret is changed by this preference.
 
 ## Continuing accepted work
 
-A response can end with one private control line:
+When work continues in a background process, the agent should schedule a check
+before ending its response. `slack_follow_up` exposes the existing continuation
+through the conversation's MCP server and returns a durable receipt. It takes
+`after_seconds` and `goal`; zero seconds cancels this turn's proposal. Calls are
+bound to the active response's grant, cannot target another job or conversation,
+and an identical retry preserves the original wake time. A promise to return is
+not a schedule. The next turn inspects the existing run and reports a meaningful
+result or failure, rather than launching the work again.
+
+Plain ACP endpoints without these tools can use the existing private final line:
 
 ```text
 SLACK_FOLLOW_UP {"after_seconds":60,"goal":"Verify the already-created artifact"}
 ```
 
 This is a prompt convention over ordinary ACP; there is no proprietary ACP method
-or required shared scheduler. The connector strips the line, records one durable
-continuation, and queues it only after the preceding reply is confirmed delivered.
+or required shared scheduler. Both entry points record the same single durable
+continuation. The connector strips the compatibility line and queues the check
+after a confirmed response terminal, including a quiet pass. Public delivery is
+independent: pending or uncertain sends remain accurately represented in the
+next turn's delivery receipts and must not be blindly resent. A failed or crashed
+turn does not activate its proposal.
 The original human, conversation, thread, endpoint, and session binding are kept.
 A fresh source-message and Slack membership check runs before the continuation.
 Reading another room does not grant a return route there.
@@ -47,7 +60,9 @@ with the installation's existing model/reply budgets also enforced. These turns
 are for concrete progress on an accepted goal, not keep-alive chatter. Bot-origin
 messages cannot schedule this chain. New human input, source changes, scope or
 endpoint changes, and expiry supersede/cancel queued work. A new human turn must
-reassess outstanding work rather than silently dropping it. No model is assumed
+reassess outstanding work rather than silently dropping it: the existing compact
+work handoff retains a superseded result-check goal for that reassessment. An
+explicitly withdrawn follow-up is not carried forward. No model is assumed
 to obey this convention perfectly; deterministic protocol tests and actual-model
 behavior are separate evidence.
 
@@ -71,3 +86,16 @@ Unconfirmed media completion or a crashed prompt without a completed result stay
 explicitly unresolved; neither is blindly rerun. The source conversation receives
 a failure/uncertainty notice where Slack still permits writes. This does not claim
 exactly-once external tool execution across arbitrary backend failures.
+
+`max_turn_requests` and `max_tokens` are known prompt terminals, not transport
+failures. For accepted human work, the existing continuation can inspect completed
+results and continue, within the same limits above. This requires complete terminal
+tool observations and no unresolved client operation or incoming steering. Partial
+answer text is not published as a result. Cancellation, refusal, incomplete tool
+observations and unknown outcomes never automatically repeat work.
+
+A host advertising attention `noForwardRejectionVersion: 1` can attest that a
+particular offer was not forwarded. Only an exact offer/session match in the
+reserved error data changes the public explanation to “not forwarded”; it does
+not authorize retrying the offer or mark the source fulfilled. Unmarked errors,
+including the same numeric code, retain the uncertain-outcome treatment.

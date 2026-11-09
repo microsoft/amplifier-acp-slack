@@ -687,6 +687,102 @@ async fn mcp_requires_grant_and_exposes_scoped_tools_with_current_permissions() 
 }
 
 #[tokio::test]
+async fn followup_tool_ack_is_durable_scoped_and_cannot_outlive_its_turn() {
+    use acp_slack_adapter::{
+        config::Attention,
+        model::{Decision, Message},
+    };
+    let f = Fixture::new().await;
+    let mut store = Store::open(f.home.path()).unwrap();
+    let m = Message {
+        team: "TTEST".into(),
+        channel: "CSHARED".into(),
+        thread: "".into(),
+        ts: "1000.000001".into(),
+        revision: "1000.000001".into(),
+        sender: "UPEER".into(),
+        bot: false,
+        text: "Check this run".into(),
+        deleted: false,
+        files: vec![],
+    };
+    store.ingest("source", &m, true).unwrap();
+    let job = store
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    let mut input = Fixture::input("CSHARED", "", "UPEER", false);
+    input["job_id"] = json!(job.id);
+    let grant = context::issue_grant(&f.state.instance_config(), f.home.path(), &input).unwrap();
+    let (_, list) = f
+        .call(
+            "/context/mcp",
+            Some(&grant),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+    assert!(
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "slack_follow_up")
+    );
+    let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slack_follow_up","arguments":{"after_seconds":5,"goal":"Inspect existing run and report its failure; do not relaunch."}}});
+    let (_, first) = f.call("/context/mcp", Some(&grant), request.clone()).await;
+    assert_eq!(first["result"]["isError"], true); // setup/quiet evaluation is not accepted work
+    acp_slack_adapter::handoff::start(&store, &job.id, "fixture-endpoint", &input).unwrap();
+    let (_, first) = f.call("/context/mcp", Some(&grant), request.clone()).await;
+    assert_eq!(first["result"]["isError"], false);
+    let (_, retry) = f.call("/context/mcp", Some(&grant), request.clone()).await;
+    assert_eq!(first, retry); // lost acknowledgement does not move the wake time
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT count(*) FROM followups", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let mut forged = request.clone();
+    forged["params"]["arguments"]["job_id"] = json!("another-conversation");
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), forged).await.1["error"]["code"],
+        -32602
+    );
+    let mut cancel = request.clone();
+    cancel["params"]["arguments"] = json!({"after_seconds":0});
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), cancel).await.1["result"]["structuredContent"]["cancelled"],
+        true
+    );
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), request.clone())
+            .await
+            .1["result"]["isError"],
+        false
+    );
+    store
+        .finish(
+            &job,
+            Ok(Decision {
+                decision: "pass".into(),
+                text: String::new(),
+                reason: "Existing run pending".into(),
+                media: vec![],
+            }),
+            &Attention::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), request).await.1["result"]["isError"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn search_preserves_pagination_and_unchanged_source_messages() {
     let f = Fixture::new().await;
     f.fake.lock().unwrap().history.insert(

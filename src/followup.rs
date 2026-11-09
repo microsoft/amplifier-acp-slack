@@ -24,34 +24,28 @@ pub fn initialize(s: &Store) -> Result<()> {
     }
     Ok(())
 }
-/// A final response can request one later turn. Capture it before finishing the
-/// job; a proposal is not eligible until that response was durably delivered.
-pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<String> {
-    let Some((answer, tail)) = output.rsplit_once("\nSLACK_FOLLOW_UP ") else {
-        return Ok(output.into());
-    };
-    let id = input["job_id"].as_str().unwrap_or("");
+/// Both the MCP tool and the legacy footer use this one durable continuation.
+/// It cannot start until the current turn has a confirmed terminal. Scheduling
+/// is independent of whether that turn has anything useful to publish.
+pub fn schedule(home: &Path, c: &Config, id: &str, seconds: i64, goal: &str) -> Result<Value> {
     let mut s = Store::open(home)?;
     initialize(&s)?;
-    // Serialize the source watermark and eligibility decision with Slack intake.
-    // A message committed afterward must invalidate this proposed continuation.
     let tx =
         s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let trigger: Option<String> = tx
         .query_row(
-            "SELECT trigger FROM jobs WHERE id=?1 AND status='running'",
+            "SELECT trigger FROM jobs WHERE id=?1 AND status='running' AND EXISTS(SELECT 1 FROM work_handoffs WHERE job=?1)",
             [id],
             |r| r.get(0),
         )
         .optional()?;
     let Some(trigger) = trigger else {
-        return Ok(answer.into());
+        return Ok(
+            json!({"scheduled":false,"reason":"No accepted response is active for this follow-up."}),
+        );
     };
     let trigger: Message = serde_json::from_str(&trigger)?;
-    // Bots may collaborate, but cannot manufacture an unbounded autonomous loop.
     if trigger.bot {
-        // This private control is unavailable on peer-origin turns. Record the
-        // refusal for operators without inserting connector prose into speech.
         tx.execute(
             "INSERT INTO audit(time,kind,data) VALUES(?1,'continuation_not_scheduled',?2)",
             params![
@@ -60,16 +54,20 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
             ],
         )?;
         tx.commit()?;
-        return Ok(answer.into());
+        return Ok(json!({"scheduled":false,"reason":"bot_origin"}));
     }
-    let request: Value = serde_json::from_str(tail.trim()).unwrap_or(Value::Null);
-    let seconds = request["after_seconds"].as_i64().unwrap_or(0);
-    let goal = request["goal"].as_str().unwrap_or("");
+    if seconds == 0 {
+        tx.execute(
+            "UPDATE followups SET status='withdrawn' WHERE parent=?1 AND status='proposed'",
+            [id],
+        )?;
+        tx.commit()?;
+        return Ok(json!({"scheduled":false,"cancelled":true}));
+    }
     if !(5..=3600).contains(&seconds) || goal.trim().is_empty() || goal.len() > 2000 {
-        return Ok(notice(
-            answer,
-            "The follow-up request was invalid, so no later turn was scheduled.",
-        ));
+        return Ok(
+            json!({"scheduled":false,"reason":"The follow-up request was invalid, so no later turn was scheduled."}),
+        );
     }
     let prior: Option<(String, i64, i64)> = tx
         .query_row(
@@ -88,26 +86,59 @@ pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<S
             ],
         )?;
         tx.commit()?;
-        return Ok(notice(
-            answer,
-            "The automatic continuation budget is exhausted. Further work needs a new request.",
-        ));
+        return Ok(
+            json!({"scheduled":false,"reason":"The automatic continuation budget is exhausted. Further work needs a new request."}),
+        );
     }
-    let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.context=?1 AND j.status='pending' AND NOT json_extract(j.trigger,'$.bot')) OR EXISTS(SELECT 1 FROM steering_inputs WHERE target_job=?2 AND state IN ('offering','submitted','unknown','notAccepted','failed','startedNewTurn','held'))",params![trigger.context(),id],|r|r.get(0))?;
+    let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.context=?1 AND j.status='pending' AND NOT json_extract(j.trigger,'$.bot')) OR EXISTS(SELECT 1 FROM steering_inputs WHERE target_job=?2 AND state IN ('offering','submitted','received','remoteQueued','unknown','notAccepted','failed','startedNewTurn','held'))",params![trigger.context(),id],|r|r.get(0))?;
     if unsettled {
-        return Ok(notice(
-            answer,
-            "No automatic follow-up was scheduled while newer input is waiting or its delivery is unresolved.",
-        ));
+        return Ok(
+            json!({"scheduled":false,"reason":"No automatic follow-up was scheduled while newer input is waiting or its delivery is unresolved."}),
+        );
     }
     let source_version: i64 = tx.query_row(
         "SELECT human_version FROM contexts WHERE id=?1",
         [trigger.context()],
         |r| r.get(0),
     )?;
-    tx.execute("INSERT OR IGNORE INTO followups(parent,root,depth,deadline,available,goal,endpoint,source_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c),source_version])?;
+    // An identical call (including a lost acknowledgement) retains its original
+    // wake time. A deliberate revision changes only this turn's single proposal.
+    tx.execute("INSERT INTO followups(parent,root,depth,deadline,available,goal,endpoint,source_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(parent) DO UPDATE SET goal=excluded.goal,available=excluded.available,source_version=excluded.source_version,status='proposed' WHERE followups.child IS NULL AND (followups.status IN ('cancelled','withdrawn') OR followups.goal!=excluded.goal)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c),source_version])?;
+    let available: i64 = tx.query_row(
+        "SELECT available FROM followups WHERE parent=?1",
+        [id],
+        |r| r.get(0),
+    )?;
     tx.commit()?;
-    Ok(answer.into())
+    Ok(json!({"scheduled":true,"available_at":available,"goal":goal,"after_current_turn":true}))
+}
+
+/// Compatibility for plain ACP endpoints without the context MCP tools.
+pub fn capture(home: &Path, c: &Config, input: &Value, output: &str) -> Result<String> {
+    let Some((answer, tail)) = output.rsplit_once("\nSLACK_FOLLOW_UP ") else {
+        return Ok(output.into());
+    };
+    let request: Value = serde_json::from_str(tail.trim()).unwrap_or(Value::Null);
+    let result = schedule(
+        home,
+        c,
+        input["job_id"].as_str().unwrap_or(""),
+        request["after_seconds"].as_i64().unwrap_or(-1),
+        request["goal"].as_str().unwrap_or(""),
+    )?;
+    if result["scheduled"] == true
+        || result["cancelled"] == true
+        || result["reason"] == "bot_origin"
+    {
+        Ok(answer.into())
+    } else {
+        Ok(notice(
+            answer,
+            result["reason"]
+                .as_str()
+                .unwrap_or("No follow-up was scheduled."),
+        ))
+    }
 }
 
 /// Offer the control only where the scheduler can honor its source authority.
@@ -116,21 +147,25 @@ pub fn guidance(input: &Value) -> &'static str {
     if input["trigger"]["bot"] != false {
         return "";
     }
-    "For a concrete next step on the same accepted goal, you may append SLACK_FOLLOW_UP {\"after_seconds\":60,\"goal\":\"next bounded step\"} on its own final line. Delay 5–3600 seconds; at most eight continuations in 24 hours per human request. New human input supersedes queued follow-ups: reassess unfinished commitments. Stop on completion, cancellation, a real blocker or budget. Do not schedule turns just to announce delivery, agreement, record closure or continued availability."
+    "When accepted work is still running or a result needs checking after this response, schedule that check with slack_follow_up before ending. Inspect the existing run and report success, failure or a real blocker; do not launch it again. A promise to return does not schedule anything. You can remain silent while waiting. If that tool is unavailable, append SLACK_FOLLOW_UP {\"after_seconds\":60,\"goal\":\"next bounded step\"} on its own final line, including after a pass JSON response. Delay 5–3600 seconds; at most eight continuations in 24 hours per human request. New human input supersedes queued follow-ups: reassess unfinished commitments. Stop on completion, cancellation, a real blocker or budget. Do not schedule turns just to announce delivery, agreement, record closure or continued availability."
 }
 pub fn input(home: &Path, id: &str) -> Result<Option<Value>> {
     let s = Store::open(home)?;
     initialize(&s)?;
-    Ok(s.db.query_row("SELECT goal,depth,deadline FROM followups WHERE child=?1",[id],|r|Ok(json!({"goal":r.get::<_,String>(0)?,"turn":r.get::<_,i64>(1)?,"maximum_turns":8,"deadline":r.get::<_,i64>(2)?,"instructions":"Continue only the already accepted goal. Inspect saved results and actual delivery receipts, then take the next concrete step. This wake-up grants no additional authority."}))).optional()?)
+    Ok(s.db.query_row("SELECT goal,depth,deadline FROM followups WHERE child=?1",[id],|r|Ok(json!({"goal":r.get::<_,String>(0)?,"turn":r.get::<_,i64>(1)?,"maximum_turns":8,"deadline":r.get::<_,i64>(2)?,"instructions":"This is a follow-up, not a replay of the original request. Continue only the already accepted goal. Inspect saved results and actual delivery receipts, then take the next concrete step. This wake-up grants no additional authority."}))).optional()?)
 }
 pub fn pump(home: &Path, c: &Config) -> Result<()> {
     let mut s = Store::open(home)?;
     initialize(&s)?;
     let tx =
         s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let rows=tx.prepare("SELECT f.parent,f.endpoint,f.deadline,j.context,j.trigger,CASE WHEN f.source_version>=0 THEN f.source_version ELSE j.version END FROM followups f JOIN jobs j ON j.id=f.parent WHERE f.status='proposed' AND f.available<=?1 AND EXISTS(SELECT 1 FROM outbox o WHERE o.job_id=j.id AND o.status='sent')")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=tx.prepare("SELECT f.parent,f.endpoint,f.deadline,j.context,j.trigger,CASE WHEN f.source_version>=0 THEN f.source_version ELSE j.version END FROM followups f JOIN jobs j ON j.id=f.parent WHERE f.status='proposed' AND f.available<=?1 AND j.status IN ('speak','pass')")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (parent, endpoint, deadline, context, trigger, version) in rows {
         let m: Message = serde_json::from_str(&trigger)?;
+        let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM steering_inputs WHERE target_job=?1 AND state IN ('offering','submitted','received','remoteQueued','unknown','notAccepted','failed','startedNewTurn','held'))",[&parent],|r|r.get(0))?;
+        if unresolved {
+            continue;
+        }
         let latest: i64 = tx.query_row(
             "SELECT human_version FROM contexts WHERE id=?1",
             [&context],

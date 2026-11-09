@@ -647,12 +647,6 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     if prior_delivery.is_array() {
         diagnostic_input["prior_source_delivery"] = prior_delivery;
     }
-    crate::handoff::start(
-        &store,
-        input["job_id"].as_str().unwrap_or(""),
-        &endpoint,
-        input,
-    )?;
     let input = &diagnostic_input;
     let ambient = host_attention || optional_participation(c, input);
     let instruction = if ambient {
@@ -702,6 +696,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     // Track only committed response work. This covers direct replies, accepted
     // continuations, and current host engage offers; quiet evaluation stays hidden.
     if !deciding {
+        crate::handoff::start(
+            &store,
+            input["job_id"].as_str().unwrap_or(""),
+            &endpoint,
+            input,
+        )?;
         crate::work_status::track_input(home, input)?;
     }
     let mut params = json!({"sessionId":sid,"prompt":blocks});
@@ -718,6 +718,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut callbacks = tokio::task::JoinSet::new();
     let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
     let mut tool_calls: HashMap<String, Value> = HashMap::new();
+    let mut tool_observations_complete = true;
     let mut activity = crate::work_status::ToolActivity::default();
     let mut public_progress = crate::work_status::PublicProgress::default();
     let mut public_speech = amplifier_acp_connection::speech::Commentary::default();
@@ -897,6 +898,10 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 });
             }
             if let Some(error) = v.get("error") {
+                if crate::attention::not_forwarded(&init, error, attention_offer.as_ref(), &sid) {
+                    store.audit("attention_not_forwarded", json!({"job":input["job_id"],"session_id":sid,"offer_id":attention_offer.as_ref().map(|o| &o["id"]),"prompt_request_id":id,"retry_scheduled":false}))?;
+                    return Err(crate::diagnostics::Failure::not_forwarded().into());
+                }
                 if error["code"] == -32010 {
                     crate::steering::recovery_required(
                         &store,
@@ -906,7 +911,41 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 return Err(crate::acp_auth::rejected(error, "session/prompt"));
             }
             if v["result"]["stopReason"] != "end_turn" {
-                store.audit("acp_turn_failed",json!({"context":ctx,"session_id":sid,"reason":"Agent did not complete the turn"}))?;
+                let reason = v["result"]["stopReason"].as_str().unwrap_or("");
+                if reason == "refusal" {
+                    return Err(crate::diagnostics::Failure::refused().into());
+                }
+                if matches!(reason, "max_turn_requests" | "max_tokens") {
+                    store.audit(
+                        "acp_turn_limit",
+                        json!({"context":ctx,"session_id":sid,"stop_reason":reason}),
+                    )?;
+                    if !tool_observations_complete
+                        || !callbacks.is_empty()
+                        || tool_calls
+                            .values()
+                            .any(|u| !matches!(u["status"].as_str(), Some("completed" | "failed")))
+                    {
+                        return Err(crate::diagnostics::Failure::unsettled_limit().into());
+                    }
+                    if !deciding {
+                        let scheduled = crate::followup::schedule(
+                            home,
+                            c,
+                            input["job_id"].as_str().unwrap_or(""),
+                            5,
+                            "The previous turn reached its request or output limit. Inspect the existing results and any failed operations, then continue unfinished authorized work and report its outcome. Do not repeat the original request, completed effects, or uncertain operations.",
+                        )?;
+                        if scheduled["scheduled"] == true {
+                            return Ok(Decision {decision:"pass".into(),text:String::new(),reason:"Turn limit reached; existing work will be inspected in the scheduled continuation".into(),media:vec![]});
+                        }
+                    }
+                    return Err(crate::diagnostics::Failure::turn_limit().into());
+                }
+                store.audit(
+                    "acp_turn_failed",
+                    json!({"context":ctx,"session_id":sid,"reason":"Unknown prompt terminal"}),
+                )?;
                 bail!("ACP turn did not complete");
             }
             if let Some(offer) = attention_offer.take() {
@@ -943,6 +982,12 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                     });
                 }
                 deciding = false;
+                crate::handoff::start(
+                    &store,
+                    input["job_id"].as_str().unwrap_or(""),
+                    &endpoint,
+                    input,
+                )?;
                 crate::work_status::track_input(home, input)?;
                 output.clear();
                 answer = crate::answer::Answer::default();
@@ -976,19 +1021,30 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             }
             output = crate::followup::capture(home, c, input, &output)?;
             let late_speech = public_speech.terminal(true);
-            let mut d =
-                if output.trim().is_empty() && (public_utterances > 0 || !late_speech.is_empty()) {
-                    Decision {
-                        decision: "pass".into(),
-                        text: String::new(),
-                        reason: "Public contributions completed".into(),
-                        media: vec![],
+            let scheduled_check: bool = store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM followups WHERE parent=?1 AND status='proposed')",
+                [input["job_id"].as_str().unwrap_or("")],
+                |r| r.get(0),
+            )?;
+            let mut d = if output.trim().is_empty()
+                && (public_utterances > 0 || !late_speech.is_empty() || scheduled_check)
+            {
+                Decision {
+                    decision: "pass".into(),
+                    text: String::new(),
+                    reason: if scheduled_check {
+                        "Result check scheduled"
+                    } else {
+                        "Public contributions completed"
                     }
-                } else if ambient {
-                    parse_decision(&output)?
-                } else {
-                    direct_reply(&output)?
-                };
+                    .into(),
+                    media: vec![],
+                }
+            } else if ambient {
+                parse_decision(&output)?
+            } else {
+                direct_reply(&output)?
+            };
             if d.decision == "speak" {
                 d.media = media;
                 if media_omitted {
@@ -1039,6 +1095,10 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 let _ =
                     crate::work_status::phase(home, input["job_id"].as_str().unwrap_or(""), &text);
             }
+            let is_tool_update = matches!(
+                u["sessionUpdate"].as_str(),
+                Some("tool_call" | "tool_call_update")
+            );
             if matches!(
                 u["sessionUpdate"].as_str(),
                 Some("tool_call" | "tool_call_update")
@@ -1056,6 +1116,8 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 {
                     previous[key] = value.clone();
                 }
+            } else if is_tool_update {
+                tool_observations_complete = false;
             }
             if u["sessionUpdate"] == "agent_message_chunk" {
                 answer.observe(u)?;
