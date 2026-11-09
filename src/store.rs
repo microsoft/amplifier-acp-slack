@@ -370,7 +370,7 @@ impl Store {
             } else {
                 let existing: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM jobs WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs)",
+                    "SELECT id FROM jobs WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs) AND id NOT IN (SELECT child FROM followups WHERE child IS NOT NULL)",
                     [&ctx],
                     |r| r.get(0),
                 )
@@ -471,7 +471,7 @@ impl Store {
         // Backfill and messages received while fetching are folded into one
         // snapshot before the model starts. Later events get their own turn.
         let queued_input: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM steering_inputs WHERE input_id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM steering_inputs WHERE input_id=?1) OR EXISTS(SELECT 1 FROM followups WHERE child=?1)",
             [&job.id],
             |r| r.get(0),
         )?;
@@ -481,7 +481,7 @@ impl Store {
             self
             .db
             .query_row(
-                "SELECT trigger,note FROM jobs WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs)",
+                "SELECT trigger,note FROM jobs WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs) AND id NOT IN (SELECT child FROM followups WHERE child IS NOT NULL)",
                 [&job.context],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -490,7 +490,7 @@ impl Store {
         if let Some((p, note)) = pending {
             job.trigger = serde_json::from_str(&p)?;
             job.reconsidered |= note.starts_with("Reconsider");
-            self.db.execute("UPDATE jobs SET status='superseded',note='Coalesced into the current turn' WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs)",[&job.context])?;
+            self.db.execute("UPDATE jobs SET status='superseded',note='Coalesced into the current turn' WHERE context=?1 AND status='pending' AND id NOT IN (SELECT input_id FROM steering_inputs) AND id NOT IN (SELECT child FROM followups WHERE child IS NOT NULL)",[&job.context])?;
         }
         job.version = self.db.query_row(
             "SELECT version FROM contexts WHERE id=?1",

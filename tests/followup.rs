@@ -133,20 +133,10 @@ fn endpoint_change_cancels_the_old_agents_continuation() {
 }
 
 #[test]
-fn maximum_depth_expiry_and_bot_source_refuse_another_continuation() {
-    for cause in ["depth", "expiry", "bot"] {
+fn retained_legacy_depth_and_expiry_refuse_another_continuation() {
+    for cause in ["depth", "expiry"] {
         let (dir, c, s, j) = fixture();
-        if cause == "bot" {
-            let mut m = j.trigger.clone();
-            m.bot = true;
-            s.db.execute(
-                "UPDATE jobs SET trigger=?2 WHERE id=?1",
-                rusqlite::params![j.id, serde_json::to_string(&m).unwrap()],
-            )
-            .unwrap();
-        } else {
-            s.db.execute("INSERT INTO followups(parent,root,depth,deadline,available,goal,endpoint,child,status) VALUES('prior','root',?1,?2,0,'accepted','endpoint',?3,'queued')",rusqlite::params![if cause=="depth" {8}else{1},if cause=="expiry" {now_ms()-1}else{now_ms()+86_400_000},j.id]).unwrap();
-        }
+        s.db.execute("INSERT INTO followups(parent,root,depth,deadline,available,goal,endpoint,child,status) VALUES('prior','root',?1,?2,0,'accepted','endpoint',?3,'queued')",rusqlite::params![if cause=="depth" {8}else{1},if cause=="expiry" {now_ms()-1}else{now_ms()+86_400_000},j.id]).unwrap();
         let answer=followup::capture(dir.path(),&c,&json!({"job_id":j.id}),"{\"decision\":\"speak\",\"text\":\"Progress\"}\nSLACK_FOLLOW_UP {\"after_seconds\":5,\"goal\":\"Next step\"}").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&answer).unwrap();
         assert_eq!(parsed["decision"], "speak");
@@ -160,6 +150,209 @@ fn maximum_depth_expiry_and_bot_source_refuse_another_continuation() {
             0
         );
     }
+}
+
+#[test]
+fn upgrading_preserves_all_old_chain_rows_and_their_finite_bounds() {
+    for source_version in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE followups(parent TEXT PRIMARY KEY,root TEXT NOT NULL,depth INTEGER NOT NULL,deadline INTEGER NOT NULL,available INTEGER NOT NULL,goal TEXT NOT NULL,endpoint TEXT NOT NULL,child TEXT UNIQUE,status TEXT NOT NULL DEFAULT 'proposed');
+            INSERT INTO followups VALUES('a','root',8,17,9,'existing work','same endpoint','b','queued');
+            INSERT INTO followups VALUES('b','root',8,17,9,'cancelled work','same endpoint',NULL,'cancelled');
+            INSERT INTO followups VALUES('c','root',2,17,9,'unknown work','same endpoint',NULL,'unknown');") .unwrap();
+        if source_version {
+            db.execute_batch("ALTER TABLE followups ADD COLUMN source_version INTEGER NOT NULL DEFAULT -1; UPDATE followups SET source_version=19;").unwrap();
+        }
+        let before: Vec<Vec<rusqlite::types::Value>> = db.prepare("SELECT parent,root,depth,deadline,available,goal,endpoint,child,status FROM followups ORDER BY parent").unwrap().query_map([], |r| (0..9).map(|i|r.get(i)).collect()).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let s = Store::open(dir.path()).unwrap();
+            let after: Vec<Vec<rusqlite::types::Value>> = s.db.prepare("SELECT parent,root,depth,deadline,available,goal,endpoint,child,status FROM followups ORDER BY parent").unwrap().query_map([], |r| (0..9).map(|i|r.get(i)).collect()).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(before, after);
+            let bounds = followup::input(dir.path(), "b").unwrap().unwrap();
+            assert_eq!(bounds["maximum_turns"], 8);
+            assert_eq!(bounds["deadline"], 17);
+            assert_eq!(
+                s.db.query_row(
+                    "SELECT source_version FROM followups WHERE parent='a'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                if source_version { 19 } else { -1 }
+            );
+        }
+    }
+}
+
+#[test]
+fn a_pending_check_stays_bound_when_an_ordinary_job_is_prepared_first() {
+    let (dir, c, mut s, j) = fixture();
+    propose(dir.path(), &c, &mut s, &j);
+    followup::pump(dir.path(), &c).unwrap();
+    s.db.execute(
+        "UPDATE jobs SET available=?1 WHERE status='pending'",
+        [now_ms() + 10_000],
+    )
+    .unwrap();
+    let mut peer = j.trigger.clone();
+    peer.ts = "3.001".into();
+    peer.revision = peer.ts.clone();
+    peer.bot = true;
+    peer.sender = "Upeer".into();
+    peer.text = "Separate peer request".into();
+    s.ingest("peer", &peer, true).unwrap();
+    let first = s
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.trigger.ts, peer.ts);
+    let prepared = s.prepare(first).unwrap();
+    assert_eq!(prepared.trigger.ts, peer.ts);
+    assert!(followup::input(dir.path(), &prepared.id).unwrap().is_none());
+    assert_eq!(s.db.query_row("SELECT count(*) FROM jobs WHERE status='pending' AND id IN (SELECT child FROM followups)",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+}
+
+#[test]
+fn accepted_work_can_continue_past_eight_turns_in_its_original_conversation() {
+    let (dir, c, mut s, mut job) = fixture();
+    let original = serde_json::to_value(&job.trigger).unwrap();
+    for turn in 1..=10 {
+        propose(dir.path(), &c, &mut s, &job);
+        drop(s);
+        followup::pump(dir.path(), &c).unwrap();
+        s = Store::open(dir.path()).unwrap();
+        job = s
+            .claim(&Attention {
+                settle_ms: 0,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let input = followup::input(dir.path(), &job.id).unwrap().unwrap();
+        assert_eq!(input["turn"], turn);
+        assert_eq!(serde_json::to_value(&job.trigger).unwrap(), original);
+        acp_slack_adapter::handoff::start(
+            &s,
+            &job.id,
+            "fixture-endpoint",
+            &json!({"trigger":job.trigger}),
+        )
+        .unwrap();
+    }
+    let input = followup::input(dir.path(), &job.id).unwrap().unwrap();
+    assert!(input["maximum_turns"].is_null());
+    assert!(input["deadline"].is_null());
+}
+
+#[test]
+fn new_work_is_not_expired_by_its_older_release_rollback_fallback() {
+    let (dir, c, mut s, j) = fixture();
+    propose(dir.path(), &c, &mut s, &j);
+    s.db.execute("UPDATE followups SET deadline=?1", [now_ms() - 1])
+        .unwrap();
+    drop(s);
+    followup::pump(dir.path(), &c).unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let next = s
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    let continuation = followup::input(dir.path(), &next.id).unwrap().unwrap();
+    assert!(continuation["deadline"].is_null());
+    assert!(continuation["maximum_turns"].is_null());
+    assert_eq!(next.trigger.ts, j.trigger.ts);
+}
+
+#[test]
+fn accepted_peer_work_can_schedule_a_quiet_same_source_check_after_restart() {
+    let (dir, c, mut s, mut j) = fixture();
+    j.trigger.bot = true;
+    j.trigger.sender = "Upeer".into();
+    s.db.execute(
+        "UPDATE jobs SET trigger=?2 WHERE id=?1",
+        rusqlite::params![j.id, serde_json::to_string(&j.trigger).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(
+        followup::schedule(dir.path(), &c, &j.id, 5, "Inspect the existing test result").unwrap()["scheduled"],
+        true
+    );
+    s.finish(
+        &j,
+        Ok(Decision {
+            decision: "pass".into(),
+            text: String::new(),
+            reason: "waiting for the existing run".into(),
+            media: vec![],
+        }),
+        &c.attention,
+    )
+    .unwrap();
+    s.db.execute("UPDATE followups SET available=0", [])
+        .unwrap();
+    drop(s);
+    followup::pump(dir.path(), &c).unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let next = s
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(next.trigger).unwrap(),
+        serde_json::to_value(j.trigger).unwrap()
+    );
+    assert_eq!(
+        s.db.query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_peer_arriving_beside_a_scheduled_check_cannot_replace_its_source() {
+    let (dir, c, mut s, j) = fixture();
+    propose(dir.path(), &c, &mut s, &j);
+    followup::pump(dir.path(), &c).unwrap();
+    let mut peer = j.trigger.clone();
+    peer.ts = "3.001".into();
+    peer.revision = peer.ts.clone();
+    peer.sender = "Upeer".into();
+    peer.bot = true;
+    peer.text = "A different peer request".into();
+    s.ingest("peer", &peer, true).unwrap();
+    let check = s
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    assert!(followup::input(dir.path(), &check.id).unwrap().is_some());
+    let check = s.prepare(check).unwrap();
+    assert_eq!(
+        serde_json::to_value(check.trigger).unwrap(),
+        serde_json::to_value(j.trigger).unwrap()
+    );
+    assert_eq!(
+        s.db.query_row(
+            "SELECT count(*) FROM jobs WHERE status='pending' AND json_extract(trigger,'$.ts')=?1",
+            [&peer.ts],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
 }
 #[test]
 fn malformed_footer_preserves_the_answer_without_scheduling_work() {
@@ -186,7 +379,7 @@ fn peer_control_is_private_even_when_malformed_or_after_a_pass() {
         "The updated plan is ready.",
         r#"{"decision":"pass","reason":"already settled"}"#,
     ] {
-        for footer in [r#"{"after_seconds":60,"goal":"Check delivery"}"#, "invalid"] {
+        for footer in ["invalid", r#"{"after_seconds":-1,"goal":"Check result"}"#] {
             let (dir, c, s, j) = fixture();
             let mut trigger = j.trigger.clone();
             trigger.bot = true;
@@ -216,19 +409,19 @@ fn peer_control_is_private_even_when_malformed_or_after_a_pass() {
                 )
                 .unwrap();
             let event: serde_json::Value = serde_json::from_str(&event).unwrap();
-            assert_eq!(event, json!({"job":j.id,"reason":"bot_origin"}));
+            assert_eq!(
+                event,
+                json!({"job":j.id,"reason":"The follow-up request was invalid, so no later turn was scheduled."})
+            );
         }
     }
 }
 
 #[test]
-fn followup_control_is_offered_only_for_a_known_human_source() {
+fn followup_control_is_offered_for_known_human_and_peer_sources() {
     assert!(followup::guidance(&json!({"trigger":{"bot":false}})).contains("SLACK_FOLLOW_UP"));
-    for input in [
-        json!({"trigger":{"bot":true}}),
-        json!({}),
-        json!({"trigger":{"bot":"false"}}),
-    ] {
+    assert!(followup::guidance(&json!({"trigger":{"bot":true}})).contains("SLACK_FOLLOW_UP"));
+    for input in [json!({}), json!({"trigger":{"bot":"false"}})] {
         assert!(followup::guidance(&input).is_empty());
     }
 }

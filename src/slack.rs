@@ -363,7 +363,7 @@ impl Slack {
     }
     pub async fn authorize_continuation(&self, c: &Config, source: &Message) -> Result<()> {
         ensure!(
-            c.should_wake(&source.channel, &source.text) && !source.bot && !source.deleted,
+            c.should_wake(&source.channel, &source.text) && !source.deleted,
             "Continuation scope changed"
         );
         let mut cursor = String::new();
@@ -420,6 +420,7 @@ impl Slack {
         ensure!(
             !current.deleted
                 && current.sender == source.sender
+                && current.bot == source.bot
                 && current.text == source.text
                 && current.revision == source.revision,
             "Continuation source changed"

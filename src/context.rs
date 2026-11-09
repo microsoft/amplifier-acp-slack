@@ -1065,7 +1065,7 @@ pub async fn mcp(
         "ping" => Ok(rpc(id, json!({}))),
         "tools/list" => {
             let mut result = mcp_tools();
-            if grant.job_id.is_some() && !grant.actor_bot {
+            if grant.job_id.is_some() {
                 result["tools"].as_array_mut().unwrap().push(json!({
                     "name":"slack_follow_up",
                     "description":"Schedule this response's next check of unfinished accepted work, or cancel its scheduled check. Use before ending while a background run is pending; inspect the same run and report success or failure, never start it again. One durable follow-up, using the existing conversation and authority. No public progress message is required. A successful receipt remains pending until this turn ends normally. Set after_seconds to 0 to cancel.",
@@ -1114,7 +1114,7 @@ pub async fn mcp(
         }
         "tools/call" => {
             if body["params"]["name"] == "slack_follow_up" {
-                let Some(job) = grant.job_id.as_deref().filter(|_| !grant.actor_bot) else {
+                let Some(job) = grant.job_id.as_deref() else {
                     return Err(ApiError::forbidden());
                 };
                 let args = &body["params"]["arguments"];

@@ -51,27 +51,35 @@ after a confirmed response terminal, including a quiet pass. Public delivery is
 independent: pending or uncertain sends remain accurately represented in the
 next turn's delivery receipts and must not be blindly resent. A failed or crashed
 turn does not activate its proposal.
-The original human, conversation, thread, endpoint, and session binding are kept.
+The original requester (human or peer), conversation, thread, endpoint, and session binding are kept.
 A fresh source-message and Slack membership check runs before the continuation.
 Reading another room does not grant a return route there.
 
-Delays are 5–3600 seconds, at most eight follow-ups in 24 hours per human request,
-with the installation's existing model/reply budgets also enforced. These turns
-are for concrete progress on an accepted goal, not keep-alive chatter. Bot-origin
-messages cannot schedule this chain. New human input, source changes, scope or
-endpoint changes, and expiry supersede/cancel queued work. A new human turn must
-reassess outstanding work rather than silently dropping it: the existing compact
-work handoff retains a superseded result-check goal for that reassessment. An
-explicitly withdrawn follow-up is not carried forward. No model is assumed
-to obey this convention perfectly; deterministic protocol tests and actual-model
-behavior are separate evidence.
+Delays are 5–3600 seconds. Newly accepted work has no connector-imposed turn
+count or age cutoff: continue until the goal is done, stopped or genuinely
+blocked. Explicit user limits, tool permissions and the installation's existing
+model/reply budgets still apply. Saved chains from earlier versions retain their
+original eight-turn allowance and deadline; upgrading does not renew old work. The additive journal also retains the old
+finite deadline as a rollback fallback: an older connector can still read these
+records and applies its former limits; the new connector does not enforce that
+fallback on new chains.
+No setting or permission is changed to enable peer conversations.
 
-The continuation control is offered only on human-origin turns. If a peer-origin
-response nevertheless includes one (for example from older session instructions),
-the connector strips it and records `continuation_not_scheduled` with reason
-`bot_origin` privately. It does not append a scheduling notice to the agent's
-public contribution or turn a pass into speech. This changes presentation, not
-continuation eligibility, authority or budgets.
+An accepted peer response can schedule the same check as an accepted human
+response. Setup and quiet attention evaluation still cannot commission work.
+The original source is revalidated, and a nearby peer message cannot replace a
+queued continuation's source. Public peer replies retain the configured
+collaboration and delivery policy; a quiet check is not an extra public message.
+These turns are for concrete progress, not keep-alive chatter.
+
+New human input, source changes, scope or endpoint changes, and a retained finite
+expiry supersede/cancel queued work. A new human turn must reassess outstanding
+work rather than silently dropping it: the existing compact work handoff retains
+a superseded result-check goal for that reassessment. An explicitly withdrawn
+follow-up is not carried forward. Invalid peer footer controls are recorded
+privately, without appending bookkeeping to the public contribution or turning a
+pass into speech. No model is assumed to obey these instructions perfectly;
+deterministic protocol tests and actual-model behavior are separate evidence.
 
 Routine delivery verification and work-record closure stay internal. A useful
 result, changed plan, question or actionable blocker belongs in the conversation;
@@ -88,7 +96,7 @@ a failure/uncertainty notice where Slack still permits writes. This does not cla
 exactly-once external tool execution across arbitrary backend failures.
 
 `max_turn_requests` and `max_tokens` are known prompt terminals, not transport
-failures. For accepted human work, the existing continuation can inspect completed
+failures. For accepted work, the existing continuation can inspect completed
 results and continue, within the same limits above. This requires complete terminal
 tool observations and no unresolved client operation or incoming steering. Partial
 answer text is not published as a result. Cancellation, refusal, incomplete tool

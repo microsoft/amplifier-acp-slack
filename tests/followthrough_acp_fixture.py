@@ -43,6 +43,14 @@ for line in sys.stdin:
                 assert rpc('tools/call',args)==first # repeated call after a lost receipt
                 # The successful schedule is the only output; no public filler or pass envelope.
                 result={'stopReason':'end_turn'}
+            elif channel.startswith('Cpeer'):
+                assert v['trigger']['bot'] is True and v['trigger']['sender']=='Ubeta'
+                (root/(channel+'-source')).write_text(json.dumps(v['trigger'],sort_keys=True))
+                tools=rpc('tools/list',{});assert any(t['name']=='slack_follow_up' for t in tools['tools'])
+                args={'name':'slack_follow_up','arguments':{'after_seconds':5,'goal':'Inspect the existing peer artifact; do not create it twice.'}}
+                first=rpc('tools/call',args);assert first['structuredContent']['scheduled']
+                assert rpc('tools/call',args)==first
+                result={'stopReason':'end_turn'}
             elif channel=='Dlimit':
                 update(sessionUpdate='tool_call',toolCallId='single-effect',kind='execute',title='Write artifact',status='completed')
                 (root/'artifact').write_text('existing result')
@@ -50,7 +58,12 @@ for line in sys.stdin:
                 result={'stopReason':'max_turn_requests'}
         else:
             assert sid=='original-fixture'
-            if channel=='Dbackground':
+            if channel.startswith('Cpeer'):
+                assert json.loads((root/(channel+'-source')).read_text())==v['trigger']
+                assert v['accepted_work_continuation']['maximum_turns'] is None
+                assert v['accepted_work_continuation']['deadline'] is None
+                speak('The accepted peer result is ready; its original artifact was preserved.')
+            elif channel=='Dbackground':
                 assert (root/'background-result').read_text().startswith('failed:')
                 speak('The existing background run failed; I did not launch it again.')
             else:
