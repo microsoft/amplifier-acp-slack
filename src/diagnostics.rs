@@ -51,7 +51,7 @@ impl Failure {
     pub fn summary(&self) -> &'static str {
         match self.category {
             "not_forwarded" => {
-                "The host did not forward this input to the agent. No work started for this input, and it has not been retried."
+                "The host did not forward this attempt to the agent. Earlier work may still exist; this attempt has not been retried."
             }
             "turn_limit" => {
                 "The agent reached its turn limit. Earlier work may be complete; no continuation was scheduled. Check the existing results before repeating work."
