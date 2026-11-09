@@ -40,6 +40,18 @@ async def main():
             assert 'existing artifact' in posts('Dlimit')[0]['markdown_text'];assert (work/'Dlimit-starts').read_text()=='1';assert (work/'Dlimit-prompts').read_text()=='2'
             assert all('PARTIAL' not in p['markdown_text'] for p in f.posts)
             print('PASS standard max-turn terminal resumes same session and inspects single existing effect',flush=True)
+            for channel in ['Cpeer','Cpeerdeleted']:
+                await f.send(channel,'Please check the existing artifact.',user='Ubeta',bot_id='Bbeta')
+                await until(lambda:bool(rows(home,"SELECT 1 FROM followups f JOIN jobs j ON j.id=f.parent WHERE j.status='pass' AND json_extract(j.trigger,'$.channel')=?",(channel,))),'accepted peer quiet check')
+            assert not posts('Cpeer') and not posts('Cpeerdeleted')
+            await stop()
+            f.messages=[m for m in f.messages if not (m.get('channel')=='Cpeerdeleted' and m.get('user')=='Ubeta')]
+            await start()
+            await until(lambda:len(posts('Cpeer'))==1,'peer continuation after restart',20)
+            await until(lambda:bool(rows(home,"SELECT 1 FROM jobs WHERE status='failed' AND json_extract(trigger,'$.channel')='Cpeerdeleted'")),'deleted peer source refusal')
+            assert (work/'Cpeer-starts').read_text()=='1' and (work/'Cpeer-prompts').read_text()=='2'
+            assert (work/'Cpeerdeleted-prompts').read_text()=='1' and not posts('Cpeerdeleted')
+            print('PASS peer MCP continuation retains exact source/session across restart; deleted source cannot run',flush=True)
             for channel in ['Crefused','Cgeneric']:
                 await f.send(channel,'Please review this.')
                 await until(lambda:bool(rows(home,"SELECT 1 FROM jobs WHERE status='failed' AND json_extract(trigger,'$.channel')=?",(channel,))),'failure recorded')

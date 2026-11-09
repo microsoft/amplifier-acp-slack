@@ -50,7 +50,8 @@ A runtime recovery-required rejection (`-32010`) produces a fixed same-conversat
 notice; it does not echo private error details, acknowledge uncertain input or retry.
 Review and any decision to proceed belong to the installation's explicit controls.
 
-Automatic continuation remains within its original depth/deadline allowance.
+Automatic continuation retains any original finite depth/deadline allowance;
+newly accepted work has no implicit chain length or age limit.
 An incorporated update can be followed by a newly requested continuation, but
 queued or unresolved input prevents that automatic continuation. Original source
 authorization versions are never advanced merely to make a continuation eligible.
