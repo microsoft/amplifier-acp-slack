@@ -11,31 +11,24 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 pub fn initialize(s: &Store) -> Result<()> {
-    // Older chains retain their actual deadline and eight-turn allowance. New
-    // chains explicitly store no implicit bound; no old work is renewed here.
+    // Additive storage keeps old releases able to read this journal on rollback.
+    // Existing rows retain their finite bounds; new rows explicitly opt out.
     let tx = rusqlite::Transaction::new_unchecked(&s.db, rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS followups(parent TEXT PRIMARY KEY,root TEXT NOT NULL,depth INTEGER NOT NULL,deadline INTEGER,available INTEGER NOT NULL,goal TEXT NOT NULL,endpoint TEXT NOT NULL,child TEXT UNIQUE,status TEXT NOT NULL DEFAULT 'proposed',source_version INTEGER NOT NULL DEFAULT -1,maximum_turns INTEGER DEFAULT 8);")?;
-    let has_version = tx
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS followups(parent TEXT PRIMARY KEY,root TEXT NOT NULL,depth INTEGER NOT NULL,deadline INTEGER NOT NULL,available INTEGER NOT NULL,goal TEXT NOT NULL,endpoint TEXT NOT NULL,child TEXT UNIQUE,status TEXT NOT NULL DEFAULT 'proposed');")?;
+    let columns = tx
         .prepare("PRAGMA table_info(followups)")?
         .query_map([], |r| r.get::<_, String>(1))?
-        .any(|v| v.is_ok_and(|v| v == "source_version"));
-    if !has_version {
-        tx.execute(
-            "ALTER TABLE followups ADD COLUMN source_version INTEGER NOT NULL DEFAULT -1",
-            [],
-        )?;
-    }
-    let required_deadline = tx
-        .prepare("PRAGMA table_info(followups)")?
-        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, bool>(3)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|(name, required)| name == "deadline" && *required);
-    if required_deadline {
-        tx.execute_batch("CREATE TABLE followups_optional_bounds(parent TEXT PRIMARY KEY,root TEXT NOT NULL,depth INTEGER NOT NULL,deadline INTEGER,available INTEGER NOT NULL,goal TEXT NOT NULL,endpoint TEXT NOT NULL,child TEXT UNIQUE,status TEXT NOT NULL DEFAULT 'proposed',source_version INTEGER NOT NULL DEFAULT -1,maximum_turns INTEGER DEFAULT 8);
-            INSERT INTO followups_optional_bounds(parent,root,depth,deadline,available,goal,endpoint,child,status,source_version,maximum_turns) SELECT parent,root,depth,deadline,available,goal,endpoint,child,status,source_version,8 FROM followups;
-            DROP TABLE followups;
-            ALTER TABLE followups_optional_bounds RENAME TO followups;")?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, definition) in [
+        ("source_version", "INTEGER NOT NULL DEFAULT -1"),
+        ("legacy_bounds", "INTEGER NOT NULL DEFAULT 1"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            tx.execute(
+                &format!("ALTER TABLE followups ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -73,17 +66,18 @@ pub fn schedule(home: &Path, c: &Config, id: &str, seconds: i64, goal: &str) -> 
             json!({"scheduled":false,"reason":"The follow-up request was invalid, so no later turn was scheduled."}),
         );
     }
-    let prior: Option<(String, i64, Option<i64>, Option<i64>)> = tx
+    let prior: Option<(String, i64, i64, bool)> = tx
         .query_row(
-            "SELECT root,depth,deadline,maximum_turns FROM followups WHERE child=?1",
+            "SELECT root,depth,deadline,legacy_bounds FROM followups WHERE child=?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let (root, depth, deadline, maximum_turns) = prior.unwrap_or((id.into(), 0, None, None));
-    if maximum_turns.is_some_and(|limit| depth >= limit)
-        || deadline.is_some_and(|limit| now_ms() + seconds * 1000 >= limit)
-    {
+    // The old deadline remains a finite rollback fallback, not a bound in this
+    // version when legacy_bounds is false. No large numeric sentinel is used.
+    let (root, depth, deadline, legacy_bounds) =
+        prior.unwrap_or((id.into(), 0, now_ms() + 86_400_000, false));
+    if legacy_bounds && (depth >= 8 || now_ms() + seconds * 1000 >= deadline) {
         tx.execute(
             "INSERT INTO audit(time,kind,data) VALUES(?1,'continuation_limit',?2)",
             params![
@@ -109,7 +103,7 @@ pub fn schedule(home: &Path, c: &Config, id: &str, seconds: i64, goal: &str) -> 
     )?;
     // An identical call (including a lost acknowledgement) retains its original
     // wake time. A deliberate revision changes only this turn's single proposal.
-    tx.execute("INSERT INTO followups(parent,root,depth,deadline,available,goal,endpoint,source_version,maximum_turns) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(parent) DO UPDATE SET goal=excluded.goal,available=excluded.available,source_version=excluded.source_version,status='proposed' WHERE followups.child IS NULL AND (followups.status IN ('cancelled','withdrawn') OR followups.goal!=excluded.goal)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c),source_version,maximum_turns])?;
+    tx.execute("INSERT INTO followups(parent,root,depth,deadline,available,goal,endpoint,source_version,legacy_bounds) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(parent) DO UPDATE SET goal=excluded.goal,available=excluded.available,source_version=excluded.source_version,status='proposed' WHERE followups.child IS NULL AND (followups.status IN ('cancelled','withdrawn') OR followups.goal!=excluded.goal)",params![id,root,depth+1,deadline,now_ms()+seconds*1000,goal,crate::driver::endpoint_key(c),source_version,legacy_bounds])?;
     let available: i64 = tx.query_row(
         "SELECT available FROM followups WHERE parent=?1",
         [id],
@@ -170,13 +164,13 @@ pub fn guidance(input: &Value) -> &'static str {
 }
 pub fn input(home: &Path, id: &str) -> Result<Option<Value>> {
     let s = Store::open(home)?;
-    Ok(s.db.query_row("SELECT goal,depth,deadline,maximum_turns FROM followups WHERE child=?1",[id],|r|Ok(json!({"goal":r.get::<_,String>(0)?,"turn":r.get::<_,i64>(1)?,"maximum_turns":r.get::<_,Option<i64>>(3)?,"deadline":r.get::<_,Option<i64>>(2)?,"instructions":"This is a follow-up, not a replay of the original request. Continue only the already accepted goal. Inspect saved results and actual delivery receipts, then take the next concrete step. This wake-up grants no additional authority."}))).optional()?)
+    Ok(s.db.query_row("SELECT goal,depth,deadline,legacy_bounds FROM followups WHERE child=?1",[id],|r|Ok(json!({"goal":r.get::<_,String>(0)?,"turn":r.get::<_,i64>(1)?,"maximum_turns":r.get::<_,bool>(3)?.then_some(8),"deadline":r.get::<_,bool>(3)?.then_some(r.get::<_,i64>(2)?),"instructions":"This is a follow-up, not a replay of the original request. Continue only the already accepted goal. Inspect saved results and actual delivery receipts, then take the next concrete step. This wake-up grants no additional authority."}))).optional()?)
 }
 pub fn pump(home: &Path, c: &Config) -> Result<()> {
     let mut s = Store::open(home)?;
     let tx =
         s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let rows=tx.prepare("SELECT f.parent,f.endpoint,f.deadline,j.context,j.trigger,CASE WHEN f.source_version>=0 THEN f.source_version ELSE j.version END FROM followups f JOIN jobs j ON j.id=f.parent WHERE f.status='proposed' AND f.available<=?1 AND j.status IN ('speak','pass')")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=tx.prepare("SELECT f.parent,f.endpoint,CASE WHEN f.legacy_bounds THEN f.deadline ELSE NULL END,j.context,j.trigger,CASE WHEN f.source_version>=0 THEN f.source_version ELSE j.version END FROM followups f JOIN jobs j ON j.id=f.parent WHERE f.status='proposed' AND f.available<=?1 AND j.status IN ('speak','pass')")?.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (parent, endpoint, deadline, context, trigger, version) in rows {
         let m: Message = serde_json::from_str(&trigger)?;
         let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM steering_inputs WHERE target_job=?1 AND state IN ('offering','submitted','received','remoteQueued','unknown','notAccepted','failed','startedNewTurn','held'))",[&parent],|r|r.get(0))?;

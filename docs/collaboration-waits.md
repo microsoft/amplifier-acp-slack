@@ -59,7 +59,10 @@ Delays are 5–3600 seconds. Newly accepted work has no connector-imposed turn
 count or age cutoff: continue until the goal is done, stopped or genuinely
 blocked. Explicit user limits, tool permissions and the installation's existing
 model/reply budgets still apply. Saved chains from earlier versions retain their
-original eight-turn allowance and deadline; upgrading does not renew old work.
+original eight-turn allowance and deadline; upgrading does not renew old work. The additive journal also retains the old
+finite deadline as a rollback fallback: an older connector can still read these
+records and applies its former limits; the new connector does not enforce that
+fallback on new chains.
 No setting or permission is changed to enable peer conversations.
 
 An accepted peer response can schedule the same check as an accepted human

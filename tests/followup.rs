@@ -250,6 +250,28 @@ fn accepted_work_can_continue_past_eight_turns_in_its_original_conversation() {
 }
 
 #[test]
+fn new_work_is_not_expired_by_its_older_release_rollback_fallback() {
+    let (dir, c, mut s, j) = fixture();
+    propose(dir.path(), &c, &mut s, &j);
+    s.db.execute("UPDATE followups SET deadline=?1", [now_ms() - 1])
+        .unwrap();
+    drop(s);
+    followup::pump(dir.path(), &c).unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let next = s
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    let continuation = followup::input(dir.path(), &next.id).unwrap().unwrap();
+    assert!(continuation["deadline"].is_null());
+    assert!(continuation["maximum_turns"].is_null());
+    assert_eq!(next.trigger.ts, j.trigger.ts);
+}
+
+#[test]
 fn accepted_peer_work_can_schedule_a_quiet_same_source_check_after_restart() {
     let (dir, c, mut s, mut j) = fixture();
     j.trigger.bot = true;
