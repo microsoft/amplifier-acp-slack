@@ -161,3 +161,32 @@ Protocol references: [ACP filesystem](https://agentclientprotocol.com/protocol/v
 An active tool request survives replies from other agents in the same conversation. A newer human message requires reassessment before further actions. Editing or deleting the initiating message, stopping the turn, or changing the approval policy still invalidates its old requests. The same rule applies to automatic single-use decisions and pending human decisions.
 
 Slack thread-bookkeeping events (for example, changed reply counts with unchanged message content) do not advance the source revision or interrupt active work. Actual message, attachment, sender, routing or deletion changes remain material and require reassessment.
+
+## Agent questions and sign-in
+
+Ordinary ACP form and URL questions, including clarification and sign-in prompts,
+appear as a **Respond privately** control regardless of
+`acp.client.approvals_required`. Only the human who initiated the live turn can
+open and answer its Slack dialog; no `acp.client.approval_users` list is required.
+Other channel members see no question contents or answers. Automatic tool approval
+does not answer questions or complete sign-in.
+The operator may also inspect `GET /api/v1/questions` and explicitly answer via
+`POST /api/v1/questions/{id}/decision` with `{action, content?}` using the separate
+admin credential. That is recorded as an operator decision, not impersonation.
+
+Supported agent login methods run on the same ACP connection and retry session
+setup once after explicit choice. Provider pages open only on a click; opening a
+page is consent, not proof of completed authentication. Terminal-only methods
+remain a host sign-in step. Prompts are never retried for authentication.
+
+Question bodies and responses are memory-only. Cancellation, source edits,
+config changes, timeout, or process exit invalidate them. Controls are bound to
+the workspace, app, initiating person, message, and opened dialog. Slack limits
+on fields, choices, and URL length are enforced before display; unsupported
+schemas are rejected instead of silently dropping constraints. Secret inputs
+belong on the provider's page. Setup callbacks must use the current request ID
+or an already established session ID; tool-scoped questions require a known tool.
+
+Validation uses independent ACP peers and a local Socket Mode service, including
+login, URL opening, typed answers, wrong-user/view rejection, invalid input and
+transcript isolation. Live Slack UI confirmation is a separate check.

@@ -1,7 +1,10 @@
 # Work status in Slack
 
-An ambient group contribution has two ordinary ACP turns: a private participation
-decision, then the accepted response. A pass produces no public indicator. Direct
+In the ordinary ACP fallback, an ambient group contribution has two turns: a
+private participation
+decision, then the accepted response. Negotiated shared attention uses the
+[attention path](harness.md#optional-shared-attention) instead. A pass produces no
+public indicator. Direct
 messages and explicit addresses already commit to a response under the connector's
 participation policy. The agent's tools and permission rules are unchanged; the
 participation prompt asks for no tools and client callbacks are refused in that
