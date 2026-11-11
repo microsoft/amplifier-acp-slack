@@ -28,7 +28,7 @@ whether it can be resumed. The current driver records `session_replaced` and
 creates a new session after
 a non-authentication load failure, rebuilding context from Slack. This describes
 the implementation; it does not establish successful restoration or an exception
-to the shared [preservation and recovery intent](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/harness-lifecycle.v1-candidate.md).
+to the shared [preservation and recovery intent](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md).
 Evaluate that path when changing recovery behavior. Session separation here is
 routing, not an assertion about
 the backend's memory or filesystem isolation.

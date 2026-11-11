@@ -1,6 +1,6 @@
 # Public speech, activity and source continuity
 
-The shared [conversation-delivery agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/conversation-delivery.v1-candidate.md)
+The shared [interaction agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/interaction.md)
 owns the meaning of public speech and delivery. This document describes its
 Slack placement and optional attention integration. [Work status](work-status.md)
 owns temporary indicators and their cleanup.
@@ -54,4 +54,4 @@ delivery facts inform its social judgment. They do not grant task authority,
 prove completion or automatically suppress another reply. An ordinary ACP agent
 without this capability retains the existing input path.
 
-See the [family harness contract](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/harness-lifecycle.v1-candidate.md).
+See the [work continuity agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md).
