@@ -11,7 +11,7 @@ standard stdio command. Runtime code has no dependency on Agent Instance. A remo
 stdio endpoint can be launched through a deliberately configured SSH command;
 `acp.cwd` is an absolute directory on the agent's host, not the connector's host.
 Native network transports can be added as separate transport implementations as
-ACP standardizes them. This release does not call its management HTTP API ACP.
+ACP standardizes them. Its management HTTP API is not ACP.
 
 ## Conversation/session routing
 
@@ -24,8 +24,13 @@ the endpoint, loads the recorded session when `agentCapabilities.loadSession` is
 advertised, or creates a session otherwise. It sends a bounded current Slack view
 for that context. The endpoint supplies its own identity and instructions. Native
 session state remains with that endpoint; the connector stores its opaque ID and
-whether it can be resumed. Failed session restoration is recorded and the context
-is rebuilt explicitly. Session separation here is routing, not an assertion about
+whether it can be resumed. The current driver records `session_replaced` and
+creates a new session after
+a non-authentication load failure, rebuilding context from Slack. This describes
+the implementation; it does not establish successful restoration or an exception
+to the shared [preservation and recovery intent](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/harness-lifecycle.v1-candidate.md).
+Evaluate that path when changing recovery behavior. Session separation here is
+routing, not an assertion about
 the backend's memory or filesystem isolation.
 
 If ACP initialization fails, the connector terminates that process and attempts
@@ -63,8 +68,8 @@ a partly delivered response is not presented as wholly received.
 ### Generated responses and actual delivery
 
 ACP history can contain a response that the connector withheld after a newer
-Slack message arrived. Version 0.3.1 tells the next turn explicitly that this
-draft was not posted. An already queued job receives that notice without losing
+Slack message arrived. The next turn is told explicitly that this draft was not
+posted. An already queued job receives that notice without losing
 its newer trigger, and coalescing preserves it.
 
 Every prompt also includes `response_delivery`: at most twelve recent completed
@@ -115,7 +120,7 @@ select a conversation, set filters, focus a control, scroll, and open/close a mo
 The browser acknowledges the revision after applying it. Secret fields use the
 write-only credential endpoint rather than the draft/view channel.
 
-## Embedding in a future fleet experience
+## Composing management clients
 
 Use `?embed=1` to hide the standalone navigation. Assets and API URLs are relative,
 so a parent can place an authenticated same-origin proxy under a component path.
