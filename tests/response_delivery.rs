@@ -258,12 +258,76 @@ fn hourly_model_capacity_defers_the_same_job_instead_of_losing_it() {
 }
 
 #[test]
-fn bot_continuation_is_owner_opt_in_and_keeps_hourly_limits() {
+fn completed_peer_handoff_survives_old_human_gate_and_restart_without_repeating_work() {
+    for cooldown in [0, 60] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let mut c = config();
+        c.attention.max_bot_replies_without_human = 1;
+        c.attention.bot_exchange_cooldown_seconds = cooldown;
+        let mut bot = message("1.000001");
+        bot.bot = true;
+        s.ingest("one", &bot, true).unwrap();
+        let j = s.claim(&c.attention).unwrap().unwrap();
+        s.finish(&j, speak(), &c.attention).unwrap();
+        let out = s.claim_outgoing(&c).unwrap().unwrap();
+        s.delivery(&out.id, "sent", Some("2.000001"), "", 0)
+            .unwrap();
+        bot.ts = "3.000001".into();
+        bot.revision = bot.ts.clone();
+        s.ingest("two", &bot, true).unwrap();
+        let handoff = s.claim(&c.attention).unwrap().unwrap();
+        s.finish(&handoff, speak(), &c.attention).unwrap();
+        // A prior connector saved this completed contribution without ever
+        // attempting Slack delivery. Loading it must not require a human reply.
+        s.db.execute("UPDATE outbox SET note='Agent exchange paused until a person responds',available=0 WHERE job_id=?1", [&handoff.id]).unwrap();
+        let id: String =
+            s.db.query_row(
+                "SELECT id FROM outbox WHERE job_id=?1",
+                [&handoff.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        s.recover().unwrap();
+        let delivered = s
+            .claim_outgoing(&c)
+            .unwrap()
+            .expect("completed peer handoff should be deliverable without a human reply");
+        assert_eq!(delivered.id, id);
+        assert_eq!(delivered.text, "PRIVATE DRAFT");
+        assert!(s.claim(&c.attention).unwrap().is_none());
+        assert_eq!(
+            s.db.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        // A crash after claiming that same send is still uncertain: lifting the
+        // old peer gate must never grant a second dispatch of unknown delivery.
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        s.recover().unwrap();
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+        assert_eq!(
+            receipt(
+                &s.response_delivery(&handoff.context, "future").unwrap(),
+                &handoff.id
+            )["status"],
+            "uncertain"
+        );
+        s.echo(&id, "4.000001").unwrap();
+        assert!(s.claim_outgoing(&c).unwrap().is_none());
+    }
+}
+
+#[test]
+fn peer_handoffs_keep_common_hourly_pacing_and_source_validation() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path()).unwrap();
     let mut c = config();
-    c.attention = attention();
     c.attention.max_bot_replies_without_human = 1;
+    c.attention.max_replies_per_context_per_hour = 1;
     let mut bot = message("1.000001");
     bot.bot = true;
     s.ingest("one", &bot, true).unwrap();
@@ -275,23 +339,30 @@ fn bot_continuation_is_owner_opt_in_and_keeps_hourly_limits() {
     bot.ts = "3.000001".into();
     bot.revision = bot.ts.clone();
     s.ingest("two", &bot, true).unwrap();
-    let j = s.claim(&c.attention).unwrap().unwrap();
-    s.finish(&j, speak(), &c.attention).unwrap();
+    let handoff = s.claim(&c.attention).unwrap().unwrap();
+    s.finish(&handoff, speak(), &c.attention).unwrap();
     assert!(s.claim_outgoing(&c).unwrap().is_none());
+    let facts = s.response_delivery(&handoff.context, "future").unwrap();
+    assert_eq!(receipt(&facts, &handoff.id)["status"], "pending");
+    assert!(receipt(&facts, &handoff.id)["retry_at"].is_number());
     s.db.execute(
-        "UPDATE outbox SET attempted=attempted-61000 WHERE attempted>0",
+        "UPDATE outbox SET attempted=attempted-3601000 WHERE attempted>0",
         [],
     )
     .unwrap();
-    s.db.execute("UPDATE outbox SET available=0", []).unwrap();
-    assert!(s.claim_outgoing(&c).unwrap().is_none()); // legacy human gate still applies
-    c.attention.bot_exchange_cooldown_seconds = 60;
-    c.attention.max_replies_per_context_per_hour = 1;
-    s.db.execute("UPDATE outbox SET available=0", []).unwrap();
-    assert!(s.claim_outgoing(&c).unwrap().is_none()); // opting in never bypasses hourly budget
-    c.attention.max_replies_per_context_per_hour = 30;
-    s.db.execute("UPDATE outbox SET available=0", []).unwrap();
-    assert!(s.claim_outgoing(&c).unwrap().is_some());
+    s.db.execute("UPDATE outbox SET available=0 WHERE status='ready'", [])
+        .unwrap();
+    bot.deleted = true;
+    bot.revision = "3.000002".into();
+    s.ingest("delete", &bot, false).unwrap();
+    assert!(s.claim_outgoing(&c).unwrap().is_none());
+    assert_eq!(
+        receipt(
+            &s.response_delivery(&handoff.context, "future").unwrap(),
+            &handoff.id
+        )["status"],
+        "not_delivered"
+    );
 }
 
 #[test]

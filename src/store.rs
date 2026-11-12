@@ -829,24 +829,9 @@ pub(crate) fn delivery_wait(
             Some(room_oldest + 3600001),
         )));
     }
-    let burst: i64 = db.query_row("SELECT bot_replies FROM contexts WHERE id=?1", [ctx], |r| {
-        r.get(0)
-    })?;
-    if m.bot && burst >= a.max_bot_replies_without_human as i64 {
-        if a.bot_exchange_cooldown_seconds == 0 {
-            return Ok(Some((
-                "Agent exchange paused until a person responds".into(),
-                None,
-            )));
-        }
-        let until = last + a.bot_exchange_cooldown_seconds as i64 * 1000;
-        if now < until {
-            return Ok(Some((
-                "Agent collaboration pause; resumes automatically".into(),
-                Some(until),
-            )));
-        }
-    }
+    // The agent already chose this contribution. Peer exchanges use the same
+    // delivery pacing as human replies; they do not require a person to unlock
+    // an already completed handoff.
     let until = last + a.minimum_reply_interval_seconds as i64 * 1000;
     if now < until {
         return Ok(Some((
@@ -860,19 +845,14 @@ pub(crate) fn delivery_wait(
 pub(crate) fn reserve_reply(
     db: &Connection,
     trigger: &Message,
-    a: &Attention,
-    now: i64,
+    _a: &Attention,
+    _now: i64,
 ) -> Result<()> {
-    let last: i64 = db.query_row(
-        "SELECT COALESCE(MAX(attempted),0) FROM reply_activity WHERE context=?1",
-        [trigger.context()],
-        |r| r.get(0),
-    )?;
-    let reset = a.bot_exchange_cooldown_seconds > 0
-        && now - last >= a.bot_exchange_cooldown_seconds as i64 * 1000;
+    // Retain the diagnostic counter without letting deprecated policy fields
+    // change delivery. Existing history requires no migration or reset.
     db.execute(
-        "UPDATE contexts SET bot_replies=CASE WHEN ?2 THEN 1 ELSE bot_replies+1 END WHERE id=?1",
-        params![trigger.context(), reset],
+        "UPDATE contexts SET bot_replies=bot_replies+1 WHERE id=?1",
+        [trigger.context()],
     )?;
     Ok(())
 }

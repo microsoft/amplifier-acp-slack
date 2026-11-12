@@ -649,7 +649,10 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     }
     let input = &diagnostic_input;
     let ambient = host_attention || optional_participation(c, input);
-    let instruction = if ambient {
+    let continuation = input.get("accepted_work_continuation").is_some();
+    let instruction = if continuation {
+        "Continue the already accepted work using its existing results and current dependencies. Report a meaningful new result or blocker when there is one; a completed inspection or bookkeeping step does not require another public reply. If nothing useful needs saying, finish quietly or return {\"decision\":\"pass\",\"reason\":\"brief operational reason\"}. Silence does not declare the underlying work complete. Do not repeat prior work, uncertain effects or already delivered statements."
+    } else if ambient {
         "Read the room. Contribute only when useful and timely. Silence is normal; do not acknowledge merely to take a turn or repeat a settled point. Return exactly one final JSON object: {\"decision\":\"speak\",\"text\":\"your concise contribution\",\"reason\":\"brief operational reason\"} or {\"decision\":\"pass\",\"reason\":\"brief operational reason\"}. This optional participation convention is a prompt contract, not a special ACP capability."
     } else {
         "You have been addressed directly or in a one-to-one direct message. Respond to the user's message, even if it only needs a brief acknowledgment; the group's optional participation rule does not apply. Reply with the final text to send here, without a decision JSON wrapper. The sole silence exception is an explicit user request not to reply; then return {\"decision\":\"pass\",\"reason\":\"explicit_silence_request\"}."
@@ -1000,6 +1003,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 continue;
             }
             if !ambient
+                && !continuation
                 && !retried_direct
                 && parse_decision(&output)
                     .is_ok_and(|d| d.decision == "pass" && d.reason != "explicit_silence_request")
@@ -1020,13 +1024,32 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 output = "The agent returned attachment content.".into();
             }
             output = crate::followup::capture(home, c, input, &output)?;
+            let quiet_continuation = continuation
+                && (output.trim().is_empty()
+                    || parse_decision(&output).is_ok_and(|d| d.decision == "pass"));
+            if quiet_continuation
+                && (!tool_observations_complete
+                    || !callbacks.is_empty()
+                    || tool_calls
+                        .values()
+                        .any(|u| !matches!(u["status"].as_str(), Some("completed" | "failed"))))
+            {
+                return Err(crate::diagnostics::Failure::unsettled_terminal().into());
+            }
             let late_speech = public_speech.terminal(true);
             let scheduled_check: bool = store.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM followups WHERE parent=?1 AND status='proposed')",
                 [input["job_id"].as_str().unwrap_or("")],
                 |r| r.get(0),
             )?;
-            let mut d = if output.trim().is_empty()
+            let mut d = if quiet_continuation {
+                Decision {
+                    decision: "pass".into(),
+                    text: String::new(),
+                    reason: "Accepted work inspected; no new public reply".into(),
+                    media: vec![],
+                }
+            } else if output.trim().is_empty()
                 && (public_utterances > 0 || !late_speech.is_empty() || scheduled_check)
             {
                 Decision {
@@ -1305,7 +1328,7 @@ pub fn parse_decision(text: &str) -> Result<Decision> {
 }
 fn direct_reply(text: &str) -> Result<Decision> {
     let text = text.trim();
-    ensure!(!text.is_empty(), "Agent returned no reply");
+    ensure!(!text.is_empty(), crate::diagnostics::Failure::answer());
     // Accept a structured response from a backend that retained the ambient
     // instruction when its participation setting changed, without leaking JSON.
     if let Ok(d) = parse_decision(text) {

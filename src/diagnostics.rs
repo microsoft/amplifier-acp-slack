@@ -34,6 +34,13 @@ impl Failure {
             delivery: "unknown",
         }
     }
+    pub fn unsettled_terminal() -> Self {
+        Self {
+            stage: "prompt_terminal",
+            category: "unsettled_operations",
+            delivery: "unknown",
+        }
+    }
     pub fn refused() -> Self {
         Self {
             stage: "prompt_terminal",
@@ -58,6 +65,9 @@ impl Failure {
             }
             "turn_limit_unsettled" => {
                 "The agent reached its turn limit with unresolved operations. Their outcome must be checked before continuing; no work was repeated."
+            }
+            "unsettled_operations" => {
+                "The agent ended its turn with unresolved operations. Their outcome must be checked before continuing; no work was repeated."
             }
             "refusal" => {
                 "The agent declined to continue this request. No automatic retry was scheduled."
@@ -98,6 +108,7 @@ pub fn recorded_summary(
         Some("not_forwarded") => Some(Failure::not_forwarded().summary()),
         Some("turn_limit") => Some(Failure::turn_limit().summary()),
         Some("turn_limit_unsettled") => Some(Failure::unsettled_limit().summary()),
+        Some("unsettled_operations") => Some(Failure::unsettled_terminal().summary()),
         Some("refusal") => Some(Failure::refused().summary()),
         _ => None,
     })

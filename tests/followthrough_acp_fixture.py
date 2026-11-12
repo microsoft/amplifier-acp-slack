@@ -33,7 +33,15 @@ for line in sys.stdin:
             out({'id':i,'error':error});continue
         if not v.get('accepted_work_continuation'):
             starts=root/(channel+'-starts');assert not starts.exists();starts.write_text('1')
-            if channel=='Dbackground':
+            if channel.startswith('Dquiet'):
+                # The initial response schedules an existing-work inspection.
+                # A later quiet terminal must not manufacture another reply.
+                args={'name':'slack_follow_up','arguments':{'after_seconds':5,'goal':'Inspect existing results; remain quiet when nothing new needs reporting.'}}
+                assert rpc('tools/call',args)['structuredContent']['scheduled']
+                result={'stopReason':'end_turn'}
+            elif channel=='Dempty':
+                result={'stopReason':'end_turn'}
+            elif channel=='Dbackground':
                 result_file=root/'background-result'
                 # A real disposable background process fails after the ACP turn.
                 subprocess.Popen([sys.executable,'-c',"import pathlib,sys,time;time.sleep(1);pathlib.Path(sys.argv[1]).write_text('failed: test run exited 6');sys.exit(6)",str(result_file)],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
@@ -58,7 +66,17 @@ for line in sys.stdin:
                 result={'stopReason':'max_turn_requests'}
         else:
             assert sid=='original-fixture'
-            if channel.startswith('Cpeer'):
+            if channel.startswith('Dquiet'):
+                (root/(channel+'-continuation-prompt')).write_text(text)
+                update(sessionUpdate='tool_call',toolCallId='existing-check',kind='read',title='Inspect existing results',status='in_progress')
+                if channel!='Dquietunsettled':
+                    update(sessionUpdate='tool_call_update',toolCallId='existing-check',status='completed')
+                if channel=='Dquiettransport':
+                    sys.exit(0) # no correlated prompt terminal; still unknown
+                assert rpc('tools/call',{'name':'slack_follow_up','arguments':{'after_seconds':0}})['structuredContent']['cancelled']
+                if channel=='Dquietpass':
+                    speak(json.dumps({'decision':'pass','reason':'Waiting on an existing dependency; no new result.'}))
+            elif channel.startswith('Cpeer'):
                 assert json.loads((root/(channel+'-source')).read_text())==v['trigger']
                 assert v['accepted_work_continuation']['maximum_turns'] is None
                 assert v['accepted_work_continuation']['deadline'] is None
