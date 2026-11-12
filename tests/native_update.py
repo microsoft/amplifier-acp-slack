@@ -59,6 +59,19 @@ class NativeUpdateTests(unittest.TestCase):
   with patch.object(worker,'stop') as stop:
    worker.apply();stop.assert_not_called()
   self.assertEqual(worker.job['state'],'succeeded');self.assertFalse(worker.job['changed'])
+ def test_replacement_launch_is_durable_before_process_dispatch(self):
+  from types import SimpleNamespace
+  worker=self.worker();worker.save('verifying',binary_sha256=u.digest(self.binary))
+  launches=[]
+  def spawn(command,**kwargs):
+   journal=u.read(worker.file);launch=journal.get('launch')
+   self.assertIsInstance(launch,dict,'A replacement launch must be recorded before Popen')
+   self.assertEqual(launch['mode'],'candidate');self.assertEqual(launch['binary_sha256'],u.digest(self.binary))
+   self.assertEqual(kwargs['env']['ACP_SLACK_UPDATE_PLAN'],self.id)
+   self.assertEqual(kwargs['env']['ACP_SLACK_UPDATE_LAUNCH'],launch['nonce']);launches.append(launch['nonce'])
+   return SimpleNamespace(pid=123)
+  with patch.object(u.subprocess,'Popen',side_effect=spawn):worker.start();worker.start()
+  self.assertNotEqual(launches[0],launches[1],'Each dispatch invalidates prior launch identity')
  def test_replace_keeps_other_installation_state_and_recovers_missing_runtime_dir(self):
   (self.home/'secrets/token').write_bytes(b'private');(self.home/'runtime/old').write_bytes(b'old');candidate=self.folder/'binary';candidate.write_bytes(b'new');runtime=self.folder/'new-runtime';runtime.mkdir();(runtime/'new').write_bytes(b'new-runtime')
   self.worker().replace(candidate,runtime);self.assertEqual(self.binary.read_bytes(),b'new');self.assertEqual((self.home/'runtime/new').read_bytes(),b'new-runtime');self.assertEqual((self.home/'secrets/token').read_bytes(),b'private')

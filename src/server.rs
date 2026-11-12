@@ -1111,6 +1111,15 @@ pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()>
     install_redacted_panic_hook();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let home = home.canonicalize()?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("service.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .context("This adapter already has a running service")?;
+    let runtime_allowed = crate::native_update::validate_launch(&home)?;
     let state = Arc::new(AppState::open(home)?);
     if state.instance_config().server.auth_mode == AuthMode::Pam {
         ensure!(
@@ -1128,14 +1137,6 @@ pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()>
             "Run this adapter service as its configured installation owner"
         );
     }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(state.home.join("service.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("This adapter already has a running service")?;
     let c = state.instance_config();
     let bind: IpAddr = c.server.bind.parse()?;
     let listener = TcpListener::bind((bind, c.server.port))
@@ -1221,10 +1222,17 @@ pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()>
     crate::updates::recover(&state.home);
     let runtime_home = state.home.clone();
     let changes = state.changes.subscribe();
-    let runtime_task = tokio::spawn(monitor_runtime(
-        state.clone(),
-        runtime::supervise(runtime_home, changes),
-    ));
+    let runtime_task = if runtime_allowed {
+        Some(tokio::spawn(monitor_runtime(
+            state.clone(),
+            runtime::supervise(runtime_home, changes),
+        )))
+    } else {
+        *state.runtime_failure.write().unwrap() = Some(
+            json!({"state":"stopped","reason":"Update recovery needs attention. Management remains available; the Slack connection has not been started.","connections":[]}),
+        );
+        None
+    };
     let handle = axum_server::Handle::new();
     *state.shutdown.lock().unwrap() = Some(handle.clone());
     let shutdown = handle.clone();
@@ -1264,8 +1272,10 @@ pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()>
             .serve(router(state.clone()).into_make_service())
             .await
     };
-    runtime_task.abort();
-    let _ = runtime_task.await;
+    if let Some(runtime_task) = runtime_task {
+        runtime_task.abort();
+        let _ = runtime_task.await;
+    }
     crate::work_status::shutdown(&state.home).await;
     signal_task.abort();
     result?;

@@ -18,6 +18,8 @@ For an independent native installation, open **Settings â†’ Advanced settings â†
 
 Only the connector executable and its private setup runtime change. A failed verification restores the previous versions. Credentials, agent configuration and conversation databases are never rewound. **Restore previous version** uses the retained backup. An interrupted pre-cutover request can be closed through **Recover interrupted update** without redispatching it. Critical-phase recovery restores the retained previous executable/runtime. If automatic recovery is incomplete, the UI reports it and admission stays closed; retain the installation folder and its `native-updates` receipts for recovery rather than deleting or recreating it.
 
+Reopening an interrupted installation keeps its management and recovery controls available without starting the Slack connection. Unreadable update records are reported and preserved. A replacement process may start only for its still-current saved launch intent, so an old delayed process cannot cross a newer recovery operation.
+
 An installation with externally enrolled saved-connection/update controls keeps that owner; this native updater does not compete with it. Existing Linux systemd update controls are unchanged. No separate fleet service or new scheduler is required.
 
 ## Management surface

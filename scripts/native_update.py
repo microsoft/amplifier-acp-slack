@@ -180,7 +180,13 @@ class Worker:
         finally:
             if handle:kernel.CloseHandle(handle)
     def start(self):
-        kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL}
+        mode={'verifying':'candidate','rolling_back':'rollback'}.get(self.job['state'])
+        if mode is None:raise RuntimeError('replacement_launch_phase_invalid')
+        nonce=str(uuid.uuid4());expected=self.job['binary_sha256' if mode=='candidate' else 'previous_sha256']
+        if digest(self.binary)!=expected:raise RuntimeError('replacement_launch_bytes_changed')
+        self.save(launch={'nonce':nonce,'mode':mode,'binary_sha256':expected})
+        env={**os.environ,'ACP_SLACK_UPDATE_PLAN':self.id,'ACP_SLACK_UPDATE_LAUNCH':nonce}
+        kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL,'env':env}
         if os.name=='nt':kwargs['creationflags']=subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP
         else:kwargs['start_new_session']=True
         self.started_process=subprocess.Popen([str(self.binary),'--home',str(self.home),'serve'],**kwargs)
@@ -210,7 +216,9 @@ class Worker:
         if (self.home/'runtime').exists():durable_replace(self.home/'runtime',runtime_old)
         durable_replace(runtime_next,self.home/'runtime')
     def rollback(self,reason):
-        self.save('rolling_back',reason=reason);self.gate()
+        # Supersede a candidate whose Popen may have completed before its worker
+        # died. The service validates this journal under service.lock before state.
+        self.save('rolling_back',reason=reason,launch=None);self.gate()
         try:self.stop()
         except (OSError,RuntimeError):
             # Our candidate may own the lock before its API is listening. Reconcile
@@ -269,7 +277,7 @@ class Worker:
             with locked(self.home/'service.lock',False):
                 self.guard_ownership()
                 if digest(self.home/'adapter.json')!=self.job['config_sha256']:raise RuntimeError('configuration_changed')
-                with sqlite3.connect(self.home/'state.sqlite3') as db,sqlite3.connect(backup/'state.sqlite3') as out:db.backup(out)
+                with contextlib.closing(sqlite3.connect(self.home/'state.sqlite3')) as db,contextlib.closing(sqlite3.connect(backup/'state.sqlite3')) as out:db.backup(out)
                 protected=self.protected();write(backup/'protected.json',protected)
                 staged_runtime=self.folder/'runtime-candidate';shutil.copytree(resources/'runtime',staged_runtime,dirs_exist_ok=True);write(staged_runtime/'native-bundle.json',manifest)
                 self.save('swapping');self.replace(candidate,staged_runtime);self.save('verifying')

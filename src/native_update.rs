@@ -13,6 +13,13 @@ use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, sync::Arc};
 const SCRIPT: &[u8] = include_bytes!("../scripts/native_update.py");
 fn read(path: &Path) -> Result<Value> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= 4 * 1024 * 1024,
+        "Native update record is not a bounded ordinary file"
+    );
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 fn allowed(home: &Path) -> Result<()> {
@@ -32,28 +39,109 @@ fn allowed(home: &Path) -> Result<()> {
     );
     Ok(())
 }
-pub fn active(home: &Path) -> Option<Value> {
+pub fn active(home: &Path) -> Result<Option<Value>> {
     let root = home.join("native-updates");
-    let id = read(&root.join("active.json")).ok()?["id"]
-        .as_str()?
-        .to_owned();
-    let uuid = uuid::Uuid::parse_str(&id).ok()?;
-    if uuid.to_string() != id {
-        return None;
+    let marker = root.join("active.json");
+    match std::fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => (),
     }
-    read(&root.join(id).join("plan.json")).ok()
+    let marker = read(&marker)?;
+    let id = marker["id"]
+        .as_str()
+        .context("Native update identity is invalid")?;
+    ensure!(
+        uuid::Uuid::parse_str(id)?.to_string() == id,
+        "Native update identity is invalid"
+    );
+    let job = read(&root.join(id).join("plan.json"))?;
+    ensure!(
+        job["schema"] == 1
+            && job["id"] == id
+            && matches!(job["action"].as_str(), Some("check" | "apply" | "rollback"))
+            && matches!(
+                job["state"].as_str(),
+                Some(
+                    "queued"
+                        | "checking"
+                        | "draining"
+                        | "ready"
+                        | "deferred"
+                        | "stopping"
+                        | "swapping"
+                        | "verifying"
+                        | "rolling_back"
+                        | "recovery_required"
+                        | "succeeded"
+                        | "rolled_back"
+                        | "failed"
+                )
+            ),
+        "Native update state is invalid; saved evidence was preserved"
+    );
+    Ok(Some(job))
 }
 pub fn blocks(home: &Path) -> bool {
-    active(home).is_some_and(|j| {
-        [
-            "stopping",
-            "swapping",
-            "verifying",
-            "rolling_back",
-            "recovery_required",
-        ]
-        .contains(&j["state"].as_str().unwrap_or(""))
+    active(home).map_or(true, |job| {
+        job.is_some_and(|j| {
+            [
+                "stopping",
+                "swapping",
+                "verifying",
+                "rolling_back",
+                "recovery_required",
+            ]
+            .contains(&j["state"].as_str().unwrap_or(""))
+        })
     })
+}
+/// Called while holding service.lock, before opening state or starting a listener.
+/// A replacement may start only for the still-current durable launch intent.
+pub fn validate_launch(home: &Path) -> Result<bool> {
+    let plan = std::env::var("ACP_SLACK_UPDATE_PLAN").ok();
+    let nonce = std::env::var("ACP_SLACK_UPDATE_LAUNCH").ok();
+    validate_launch_intent(home, plan.as_deref(), nonce.as_deref())
+}
+fn validate_launch_intent(home: &Path, plan: Option<&str>, nonce: Option<&str>) -> Result<bool> {
+    if plan.is_none() && nonce.is_none() {
+        // Ordinary app opening must retain its existing management/recovery UI.
+        // Unresolved state permits that UI but never starts the Slack runtime.
+        return Ok(!blocks(home));
+    }
+    let job = active(home)?.context("No update owns this launch")?;
+    let plan = plan.context("Missing update launch identity")?;
+    let nonce = nonce.context("Missing update launch identity")?;
+    ensure!(
+        uuid::Uuid::parse_str(nonce)?.to_string() == nonce,
+        "Invalid update launch identity"
+    );
+    let mode = if job["state"] == "verifying" {
+        "candidate"
+    } else if job["state"] == "rolling_back" {
+        "rollback"
+    } else {
+        anyhow::bail!("Update launch was superseded")
+    };
+    ensure!(
+        job["id"] == plan && job["launch"]["nonce"] == nonce && job["launch"]["mode"] == mode,
+        "Update launch was superseded"
+    );
+    let expected = if mode == "candidate" {
+        &job["binary_sha256"]
+    } else {
+        &job["previous_sha256"]
+    };
+    use sha2::{Digest, Sha256};
+    let actual = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(std::env::current_exe()?)?)
+    );
+    ensure!(
+        job["launch"]["binary_sha256"] == *expected && expected.as_str() == Some(actual.as_str()),
+        "Update launch executable changed"
+    );
+    Ok(true)
 }
 fn worker_guard(home: &Path) -> Result<std::fs::File> {
     let path = home.join("native-updates/worker.lock");
@@ -68,7 +156,13 @@ fn worker_guard(home: &Path) -> Result<std::fs::File> {
 }
 pub fn status(home: &Path) -> Value {
     let support = allowed(home);
-    let mut current = active(home);
+    let (mut current, journal_error) = match active(home) {
+        Ok(current) => (current, None),
+        Err(error) => (
+            None,
+            Some(format!("Update state needs inspection: {error}")),
+        ),
+    };
     if let Some(job) = current.as_mut() {
         let running = match std::fs::File::open(home.join("native-updates/worker.lock")) {
             Ok(file) => match fs2::FileExt::try_lock_exclusive(&file) {
@@ -102,7 +196,7 @@ pub fn status(home: &Path) -> Value {
                 .contains(&job["state"].as_str().unwrap_or(""))
         );
     }
-    json!({"supported":support.is_ok(),"reason":support.err().map(|e|e.to_string()),"repository":"microsoft/amplifier-acp-slack","source":"published releases","current":current})
+    json!({"supported":support.is_ok(),"reason":support.err().map(|e|e.to_string()).or(journal_error.clone()),"journal_error":journal_error,"repository":"microsoft/amplifier-acp-slack","source":"published releases","current":current})
 }
 pub async fn get(State(s): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     auth::check(&s, &headers, "admin", false)?;
@@ -154,7 +248,7 @@ fn queue(home: &Path, input: Command) -> Result<Value> {
         );
         return Ok(previous);
     }
-    if let Some(job) = active(home) {
+    if let Some(job) = active(home)? {
         let recovery = ["recover", "rollback"].contains(&input.action.as_str())
             && input.plan_id.is_some_and(|id| job["id"] == id.to_string());
         ensure!(
@@ -258,6 +352,9 @@ fn queue(home: &Path, input: Command) -> Result<Value> {
         );
     }
     job["critical_recovery"] = json!(critical_recovery);
+    // Invalidate any process spawned by an earlier request before recovery can
+    // dispatch. Its original PID may be unknown after a worker crash.
+    job["launch"] = Value::Null;
     job["action"] = json!(effective_action);
     job["request_action"] = json!(input.action);
     job["updated_at"] = json!(crate::model::now_ms());
@@ -335,7 +432,9 @@ pub async fn stop(
 ) -> ApiResult<Json<Value>> {
     auth::check(&s, &headers, "admin", true)?;
     allowed(&s.home).map_err(|e| ApiError::bad(e.to_string()))?;
-    let job = active(&s.home).ok_or_else(ApiError::missing)?;
+    let job = active(&s.home)
+        .map_err(|e| ApiError::bad(e.to_string()))?
+        .ok_or_else(ApiError::missing)?;
     if job["id"] != input.plan_id.to_string()
         || !["stopping", "rolling_back"].contains(&job["state"].as_str().unwrap_or(""))
     {
@@ -369,12 +468,76 @@ mod tests {
         .unwrap();
         config::private_write(
             &root.join(&id).join("plan.json"),
-            json!({"id":id,"state":phase,"action":"check","created_at":1})
+            json!({"schema":1,"id":id,"state":phase,"action":"check","created_at":1})
                 .to_string()
                 .as_bytes(),
         )
         .unwrap();
         (dir, id)
+    }
+    #[test]
+    fn invalid_existing_journal_preserves_closed_admission() {
+        for invalid_marker in [false, true] {
+            let (dir, id) = fixture("verifying");
+            let root = dir.path().join("native-updates");
+            let path = if invalid_marker {
+                root.join("active.json")
+            } else {
+                root.join(id).join("plan.json")
+            };
+            std::fs::write(&path, b"{interrupted").unwrap();
+            assert!(
+                blocks(dir.path()),
+                "Existing unreadable state is not no update"
+            );
+            assert!(
+                queue(
+                    dir.path(),
+                    Command {
+                        action: "check".into(),
+                        request_id: uuid::Uuid::new_v4(),
+                        plan_id: None
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(path).unwrap(), b"{interrupted");
+        }
+    }
+    #[test]
+    fn delayed_launch_cannot_cross_recovery_or_a_new_launch_nonce() {
+        use sha2::{Digest, Sha256};
+        let (dir, id) = fixture("verifying");
+        let file = dir
+            .path()
+            .join("native-updates")
+            .join(&id)
+            .join("plan.json");
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())
+        );
+        let mut job = read(&file).unwrap();
+        job["binary_sha256"] = json!(digest);
+        job["previous_sha256"] = json!(digest);
+        job["launch"] = json!({"nonce":nonce,"mode":"candidate","binary_sha256":digest});
+        config::private_write(&file, &serde_json::to_vec(&job).unwrap()).unwrap();
+        assert!(validate_launch_intent(dir.path(), Some(&id), Some(&nonce)).is_ok());
+        assert!(!validate_launch_intent(dir.path(), None, None).unwrap());
+        job["state"] = json!("rolling_back");
+        job["launch"] = Value::Null;
+        config::private_write(&file, &serde_json::to_vec(&job).unwrap()).unwrap();
+        assert!(validate_launch_intent(dir.path(), Some(&id), Some(&nonce)).is_err());
+        let next = uuid::Uuid::new_v4().to_string();
+        job["launch"] = json!({"nonce":next,"mode":"rollback","binary_sha256":digest});
+        config::private_write(&file, &serde_json::to_vec(&job).unwrap()).unwrap();
+        assert!(validate_launch_intent(dir.path(), Some(&id), Some(&nonce)).is_err());
+        assert!(validate_launch_intent(dir.path(), Some(&id), Some(&next)).is_ok());
+        job["state"] = json!("rolled_back");
+        config::private_write(&file, &serde_json::to_vec(&job).unwrap()).unwrap();
+        assert!(validate_launch_intent(dir.path(), Some(&id), Some(&next)).is_err());
+        assert!(validate_launch_intent(dir.path(), None, None).is_ok());
     }
     #[test]
     fn interrupted_pre_cutover_request_closes_without_redispatch() {

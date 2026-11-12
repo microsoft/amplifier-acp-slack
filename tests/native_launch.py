@@ -15,6 +15,41 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 import zipfile
+import uuid
+
+def superseded_launch(binary,home,env):
+    """A process carrying the prior launch nonce reaches main after recovery."""
+    root=home/'native-updates';assert not root.exists()
+    plan=str(uuid.uuid4());old_nonce=str(uuid.uuid4());folder=root/plan;folder.mkdir(parents=True)
+    executable=home/'bin'/binary.name;sha=hashlib.sha256(executable.read_bytes()).hexdigest()
+    record={'schema':1,'id':plan,'state':'rolling_back','action':'rollback','previous_sha256':sha,'launch':{'nonce':str(uuid.uuid4()),'mode':'rollback','binary_sha256':sha}}
+    marker=root/'active.json';marker.write_text(json.dumps({'id':plan}),encoding='utf-8');journal=folder/'plan.json';journal.write_text(json.dumps(record),encoding='utf-8')
+    before={p:p.read_bytes()for p in [journal,marker,home/'adapter.json',home/'state.sqlite3']}
+    try:
+        result=subprocess.run([str(executable),'--home',str(home),'serve'],env={**env,'ACP_SLACK_UPDATE_PLAN':plan,'ACP_SLACK_UPDATE_LAUNCH':old_nonce},capture_output=True,text=True,encoding='utf-8',timeout=10)
+        assert result.returncode!=0 and 'Update launch was superseded' in result.stderr,(result.returncode,result.stderr)
+        assert all(p.read_bytes()==data for p,data in before.items()),'Rejected old launch changed saved state'
+        runtime=home/'runtime.json';previous_runtime=runtime.read_bytes()if runtime.exists()else None
+        recovery=subprocess.Popen([str(executable),'--home',str(home),'serve'],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            base=json.loads((home/'endpoints.json').read_text(encoding='utf-8'))['base_url']
+            for _ in range(100):
+                try:
+                    if request(base,'/api/v1/auth/session')[0]==200:break
+                except (OSError,ValueError):pass
+                assert recovery.poll()is None,'Management recovery process exited';time.sleep(.1)
+            else:raise AssertionError('Management recovery did not become available')
+            headers={'Authorization':'Bearer '+(home/'secrets/control-token').read_text(encoding='utf-8').strip()}
+            code,_,status=request(base,'/api/v1/status',headers=headers)
+            assert code==200 and status['runtime']['state']=='stopped'and 'recovery' in status['runtime']['reason']
+            code,_,update=request(base,'/api/v1/desktop/updates',headers=headers)
+            assert code==200 and update['current']['id']==plan
+            journal.write_bytes(b'{damaged');code,_,update=request(base,'/api/v1/desktop/updates',headers=headers)
+            assert code==200 and update['journal_error']and update['current']is None
+            assert journal.read_bytes()==b'{damaged'
+            assert (runtime.read_bytes()if runtime.exists()else None)==previous_runtime,'Recovery management started the Slack runtime'
+        finally:recovery.terminate();recovery.wait(timeout=20)
+    finally:shutil.rmtree(root)
 
 def extract(package,folder):
     if package.name.endswith('.zip'):
@@ -114,6 +149,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                 checks.append('actual checksum-pinned official Slack CLI starts on this platform')
 
         finally:p.terminate();p.wait(timeout=20);log.close()
+        superseded_launch(binary,home,env);checks.extend(['actual superseded replacement refuses startup before state, listener or Slack runtime','management recovery remains available without Slack runtime; damaged journal is reported and preserved'])
         p,base,log=start()
         try:
             assert (home/'adapter.json').read_bytes()==config_bytes
