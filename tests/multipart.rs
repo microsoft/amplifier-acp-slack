@@ -183,3 +183,100 @@ async fn source_deleted_during_delivery_stops_remaining_parts() {
     assert_eq!(state.lock().unwrap().calls.len(), 1);
     task.abort();
 }
+
+#[tokio::test]
+async fn outgoing_fence_layout_keeps_the_first_data_row_and_original_outbox() {
+    let (slack, state, task) = fixture(false).await;
+    let home = tempfile::tempdir().unwrap();
+    let mut store = Store::open(home.path()).unwrap();
+    let (mut out, _) = queued(&mut store);
+    // A plain-text handoff supplied its first data row beside the opening
+    // delimiter. Slack's Markdown converter treats that row as hidden info.
+    let original = "Fixture hashes:\n```clip.mp4 0123456789abcdef\nclip.webm fedcba9876543210```\n\n```sh\nprintf '%s' 'unchanged'\n```";
+    out.text = original.into();
+    store
+        .db
+        .execute(
+            "UPDATE outbox SET text=?1 WHERE id=?2",
+            rusqlite::params![original, out.id],
+        )
+        .unwrap();
+    let store = Arc::new(Mutex::new(store));
+    slack.publish_durable(&out, &store).await.unwrap();
+    let calls = &state.lock().unwrap().calls;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["markdown_text"],
+        "Fixture hashes:\n```\nclip.mp4 0123456789abcdef\nclip.webm fedcba9876543210\n```\n\n```sh\nprintf '%s' 'unchanged'\n```"
+    );
+    assert_eq!(calls[0]["client_msg_id"], out.id);
+    assert!(calls[0].get("text").is_none() && calls[0].get("blocks").is_none());
+    let retained: String = store
+        .lock()
+        .unwrap()
+        .db
+        .query_row("SELECT text FROM outbox WHERE id=?1", [&out.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(retained, original);
+    task.abort();
+}
+
+#[tokio::test]
+async fn restart_uses_saved_parts_even_when_new_layout_changes_the_part_count() {
+    for expanded in [true, false] {
+        let (slack, state, task) = fixture(false).await;
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Store::open(home.path()).unwrap();
+        let (mut out, _) = queued(&mut store);
+        let (first, last) = if expanded {
+            // Adding layout newlines now pushes this old two-part plan over
+            // another boundary. The saved parts must not gain a repeated tail.
+            ("```row x```\n".repeat(750), "```row x```\n".repeat(750))
+        } else {
+            // The current splitter would send this as one message, but an
+            // existing two-part plan has already delivered its first part.
+            ("Earlier part\n".into(), "Remaining part\n".into())
+        };
+        out.text = format!("{first}{last}");
+        let new_parts = acp_slack_adapter::reply_parts::split(&out.text).unwrap();
+        if expanded {
+            assert!(new_parts.len() > 2);
+        } else {
+            assert_eq!(new_parts.len(), 1);
+        }
+        store
+            .db
+            .execute(
+                "UPDATE outbox SET text=?1 WHERE id=?2",
+                rusqlite::params![out.text, out.id],
+            )
+            .unwrap();
+        for (index, id, text, status, ts) in [
+            (0, "saved-first", &first, "sent", Some("9.000001")),
+            (1, "saved-last", &last, "ready", None),
+        ] {
+            store.db.execute("INSERT INTO outbox_parts(outbox_id,part,client_id,text,status,slack_ts) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![out.id,index,id,text,status,ts]).unwrap();
+        }
+        drop(store);
+        let store = Arc::new(Mutex::new(Store::open(home.path()).unwrap()));
+        assert_eq!(
+            slack.publish_durable(&out, &store).await.unwrap(),
+            "9.000001"
+        );
+        let calls = &state.lock().unwrap().calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["client_msg_id"], "saved-last");
+        assert_eq!(calls[0]["markdown_text"], last);
+        let saved: Vec<(i64, String, String, String)> = store.lock().unwrap().db.prepare("SELECT part,client_id,text,status FROM outbox_parts WHERE outbox_id=?1 ORDER BY part").unwrap().query_map([&out.id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(
+            saved,
+            vec![
+                (0, "saved-first".into(), first, "sent".into()),
+                (1, "saved-last".into(), last, "sent".into())
+            ]
+        );
+        task.abort();
+    }
+}

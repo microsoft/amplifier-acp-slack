@@ -26,7 +26,6 @@ use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 const GRANT_LIFETIME_MS: i64 = 30 * 60 * 1000;
 const MAX_MESSAGES: usize = 40;
 const MAX_TEXT_CHARS: usize = 16_000;
-const MAX_MESSAGE_CHARS: usize = 2_000;
 const MAX_LIST_PAGES: usize = 3;
 const MAX_MEMBER_PAGES: usize = 5;
 
@@ -561,11 +560,8 @@ fn messages(
         let Some(ts) = message["ts"].as_str().filter(|s| timestamp(s)) else {
             continue;
         };
-        let content = message["text"].as_str().unwrap_or("");
-        let text: String = content
-            .chars()
-            .take(budget.min(MAX_MESSAGE_CHARS))
-            .collect();
+        let content = crate::message_content::text(message);
+        let text: String = content.chars().take(budget).collect();
         let text_truncated = text.chars().count() < content.chars().count();
         budget -= text.chars().count();
         truncated |= text_truncated;
