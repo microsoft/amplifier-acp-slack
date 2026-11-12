@@ -189,6 +189,22 @@ async def main():
             original = await begin("happy")
             await until(lambda: marker("happy", "inspected").exists(), "quiet coordination and inspectable transcript", timeout=65)
             descriptor = json.loads(marker("happy", "ready").read_text())["descriptor"]
+            # This case asks about a later human join. Accepted MCP work can
+            # still be awaiting Slack delivery when the earlier peer reply is
+            # already readable. Observe its actual delivery and the peer's
+            # settled thread before introducing a distinct human stimulus.
+            await until(lambda: any(p["markdown_text"].startswith("HUDDLE_WORK happy") for p in case_posts("happy")), "routine coordination actually posted before later human join")
+            work_post = next(p for p in case_posts("happy") if p["markdown_text"].startswith("HUDDLE_WORK happy"))
+            await until(lambda: bool(rows(homes["alpha"], "SELECT 1 FROM public_speech WHERE id=? AND status='sent'", (work_post["client_msg_id"],))), "routine post has a confirmed delivery receipt")
+
+            def peer_settled():
+                observed = rows(homes["beta"], "SELECT 1 FROM messages WHERE channel='Chappy' AND json_extract(body,'$.thread')=? AND json_extract(body,'$.text') LIKE 'HUDDLE_WORK happy%'", (descriptor["root_ts"],))
+                terminal = rows(homes["beta"], "SELECT 1 FROM jobs WHERE json_extract(trigger,'$.channel')='Chappy' AND json_extract(trigger,'$.thread')=? AND status IN ('speak','pass')", (descriptor["root_ts"],))
+                active = rows(homes["beta"], "SELECT 1 FROM jobs WHERE json_extract(trigger,'$.channel')='Chappy' AND json_extract(trigger,'$.thread')=? AND status IN ('pending','running')", (descriptor["root_ts"],))
+                return observed and terminal and not active
+
+            await until(peer_settled, "peer observed routine coordination and its side-thread turn is terminal")
+            marker("happy", "before_human_join").write_text(json.dumps({"work_delivery_id": work_post["client_msg_id"], "work_receipt": rows(homes["alpha"], "SELECT status,slack_ts FROM public_speech WHERE id=?", (work_post["client_msg_id"],)), "peer_jobs": rows(homes["beta"], "SELECT id,status,json_extract(trigger,'$.ts') FROM jobs WHERE json_extract(trigger,'$.channel')='Chappy' AND json_extract(trigger,'$.thread')=?", (descriptor["root_ts"],))}))
             snapshot = len(fixture.posts)
             await asyncio.sleep(0.3)
             assert len(fixture.posts) == snapshot and not any(p["markdown_text"].startswith("RESULT ") for p in case_posts("happy"))
