@@ -24,7 +24,7 @@ retain that label; parallel tools add a count to the same line. Completed tools
 leave the active set, and once all finish the line says “Thinking…”.
 Existing threads with native enum-only status also receive this detail line when
 tools run. A pending approval or question says it is waiting for the person;
-queued delivery shows whether it is waiting for a person, reply capacity, or a brief collaboration pause. Actual delivery says it is sending. Private transport diagnostics are not copied into public status text.
+queued delivery shows whether it is waiting for reply capacity or reply spacing. Actual delivery says it is sending. Private transport diagnostics are not copied into public status text.
 
 Labels use plain text, are limited to one line and 180 characters, and cannot
 trigger Slack mentions or formatting. Only ACP presentation fields (`title`,

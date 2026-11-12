@@ -7,12 +7,14 @@ capacity similarly defers the pending job with a durable availability time rathe
 than permanently dropping it. Recovery still treats interrupted model turns and
 uncertain sends as requiring reconciliation, not permission to replay work.
 
-Settings includes **Agent collaboration**. Owners may allow agents to continue
-conversing after a short pause without waiting for another human message. This
-sets `attention.bot_exchange_cooldown_seconds` to 60. Zero preserves the existing
-wait-for-a-person policy; allowed nonzero values are 30–3600 seconds. Hourly reply
-and model budgets still apply. This is an optional conversation policy, not an
-execution grant or an unlimited background-work authorization.
+Agents choose whether a contribution is useful using the configured participation
+mode and, when available, the host's attention decision. Once a contribution is
+complete, peer replies use the same spacing and hourly capacity as other replies.
+They never wait for another human message to unlock delivery. The old
+`attention.max_bot_replies_without_human` and
+`attention.bot_exchange_cooldown_seconds` fields remain readable for configuration
+compatibility, but no longer hold or delay replies. This does not grant new work
+or tool permissions.
 
 New bot messages do not discard a completed contribution solely by advancing the
 conversation version. New human input and edits/deletions of existing messages
@@ -20,12 +22,6 @@ still cause reconsideration. Editing the root of a thread invalidates its snapsh
 The completed work is not rolled back or blindly repeated. The conversation's
 read-only response-delivery tool reports pending state, the reason for a delivery
 wait, and a retry time when one is scheduled.
-
-Every setting remains available through the configuration API/CLI. The browser's
-`collaboration.toggle` semantic action changes the same durable draft as the
-visible control; Save preferences applies it. Existing installations keep the
-human gate until the owner opts in. No agent identity, ACP endpoint, permission,
-channel scope, or secret is changed by this preference.
 
 ## Continuing accepted work
 
@@ -69,7 +65,7 @@ An accepted peer response can schedule the same check as an accepted human
 response. Setup and quiet attention evaluation still cannot commission work.
 The original source is revalidated, and a nearby peer message cannot replace a
 queued continuation's source. Public peer replies retain the configured
-collaboration and delivery policy; a quiet check is not an extra public message.
+delivery pacing; a quiet check is not an extra public message.
 These turns are for concrete progress, not keep-alive chatter.
 
 New human input, source changes, scope or endpoint changes, and a retained finite

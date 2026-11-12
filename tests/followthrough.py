@@ -44,6 +44,27 @@ async def main():
             assert 'existing artifact' in posts('Dlimit')[0]['markdown_text'];assert (work/'Dlimit-starts').read_text()=='1';assert (work/'Dlimit-prompts').read_text()=='2'
             assert all('PARTIAL' not in p['markdown_text'] for p in f.posts)
             print('PASS standard max-turn terminal resumes same session and inspects single existing effect',flush=True)
+            for channel in ['Dquiet','Dquietpass','Dquietunsettled','Dquiettransport']:
+                await f.send(channel,'Inspect the existing result and only report something useful.')
+                expected='failed' if channel in ['Dquietunsettled','Dquiettransport'] else 'pass'
+                await until(lambda:bool(rows(home,"SELECT 1 FROM jobs j JOIN followups f ON f.child=j.id WHERE j.status=? AND json_extract(j.trigger,'$.channel')=?",(expected,channel))),'settled quiet continuation or honest unresolved outcome',20)
+                assert not posts(channel)
+                assert (work/(channel+'-starts')).read_text()=='1'
+                assert (work/(channel+'-prompts')).read_text()=='2'
+                assert 'You have been addressed directly' not in (work/(channel+'-continuation-prompt')).read_text()
+                if expected=='pass':
+                    assert not rows(home,"SELECT 1 FROM audit a JOIN jobs j ON j.id=json_extract(a.data,'$.job') WHERE a.kind='driver_failed' AND json_extract(j.trigger,'$.channel')=?",(channel,))
+                    await until(lambda:not rows(home,"SELECT 1 FROM response_indicators i JOIN jobs j ON j.id=i.job_id WHERE json_extract(j.trigger,'$.channel')=? AND i.state!='finished'",(channel,)),'quiet indicator cleanup')
+                    assert not any(i['channel']==channel and 'couldn’t confirm' in i.get('text','') for i in f.indicator_updates)
+                else:
+                    failure=rows(home,"SELECT a.data FROM audit a JOIN jobs j ON j.id=json_extract(a.data,'$.job') WHERE a.kind='driver_failed' AND json_extract(j.trigger,'$.channel')=?",(channel,))
+                    assert json.loads(failure[-1][0])['delivery']=='unknown'
+            await f.send('Dempty','Please answer this direct request.')
+            await until(lambda:bool(rows(home,"SELECT 1 FROM jobs WHERE status='failed' AND json_extract(trigger,'$.channel')='Dempty'")),'missing direct answer remains a failure')
+            failure=rows(home,"SELECT a.data FROM audit a JOIN jobs j ON j.id=json_extract(a.data,'$.job') WHERE a.kind='driver_failed' AND json_extract(j.trigger,'$.channel')='Dempty'")
+            assert json.loads(failure[-1][0])['category']=='invalid_answer'
+            assert not posts('Dempty') and (work/'Dempty-prompts').read_text()=='1'
+            print('PASS quiet accepted checks finish without filler or false failure; unresolved tools/transport and unanswered direct requests stay distinct',flush=True)
             for channel in ['Cpeer','Cpeerdeleted']:
                 await f.send(channel,'Please check the existing artifact.',user='Ubeta',bot_id='Bbeta')
                 await until(lambda:bool(rows(home,"SELECT 1 FROM followups f JOIN jobs j ON j.id=f.parent WHERE j.status='pass' AND json_extract(j.trigger,'$.channel')=?",(channel,))),'accepted peer quiet check')
