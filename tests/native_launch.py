@@ -9,6 +9,7 @@ import plistlib
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -18,30 +19,61 @@ import xml.etree.ElementTree as ET
 import zipfile
 import uuid
 
+def run_startup_query(powershell,query,env):
+    print('startup-inspection: before-powershell',file=sys.stderr,flush=True)
+    try:
+        return subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-Command',query],env=env,check=True,capture_output=True,timeout=30).stdout
+    except (subprocess.TimeoutExpired,subprocess.CalledProcessError) as error:
+        # Fixed fixture diagnostics only, with no configuration or secret bytes.
+        for stream in (error.stdout,error.stderr):
+            if stream:print(stream.decode('utf-8',errors='replace') if isinstance(stream,bytes) else stream,file=sys.stderr,flush=True)
+        raise
+
 def startup_registration(home,label,env):
     """Read this fresh fixture's actual registration, refusing different owners."""
     assert label=='acp-slack-adapter-'+str(uuid.UUID(label.removeprefix('acp-slack-adapter-')))
     if os.name=='nt':
         query=r"""$ErrorActionPreference='Stop'
+function Mark([string]$phase) { [Console]::Error.WriteLine('startup-inspection: ' + $phase); [Console]::Error.Flush() }
+Mark 'script-entered'
 function OwnerSid([string] $name) {
  if ([string]::IsNullOrWhiteSpace($name)) { throw 'Task owner missing' }
  if ($name.StartsWith('S-1-')) { return $name }
  return ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
 }
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-$s=New-Object -ComObject Schedule.Service; $s.Connect()
-try { $t=$s.GetFolder('\').GetTask($env:SLACK_FIXTURE_TASK) }
+Mark 'before-service'
+$s=New-Object -ComObject Schedule.Service
+Mark 'before-connect'
+$s.Connect()
+Mark 'before-folder'
+$folder=$s.GetFolder('\')
+Mark 'before-query'
+try { $t=$folder.GetTask($env:SLACK_FIXTURE_TASK) }
 catch {
- $e=$_.Exception; while ($e.InnerException) { $e=$e.InnerException }
- if ($e.HResult -eq -2147024894) { @{present=$false}|ConvertTo-Json -Compress; exit 0 }
+ Mark 'query-exception'
+ $e=$_.Exception
+ $seen=New-Object 'System.Collections.Generic.List[object]'
+ for ($i=0; $i -lt 12; $i++) {
+  foreach ($old in $seen) { if ([Object]::ReferenceEquals($old,$e)) { throw 'Startup inspection exception cycle' } }
+  $seen.Add($e)
+  Mark ('exception-' + $i + '-hresult-' + $e.HResult)
+  if ($null -eq $e.InnerException) { break }
+  if ($i -eq 11) { throw 'Startup inspection exception depth exceeded' }
+  $e=$e.InnerException
+ }
+ if ($e.HResult -eq -2147024894) { Mark 'confirmed-absent'; @{present=$false}|ConvertTo-Json -Compress; Mark 'complete'; exit 0 }
  throw
 }
+Mark 'query-complete'
 $d=$t.Definition
 $owners=@(); foreach ($trigger in $d.Triggers) { if ($trigger.Type -ne 9) { throw 'Unexpected trigger' }; $owners += OwnerSid $trigger.UserId }
+Mark 'before-result'
 @{present=$true;xml=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t.Xml));sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;principal_sid=(OwnerSid $d.Principal.UserId);trigger_sids=@($owners)}|ConvertTo-Json -Compress
+Mark 'complete'
 """
         powershell=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
-        value=json.loads(subprocess.check_output([str(powershell),'-NoProfile','-NonInteractive','-Command',query],env={**env,'SLACK_FIXTURE_TASK':label},timeout=30).decode('utf-8'))
+        value=json.loads(run_startup_query(powershell,query,{**env,'SLACK_FIXTURE_TASK':label}).decode('utf-8'))
         if value=={'present':False}:return None
         assert value['present'] is True and value['principal_sid']==value['sid'] and value['trigger_sids']==[value['sid']]
         observed=__import__('base64').b64decode(value['xml']).decode('utf-8')
