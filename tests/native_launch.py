@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise an extracted native download using only its bundled runtime (no Slack/model calls)."""
 import argparse
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -28,6 +30,21 @@ def run_startup_query(powershell,query,env):
         for stream in (error.stdout,error.stderr):
             if stream:print(stream.decode('utf-8',errors='replace') if isinstance(stream,bytes) else stream,file=sys.stderr,flush=True)
         raise
+
+def parse_startup_observation(text):
+    """Fixed .NET frame; do not depend on PowerShell module/JSON discovery."""
+    fields=text.splitlines()
+    if fields==['slack-startup-v1','absent']:return {'present':False}
+    if len(fields)!=6 or fields[:2]!=['slack-startup-v1','present']:
+        raise ValueError('Invalid startup observation framing')
+    xml=base64.b64decode(fields[2],validate=True)
+    if not xml or base64.b64encode(xml).decode('ascii')!=fields[2]:
+        raise ValueError('Invalid startup observation XML encoding')
+    xml.decode('utf-8')
+    for sid in fields[3:]:
+        if not re.fullmatch(r'S-1-[0-9]+(?:-[0-9]+)+',sid):
+            raise ValueError('Invalid startup observation SID')
+    return {'present':True,'xml':fields[2],'sid':fields[3],'principal_sid':fields[4],'trigger_sids':[fields[5]]}
 
 def startup_registration(home,label,env):
     """Read this fresh fixture's actual registration, refusing different owners."""
@@ -64,21 +81,24 @@ catch {
   if ($i -eq 11) { throw 'Startup inspection exception depth exceeded' }
   $e=$e.InnerException
  }
- if ($e.HResult -eq -2147024894) { Mark 'confirmed-absent'; @{present=$false}|ConvertTo-Json -Compress; Mark 'complete'; exit 0 }
+ if ($e.HResult -eq -2147024894) { Mark 'confirmed-absent'; [Console]::Out.WriteLine("slack-startup-v1`nabsent"); [Console]::Out.Flush(); Mark 'complete'; exit 0 }
  throw
 }
 Mark 'query-complete'
 $d=$t.Definition
 $owners=@(); foreach ($trigger in $d.Triggers) { if ($trigger.Type -ne 9) { throw 'Unexpected trigger' }; $owners += OwnerSid $trigger.UserId }
+if ($owners.Count -ne 1) { throw 'Expected one owned logon trigger' }
 Mark 'before-result'
-@{present=$true;xml=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t.Xml));sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;principal_sid=(OwnerSid $d.Principal.UserId);trigger_sids=@($owners)}|ConvertTo-Json -Compress
+$fields=[string[]]@('slack-startup-v1','present',[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t.Xml)),[Security.Principal.WindowsIdentity]::GetCurrent().User.Value,(OwnerSid $d.Principal.UserId),$owners[0])
+[Console]::Out.WriteLine([String]::Join("`n",$fields))
+[Console]::Out.Flush()
 Mark 'complete'
 """
         powershell=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
-        value=json.loads(run_startup_query(powershell,query,{**env,'SLACK_FIXTURE_TASK':label}).decode('utf-8'))
+        value=parse_startup_observation(run_startup_query(powershell,query,{**env,'SLACK_FIXTURE_TASK':label}).decode('utf-8'))
         if value=={'present':False}:return None
         assert value['present'] is True and value['principal_sid']==value['sid'] and value['trigger_sids']==[value['sid']]
-        observed=__import__('base64').b64decode(value['xml']).decode('utf-8')
+        observed=base64.b64decode(value['xml'],validate=True).decode('utf-8')
         task=ET.fromstring(observed);ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
         principals=task.findall('./t:Principals/t:Principal',ns);assert len(principals)==1
         assert principals[0].findtext('t:LogonType',namespaces=ns)=='InteractiveToken'

@@ -119,6 +119,7 @@ jobs:
       - run: cargo test --locked --test native_auth
       - run: python tests/slack_setup.py
       - run: python tests/native_update.py
+      - run: python tests/native_startup_observation.py
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package private runtime and verify platform binary
         shell: bash
