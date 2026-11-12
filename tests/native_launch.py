@@ -181,6 +181,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             if verify_startup:
                 if os.name!='nt' and __import__('sys').platform!='darwin':raise AssertionError('Startup fixture is limited to native Windows/Mac CI')
                 startup_headers={'Cookie':cookie,'X-CSRF-Token':session['csrf']};label='acp-slack-adapter-'+config['id']
+                assert startup_registration(home,label,env) is None,'Fresh fixture must not touch an existing startup entry'
                 startup_error=None
                 def startup_request(enabled):
                     r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':enabled}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
