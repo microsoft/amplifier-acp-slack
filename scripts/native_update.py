@@ -7,7 +7,59 @@ REPO='microsoft/amplifier-acp-slack'
 CRITICAL={'stopping','swapping','verifying','rolling_back','recovery_required'}
 MAX_ARCHIVE=384*1024*1024
 
-def read(path):return json.loads(path.read_text())
+def _windows_path(path):
+    value=os.path.abspath(path)
+    if value.startswith('\\\\?\\'):return value
+    return '\\\\?\\UNC\\'+value[2:] if value.startswith('\\\\') else '\\\\?\\'+value
+
+@contextlib.contextmanager
+def _windows_handle(path,access):
+    import ctypes as c
+    from ctypes import wintypes as w
+    kernel=c.WinDLL('kernel32',use_last_error=True)
+    kernel.CreateFileW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,w.LPVOID,w.DWORD,w.DWORD,w.HANDLE]
+    kernel.CreateFileW.restype=w.HANDLE
+    kernel.CloseHandle.argtypes=[w.HANDLE];kernel.CloseHandle.restype=w.BOOL
+    # Readers retain their exact opened snapshot while a new journal is published.
+    handle=kernel.CreateFileW(_windows_path(path),access,0x7,None,3,0x80,None)
+    if handle==c.c_void_p(-1).value:raise c.WinError(c.get_last_error())
+    try:yield kernel,handle
+    finally:kernel.CloseHandle(handle)
+
+def read(path):
+    if os.name!='nt':return json.loads(path.read_text())
+    import ctypes as c
+    from ctypes import wintypes as w
+    with _windows_handle(path,0x80000000) as (kernel,handle):
+        kernel.ReadFile.argtypes=[w.HANDLE,w.LPVOID,w.DWORD,c.POINTER(w.DWORD),w.LPVOID]
+        kernel.ReadFile.restype=w.BOOL
+        buffer=c.create_string_buffer(65536);count=w.DWORD();chunks=[]
+        while True:
+            if not kernel.ReadFile(handle,buffer,len(buffer),c.byref(count),None):raise c.WinError(c.get_last_error())
+            if not count.value:break
+            chunks.append(buffer.raw[:count.value])
+        return json.loads(b''.join(chunks))
+
+def _publish_json(source,target):
+    if os.name!='nt':return durable_replace(source,target)
+    import ctypes as c
+    from ctypes import wintypes as w
+    # Windows 11: FileRenameInfoEx (22), REPLACE_IF_EXISTS | POSIX_SEMANTICS.
+    # Unlike MoveFileExW, this permits delete-sharing readers without a missing-
+    # file window. It does not override a reader that denies delete sharing.
+    # https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-file_rename_info
+    # https://learn.microsoft.com/openspecs/windows_protocols/ms-fscc/4217551b-d2c0-42cb-9dc1-69a716cf6d0c
+    name=_windows_path(target).encode('utf-16-le')
+    class Rename(c.Structure):
+        # Keep an explicit UTF-16 terminator, independent of structure padding.
+        _fields_=[('Flags',w.DWORD),('RootDirectory',w.HANDLE),('FileNameLength',w.DWORD),('FileName',c.c_ubyte*(len(name)+2))]
+    info=Rename();info.Flags=0x1|0x2;info.FileNameLength=len(name);info.FileName[:len(name)]=name
+    with _windows_handle(source,0xC0010000) as (kernel,handle):
+        kernel.SetFileInformationByHandle.argtypes=[w.HANDLE,c.c_int,w.LPVOID,w.DWORD]
+        kernel.SetFileInformationByHandle.restype=w.BOOL
+        kernel.FlushFileBuffers.argtypes=[w.HANDLE];kernel.FlushFileBuffers.restype=w.BOOL
+        if not kernel.SetFileInformationByHandle(handle,22,c.byref(info),c.sizeof(info)):raise c.WinError(c.get_last_error())
+        if not kernel.FlushFileBuffers(handle):raise c.WinError(c.get_last_error())
 def digest(path):
     with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
 def sync_file(path):
@@ -36,7 +88,7 @@ def sync_tree(root):
 def write(path,value):
     path.parent.mkdir(mode=0o700,parents=True,exist_ok=True);temp=path.parent/('.write-'+uuid.uuid4().hex)
     with open(temp,'x',opener=lambda p,f:os.open(p,f,0o600)) as f:json.dump(value,f,indent=2);f.flush();os.fsync(f.fileno())
-    durable_replace(temp,path)
+    _publish_json(temp,path)
 @contextlib.contextmanager
 def locked(path,blocking=True):
     path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)

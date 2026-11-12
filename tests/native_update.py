@@ -17,6 +17,9 @@ class NativeUpdateTests(unittest.TestCase):
  def test_atomic_write_and_existing_owner_restriction(self):
   self.assertEqual(self.worker().config['id'],self.agent);u.write(self.home/'saved-connections.json',{'url':'https://owner.example'})
   with self.assertRaisesRegex(RuntimeError,'externally_managed'):self.worker()
+ def test_malformed_journal_is_not_treated_as_absent(self):
+  p=self.folder/'malformed.json';p.write_bytes(b'{"state":')
+  with self.assertRaises(json.JSONDecodeError):u.read(p)
  def test_archive_refuses_escape_and_symlink(self):
   for name,mode in [('../escape',0o100644),('link',0o120777)]:
    file=self.folder/'test.zip'
@@ -118,4 +121,87 @@ class NativeUpdateTests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'local_proof_connection_closed'):self.worker().api('status')
    self.assertEqual(len(seen),1);self.assertFalse(any(k.lower()=='authorization' for k in seen[0]))
   finally:server.shutdown();server.server_close();thread.join()
+@unittest.skipUnless(os.name=='nt','Actual Windows file-sharing semantics')
+class WindowsJournalTests(unittest.TestCase):
+ def setUp(self):
+  import ctypes as c
+  from ctypes import wintypes as w
+  self.c=c;self.w=w;self.temp=TemporaryDirectory(prefix='Slack journal café 子 ');self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+  self.kernel=c.WinDLL('kernel32',use_last_error=True)
+  self.kernel.CreateFileW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,w.LPVOID,w.DWORD,w.DWORD,w.HANDLE];self.kernel.CreateFileW.restype=w.HANDLE
+  self.kernel.ReadFile.argtypes=[w.HANDLE,w.LPVOID,w.DWORD,c.POINTER(w.DWORD),w.LPVOID];self.kernel.ReadFile.restype=w.BOOL
+  self.kernel.CloseHandle.argtypes=[w.HANDLE];self.kernel.CloseHandle.restype=w.BOOL
+ def open_reader(self,path,sharing):
+  h=self.kernel.CreateFileW(str(path),0x80000000,sharing,None,3,0x80,None)
+  if h==self.c.c_void_p(-1).value:raise self.c.WinError(self.c.get_last_error())
+  return h
+ def snapshot(self,handle):
+  buffer=self.c.create_string_buffer(4096);count=self.w.DWORD()
+  self.assertTrue(self.kernel.ReadFile(handle,buffer,len(buffer),self.c.byref(count),None))
+  return json.loads(buffer.raw[:count.value])
+ def test_published_journal_preserves_already_open_reader_snapshot(self):
+  p=self.root/'plan.json';u.write(p,{'generation':0});handle=self.open_reader(p,7)
+  try:
+   u.write(p,{'generation':1});u.write(p,{'generation':2})
+   self.assertEqual(u.read(p),{'generation':2});self.assertEqual(self.snapshot(handle),{'generation':0})
+  finally:self.kernel.CloseHandle(handle)
+ def test_reader_denying_delete_is_refused_without_losing_original(self):
+  p=self.root/'plan.json';u.write(p,{'generation':0});before=p.read_bytes();handle=self.open_reader(p,3)
+  try:
+   with self.assertRaises(OSError) as raised:u.write(p,{'generation':1})
+   self.assertEqual(raised.exception.winerror,32);self.assertEqual(p.read_bytes(),before)
+  finally:self.kernel.CloseHandle(handle)
+  u.write(p,{'generation':2});self.assertEqual(u.read(p),{'generation':2})
+ def test_concurrent_worker_reads_never_lose_or_partially_read_journal(self):
+  p=self.root/'plan.json';u.write(p,{'generation':0,'padding':'x'*16384});stop=threading.Event();started=threading.Event();errors=[];reads=[]
+  def reader():
+   while not stop.is_set():
+    try:
+     value=u.read(p)
+     if not isinstance(value.get('generation'),int) or value.get('padding')!='x'*16384:raise AssertionError('Partial journal')
+     reads.append(value['generation']);started.set()
+    except BaseException as error:errors.append(error);started.set();return
+  threads=[threading.Thread(target=reader) for _ in range(2)]
+  for thread in threads:thread.start()
+  try:
+   self.assertTrue(started.wait(5))
+   for generation in range(1,101):u.write(p,{'generation':generation,'padding':'x'*16384})
+  finally:
+   stop.set()
+   for thread in threads:thread.join(5);self.assertFalse(thread.is_alive())
+  self.assertFalse(errors,repr(errors));self.assertTrue(reads);self.assertEqual(u.read(p)['generation'],100)
+ def test_long_unicode_path_create_and_replace(self):
+  folder=self.root
+  while len(str(folder))<340:folder=folder/('café 子 '+('x'*25))
+  folder.mkdir(parents=True);p=folder/'plan-😀.json'
+  u.write(p,{'generation':0});u.write(p,{'generation':1});self.assertEqual(u.read(p),{'generation':1})
+ def test_utf16_name_alignment_never_changes_destination_name(self):
+  for length in range(1,9):
+   p=self.root/(('x'*length)+'.json');u.write(p,{'length':length});u.write(p,{'length':length+1})
+   self.assertEqual(u.read(p),{'length':length+1})
+  self.assertEqual(sorted(p.name for p in self.root.iterdir()),sorted(('x'*n)+'.json' for n in range(1,9)))
+ def test_readonly_destination_is_not_overridden(self):
+  import stat
+  p=self.root/'plan.json';u.write(p,{'generation':0});p.chmod(stat.S_IREAD)
+  try:
+   with self.assertRaises(OSError):u.write(p,{'generation':1})
+   self.assertEqual(u.read(p),{'generation':0})
+  finally:p.chmod(stat.S_IREAD|stat.S_IWRITE)
+ def test_directory_is_not_replaced_by_json(self):
+  p=self.root/'plan.json';p.mkdir();(p/'kept').write_bytes(b'evidence')
+  with self.assertRaises(OSError):u.write(p,{'generation':1})
+  self.assertEqual((p/'kept').read_bytes(),b'evidence')
+ def test_failed_post_rename_flush_reports_uncertainty_without_undoing_publication(self):
+  import contextlib
+  from types import SimpleNamespace
+  p=self.root/'plan.json';u.write(p,{'generation':0});original=u._windows_handle
+  def refused_flush(handle):self.c.set_last_error(5);return False
+  @contextlib.contextmanager
+  def fail_after_actual_rename(path,access):
+   with original(path,access) as (kernel,handle):
+    yield SimpleNamespace(SetFileInformationByHandle=kernel.SetFileInformationByHandle,FlushFileBuffers=refused_flush),handle
+  with patch.object(u,'_windows_handle',side_effect=fail_after_actual_rename),self.assertRaises(OSError) as raised:u.write(p,{'generation':1})
+  self.assertEqual(raised.exception.winerror,5)
+  # Publication occurred, but the caller received an error, never false success.
+  self.assertEqual(u.read(p),{'generation':1})
 if __name__=='__main__':unittest.main()
