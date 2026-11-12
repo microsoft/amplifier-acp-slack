@@ -61,8 +61,24 @@ def run(package,result):
      except Exception:
       rollback_errors.append(traceback.format_exc());raise
     current.rollback=traced_rollback
-    current.execute();out=worker.read(folder/'plan.json');assert out['state']==('rolled_back' if fail else 'succeeded'),{'plan':out,'rollback_errors':rollback_errors}
-    checks.append('actual failed start restores prior binary/runtime' if fail=='start' else 'actual failed verification restores prior binary/runtime' if fail else 'actual idle stop, binary/runtime swap and verified restart')
+    if fail is None:
+     # Use the packaged API dispatcher and its private interpreter for the real
+     # no-toolchain worker path. Later cases inject faults at exact worker seams.
+     request_id=str(uuid.uuid4())
+     try:current.api('desktop/updates',{'action':'apply','request_id':request_id,'plan_id':identifier})
+     except (TimeoutError,ConnectionError):pass  # Reconcile the same durable request; never redispatch.
+     deadline=time.monotonic()+240
+     while time.monotonic()<deadline:
+      out=worker.read(folder/'plan.json')
+      if out['state'] in {'succeeded','rolled_back','failed','deferred','recovery_required'}:break
+      time.sleep(.2)
+     else:raise AssertionError('The installed native worker did not settle')
+     assert worker.read(home/'native-updates'/('request-'+request_id+'.json'))['id']==identifier
+     assert (folder/'worker.py').read_bytes()==(ROOT/'scripts/native_update.py').read_bytes(),'Package worker differs from the fault-injection fixture'
+    else:
+     current.execute();out=worker.read(folder/'plan.json')
+    assert out['state']==('rolled_back' if fail else 'succeeded'),{'plan':out,'rollback_errors':rollback_errors}
+    checks.append('actual failed start restores prior binary/runtime' if fail=='start' else 'actual failed verification restores prior binary/runtime' if fail else 'actual API dispatch and packaged private worker perform idle stop, swap and verified restart')
     assert (home/'adapter.json').read_bytes()==config_bytes
     assert worker.digest(home/'secrets/local-password')==secret_before and worker.digest(home/'secrets/control-token')==private_before
     assert current.api('status')['id']==identity_before

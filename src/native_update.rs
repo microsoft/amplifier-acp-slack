@@ -73,7 +73,7 @@ pub fn status(home: &Path) -> Value {
         let running = match std::fs::File::open(home.join("native-updates/worker.lock")) {
             Ok(file) => match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(()) => Some(false),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Some(true),
+                Err(e) if crate::process::lock_busy(&e) => Some(true),
                 Err(_) => None,
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),

@@ -1,7 +1,7 @@
 use acp_slack_adapter::{acp_auth, config::Config, driver};
 use serde_json::json;
 #[tokio::test]
-async fn bare_agent_can_read_during_new_and_load_without_management_extensions() {
+async fn bare_agent_negotiates_optional_reads_during_new_and_load_without_management_extensions() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("adapter");
     let workspace = temp.path().join("workspace");
@@ -33,9 +33,14 @@ for line in sys.stdin:
     let mut c = Config::new("Bare ACP".into(), "owner".into());
     c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
     c.acp.args = vec![script.to_string_lossy().into_owned()];
-    c.acp.cwd = workspace.to_string_lossy().into_owned();
-    c.acp.client.read_text_file = true;
-    c.acp.client.workspace_roots = vec![c.acp.cwd.clone()];
+    c.acp.cwd = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    c.acp.client.read_text_file = cfg!(unix);
+    if cfg!(unix) {
+        c.acp.client.workspace_roots = vec![c.acp.cwd.clone()];
+    }
     c.context.enabled = false;
     let input = json!({"conversation":{"context":"slack:T:C:","channel":"C","thread":""},"trigger":{"text":"hello","sender":"user","bot":false},"orientation":{"conversation_kind":"im"}});
     for _ in 0..2 {

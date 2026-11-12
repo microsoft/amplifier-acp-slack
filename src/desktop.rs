@@ -104,7 +104,7 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
             }
             crate::server::serve_with_browser(home, open_browser).await
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(error) if crate::process::lock_busy(&error) => {
             let response = local_api(&home, "GET", "status", None).await.context("The running connector could not be verified; no credential was sent to an unverified local HTTP listener")?;
             ensure!(
                 response["id"] == config.id,

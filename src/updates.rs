@@ -274,7 +274,7 @@ pub fn admission(home: &Path) -> Result<Option<std::fs::File>> {
     };
     match file.try_lock_exclusive() {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) if crate::process::lock_busy(&e) => return Ok(None),
         Err(e) => return Err(e.into()),
     }
     if crate::connection::gated(home) || crate::native_update::blocks(home) {

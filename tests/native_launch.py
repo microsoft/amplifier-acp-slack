@@ -37,7 +37,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
     with tempfile.TemporaryDirectory(prefix='Slack native café 子 ') as temporary:
         root=Path(temporary);bundle=root/'download';bundle.mkdir();extract(package,bundle)
         binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file())
-        binary.chmod(0o755);home=root/'private connection';env={k:v for k,v in os.environ.items() if not k.upper().startswith(('SLACK_','OPENAI_','ANTHROPIC_','AZURE_','GOOGLE_','AMPLIFIER_'))};env['PATH']=str(root/'no-tools');env['PYTHONDONTWRITEBYTECODE']='1'
+        binary.chmod(0o755);home=root/'private connection';env={k:v for k,v in os.environ.items() if not k.upper().startswith(('SLACK_','OPENAI_','ANTHROPIC_','AZURE_','GOOGLE_','AMPLIFIER_'))};env['PATH']=str(root/'no-tools');env['PYTHONDONTWRITEBYTECODE']='1';env['USER']='Native café 子';env['USERNAME']='Native café 子'
         if verify_startup:env['PATH']=str(Path(os.environ['SystemRoot'])/'System32') if os.name=='nt' else '/usr/bin:/bin'
         def start():
             log=open(root/'server.log','ab');p=subprocess.Popen([str(binary),'--home',str(home),'--no-browser'],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
@@ -56,7 +56,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             status,_,session=request(base,'/api/v1/auth/session');assert status==200 and session['first_account_needed']
             status,_,_=request(base,'/api/v1/config');assert status==401
             status,_,_=request(base,'/api/v1/auth/session',headers={'Host':'evil.test','Origin':'http://evil.test'});assert status==403;checks.append('unauthenticated and cross-origin refused')
-            cap=json.loads((home/'secrets/first-account').read_text())['token'];password='Disposable native password 29'
+            cap=json.loads((home/'secrets/first-account').read_text())['token'];password='Disposable native password café 子'
             if browser:
                 fixture=root/'browser-input.json';fixture.write_text(json.dumps({'base':base,'cap':cap,'password':password}))
                 subprocess.run([shutil.which('node'),str(Path(__file__).with_name('native-browser.mjs')),str(fixture)],check=True,timeout=90)

@@ -2,6 +2,14 @@
 use anyhow::Result;
 use tokio::process::{Child, Command};
 
+/// fs2 preserves Windows ERROR_LOCK_VIOLATION, which is not WouldBlock.
+pub(crate) fn lock_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
 pub fn prepare(command: &mut Command) {
     #[cfg(unix)]
     command.process_group(0);
