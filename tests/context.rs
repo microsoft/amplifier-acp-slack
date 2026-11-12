@@ -1,7 +1,7 @@
 use acp_slack_adapter::{
     auth,
-    config::{Config, private_write},
-    context,
+    config::{Config, Secrets, private_write},
+    context, slack,
     state::AppState,
     store::Store,
 };
@@ -417,6 +417,92 @@ async fn owner_discovery_and_reads_require_shared_membership_and_exclude_other_d
             .unwrap()
             .contains("TTEST/CSHARED")
     );
+}
+
+#[tokio::test]
+async fn live_reads_and_search_preserve_table_only_content_and_source_identity() {
+    let f = Fixture::new().await;
+    let prose = format!(
+        "Saved handoff. {}",
+        "Detailed reproducibility notes. ".repeat(130)
+    );
+    f.fake.lock().unwrap().history.insert("CSHARED".into(), vec![json!({
+        "ts":"1000.000002", "user":"UPEER", "text":prose,
+        "blocks":[{"type":"table", "rows":[
+            [{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"clip.mp4","style":{"code":true}}]}]}, {"type":"raw_text","text":"fixture-sha256"}]
+        ]}]
+    })]);
+    for operation in ["read", "orientation", "search"] {
+        let mut query =
+            json!({"operation":operation,"access":{"mode":"owner"},"conversation_id":"CSHARED"});
+        if operation == "search" {
+            query["query"] = json!("fixture-sha256");
+        }
+        let (status, result) = f.query(query).await;
+        assert_eq!(status, StatusCode::OK, "{operation}: {result}");
+        let messages = if operation == "orientation" {
+            &result["recent_messages"]
+        } else {
+            &result["messages"]
+        };
+        assert_eq!(
+            messages.as_array().unwrap().len(),
+            1,
+            "{operation}: {result}"
+        );
+        let message = &messages[0];
+        assert_eq!(message["id"], "1000.000002");
+        assert_eq!(message["actor"], "UPEER");
+        assert!(
+            message["text"]
+                .as_str()
+                .unwrap()
+                .contains("| clip.mp4 | fixture-sha256 |")
+        );
+        assert!(message["text"].as_str().unwrap().starts_with(&prose));
+        assert!(message["text"].as_str().unwrap().len() > 4000);
+        assert_eq!(message["truncated"], false);
+    }
+}
+
+#[tokio::test]
+async fn continuation_accepts_exact_legacy_fallback_but_not_changed_enriched_source() {
+    let f = Fixture::new().await;
+    let mut c = f.state.instance_config();
+    c.participation = "ambient".into();
+    let slack = slack::Slack::new(
+        &c,
+        Secrets {
+            app_token: "fixture".into(),
+            bot_token: "fixture".into(),
+        },
+    )
+    .unwrap();
+    let raw = json!({"ts":"1000.000001","user":"UPEER","text":"Original fallback.","blocks":[{"type":"table","rows":[[{"type":"raw_text","text":"original result"}]]}]});
+    f.fake
+        .lock()
+        .unwrap()
+        .history
+        .insert("CSHARED".into(), vec![raw.clone()]);
+    let full = slack::normalize("TTEST", "CSHARED", &raw, None).unwrap();
+    let mut old = full.clone();
+    old.text = raw["text"].as_str().unwrap().into();
+    slack.authorize_continuation(&c, &old).await.unwrap();
+    slack.authorize_continuation(&c, &full).await.unwrap();
+    assert_eq!(old.text, "Original fallback.");
+    {
+        let mut fake = f.fake.lock().unwrap();
+        fake.history.get_mut("CSHARED").unwrap()[0]["blocks"][0]["rows"][0][0]["text"] =
+            json!("different result");
+    }
+    assert!(slack.authorize_continuation(&c, &full).await.is_err());
+    {
+        let mut fake = f.fake.lock().unwrap();
+        fake.history.get_mut("CSHARED").unwrap()[0] = raw;
+        fake.history.get_mut("CSHARED").unwrap()[0]["edited"] = json!({"ts":"1001.000001"});
+    }
+    assert!(slack.authorize_continuation(&c, &old).await.is_err());
+    assert!(slack.authorize_continuation(&c, &full).await.is_err());
 }
 
 #[tokio::test]
@@ -839,7 +925,7 @@ async fn search_is_literal_and_does_not_claim_to_search_truncated_text_or_other_
                 message(
                     "1000.000002",
                     "UPEER",
-                    &format!("{}hidden-needle", "x".repeat(2000)),
+                    &format!("{}hidden-needle", "x".repeat(16000)),
                 ),
             ],
         );
@@ -941,12 +1027,14 @@ async fn coverage_reports_pagination_and_text_truncation_and_scope_changes_apply
     assert_eq!(read["complete"], false);
     assert!(read["next_cursor"].is_string());
     assert_eq!(read["coverage"]["text_truncated"], true);
+    assert_eq!(read["messages"][0]["text"].as_str().unwrap().len(), 0);
+    assert_eq!(read["messages"][1]["text"].as_str().unwrap().len(), 16000);
     assert!(
         read["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|v| v["text"].as_str().unwrap().len() <= 2000)
+            .all(|v| v["truncated"] == true)
     );
     f.state.config.write().unwrap().slack.channels = vec!["DOWNER".into()];
     assert_eq!(

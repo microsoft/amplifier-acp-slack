@@ -15,23 +15,100 @@ pub fn split(text: &str) -> Result<Vec<Part>> {
         text.chars().count() <= crate::model::MAX_REPLY_CHARS,
         "Reply exceeds delivery limit"
     );
+    let (markdown, inserted) = fence_layout(text);
+    let mut parts = split_markdown(&markdown)?;
+    let mut rendered_end = 0;
+    let mut source_start = 0;
+    for part in &mut parts {
+        rendered_end += part.source.len();
+        let source_end = rendered_end - inserted.partition_point(|at| *at < rendered_end);
+        part.source = text[source_start..source_end].to_owned();
+        source_start = source_end;
+    }
+    Ok(parts)
+}
+
+/// Slack hides the opening fence's info string. Keep data written beside a
+/// fence visible by inserting only layout newlines; ordinary language tags
+/// remain unchanged. Stored reply/source text is never rewritten.
+pub fn markdown(text: &str) -> String {
+    fence_layout(text).0
+}
+
+fn fence_layout(text: &str) -> (String, Vec<usize>) {
+    let mut insertions = Vec::new();
+    let mut open: Option<(char, usize)> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end();
+        let trimmed = body.trim_start();
+        if open.is_none() {
+            if let Some((mark, count)) = fence_marker(trimmed) {
+                let start = body.len() - trimmed.len() + count;
+                let tail = &body[start..];
+                let closing = trailing_fence(tail, mark, count);
+                if tail.split_whitespace().count() > 1 || closing.is_some() {
+                    insertions.push(offset + start);
+                }
+                if let Some(at) = closing {
+                    if !tail[..at].trim().is_empty() {
+                        insertions.push(offset + start + at);
+                    }
+                } else {
+                    open = Some((mark, count));
+                }
+            }
+        } else if let Some((mark, count)) = open
+            && let Some(at) = trailing_fence(body, mark, count)
+        {
+            if !body[..at].trim().is_empty() {
+                insertions.push(offset + at);
+            }
+            open = None;
+        }
+        offset += line.len();
+    }
+    let mut rendered = String::with_capacity(text.len() + insertions.len());
+    let mut inserted = Vec::with_capacity(insertions.len());
+    let mut source_start = 0;
+    for at in insertions {
+        rendered.push_str(&text[source_start..at]);
+        inserted.push(rendered.len());
+        rendered.push('\n');
+        source_start = at;
+    }
+    rendered.push_str(&text[source_start..]);
+    (rendered, inserted)
+}
+
+fn fence_marker(text: &str) -> Option<(char, usize)> {
+    let mark = text.chars().next()?;
+    if !matches!(mark, '`' | '~') {
+        return None;
+    }
+    let count = text.chars().take_while(|c| *c == mark).count();
+    (count >= 3).then_some((mark, count))
+}
+
+fn trailing_fence(text: &str, mark: char, minimum: usize) -> Option<usize> {
+    let count = text.chars().rev().take_while(|c| *c == mark).count();
+    (count >= minimum).then_some(text.len() - count)
+}
+
+fn split_markdown(text: &str) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
     let mut source = String::new();
     let mut rendered = String::new();
     let mut fence: Option<String> = None;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        let mark = if trimmed.starts_with("```") {
-            Some('`')
-        } else if trimmed.starts_with("~~~") {
-            Some('~')
-        } else {
-            None
-        };
+        let marker = fence_marker(trimmed);
+        let closing = fence.as_ref().is_some_and(|f| {
+            let (mark, count) = fence_marker(f.trim_start()).unwrap();
+            marker.is_some_and(|(m, n)| mark == m && n >= count && trimmed[n..].trim().is_empty())
+        });
         // Keep the entire fence delimiter line together.
-        let delimiter = mark.is_some()
-            && (fence.is_none()
-                || trimmed.starts_with(fence.as_ref().unwrap().chars().next().unwrap()));
+        let delimiter = marker.is_some() && (fence.is_none() || closing);
         let mut rest = line;
         while !rest.is_empty() {
             let reserve = 160; // a reopened fence and optional closing newline
@@ -69,12 +146,10 @@ pub fn split(text: &str) -> Result<Vec<Part>> {
             rest = &rest[cut..];
             flush(&mut parts, &mut source, &mut rendered, &fence);
         }
-        if let Some(mark) = mark {
-            if fence.as_ref().is_some_and(|f| f.starts_with(mark)) {
-                fence = None;
-            } else if fence.is_none() && line.chars().count() < 120 {
-                fence = Some(line.trim_end().to_owned());
-            }
+        if closing {
+            fence = None;
+        } else if marker.is_some() && fence.is_none() && line.chars().count() < 120 {
+            fence = Some(line.trim_end().to_owned());
         }
     }
     if !source.is_empty() {
@@ -93,7 +168,8 @@ fn flush(
         if !rendered.ends_with('\n') {
             rendered.push('\n');
         }
-        rendered.push_str(if f.starts_with('`') { "```" } else { "~~~" });
+        let (mark, count) = fence_marker(f.trim_start()).unwrap();
+        rendered.push_str(&mark.to_string().repeat(count));
     }
     parts.push(Part {
         source: std::mem::take(source),
@@ -176,6 +252,52 @@ fn safe_break(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn data_beside_fences_stays_visible_without_changing_source_bytes() {
+        let text = "Data:\n```first-row café 🌟\nsecond-row value```\n~~~name value~~~\n```rust\nlet x = 1;\n```\n";
+        let expected = "Data:\n```\nfirst-row café 🌟\nsecond-row value\n```\n~~~\nname value\n~~~\n```rust\nlet x = 1;\n```\n";
+        assert_eq!(markdown(text), expected);
+        assert_eq!(markdown(expected), expected);
+        let parts = split(text).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].source, text);
+        assert_eq!(parts[0].markdown, expected);
+    }
+
+    #[test]
+    fn ordinary_language_fences_and_inline_code_are_unchanged() {
+        for text in [
+            "```rust\nlet x = 1;\n```\n",
+            "~~~c++\nint x = 1;\n~~~\n",
+            "  ```python\nprint('ok')\n  ```\n",
+            "````markdown\n```rust\nlet x = 1;\n```\n````\n",
+            "Use `inline code` or the literal `~~~` here.\n",
+        ] {
+            assert_eq!(markdown(text), text);
+        }
+    }
+
+    #[test]
+    fn repaired_multipart_fences_keep_every_original_byte_once() {
+        let text = format!(
+            "```first row 🌟\n{}final row```\n",
+            "data café value\n".repeat(2500)
+        );
+        let parts = split(&text).unwrap();
+        assert!(parts.len() > 2);
+        assert_eq!(
+            parts.iter().map(|p| p.source.as_str()).collect::<String>(),
+            text
+        );
+        assert!(parts[0].markdown.starts_with("```\nfirst row 🌟\n"));
+        assert!(parts.last().unwrap().markdown.ends_with("final row\n```\n"));
+        for part in parts {
+            assert!(part.markdown.chars().count() <= PART_CHARS);
+            assert_eq!(markdown(&part.markdown), part.markdown);
+            assert_eq!(part.markdown.matches("```").count(), 2);
+        }
+    }
+
     #[test]
     fn unicode_markdown_and_fenced_code_remain_complete() {
         let text = format!(

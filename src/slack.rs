@@ -161,27 +161,51 @@ impl Slack {
                 |r| r.get::<_, bool>(0),
             )
             .map_err(|_| ApiError::Uncertain)?;
-        let parts = crate::reply_parts::split(&o.text)
-            .map_err(|_| ApiError::Rejected("reply_cannot_be_split_safely".into()))?;
-        if parts.len() == 1 {
-            return self.publish_message(o, notice).await;
-        }
-        {
-            let s = store.lock().unwrap();
-            for (index, part) in parts.iter().enumerate() {
-                let client_id = uuid::Uuid::new_v5(
-                    &uuid::Uuid::NAMESPACE_URL,
-                    format!("acp-reply:{}:{index}", o.id).as_bytes(),
-                )
-                .to_string();
-                s.db.execute("INSERT OR IGNORE INTO outbox_parts(outbox_id,part,client_id,text) VALUES(?1,?2,?3,?4)",rusqlite::params![o.id,index as i64,client_id,part.markdown]).map_err(|_|ApiError::Uncertain)?;
+        let (indices, single) = {
+            let mut s = store.lock().unwrap();
+            let tx =
+                s.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|_| ApiError::Uncertain)?;
+            let mut indices: Vec<i64> = tx
+                .prepare("SELECT part FROM outbox_parts WHERE outbox_id=?1 ORDER BY part")
+                .map_err(|_| ApiError::Uncertain)?
+                .query_map([&o.id], |r| r.get(0))
+                .map_err(|_| ApiError::Uncertain)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(|_| ApiError::Uncertain)?;
+            let mut single = None;
+            // A saved plan is authoritative across upgrades. Re-splitting can
+            // change boundaries and append a second copy of an already sent tail.
+            if indices.is_empty() {
+                let parts = crate::reply_parts::split(&o.text)
+                    .map_err(|_| ApiError::Rejected("reply_cannot_be_split_safely".into()))?;
+                if parts.len() == 1 {
+                    single = Some(parts.into_iter().next().unwrap().markdown);
+                } else {
+                    for (index, part) in parts.iter().enumerate() {
+                        let client_id = uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_URL,
+                            format!("acp-reply:{}:{index}", o.id).as_bytes(),
+                        )
+                        .to_string();
+                        tx.execute("INSERT INTO outbox_parts(outbox_id,part,client_id,text) VALUES(?1,?2,?3,?4)",rusqlite::params![o.id,index as i64,client_id,part.markdown]).map_err(|_|ApiError::Uncertain)?;
+                        indices.push(index as i64);
+                    }
+                }
             }
+            tx.commit().map_err(|_| ApiError::Uncertain)?;
+            (indices, single)
+        };
+        if let Some(text) = single {
+            let mut payload = o.clone();
+            payload.text = text;
+            return self.publish_message(&payload, notice).await;
         }
         let mut first = None;
-        for index in 0..parts.len() {
+        for (position, index) in indices.iter().enumerate() {
             let (client_id, text, status, ts): (String, String, String, Option<String>) = {
                 let s = store.lock().unwrap();
-                s.db.query_row("SELECT client_id,text,status,slack_ts FROM outbox_parts WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_|ApiError::Uncertain)?
+                s.db.query_row("SELECT client_id,text,status,slack_ts FROM outbox_parts WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_|ApiError::Uncertain)?
             };
             if status == "sent" {
                 if first.is_none() {
@@ -206,7 +230,7 @@ impl Slack {
                 .db
                 .execute(
                     "UPDATE outbox_parts SET status='sending' WHERE outbox_id=?1 AND part=?2",
-                    rusqlite::params![o.id, index as i64],
+                    rusqlite::params![o.id, index],
                 )
                 .map_err(|_| ApiError::Uncertain)?;
             let part = Outgoing {
@@ -214,7 +238,7 @@ impl Slack {
                 channel: o.channel.clone(),
                 thread: o.thread.clone(),
                 text,
-                media: if index + 1 == parts.len() {
+                media: if position + 1 == indices.len() {
                     o.media.clone()
                 } else {
                     vec![]
@@ -222,7 +246,7 @@ impl Slack {
             };
             match self.publish_message(&part, notice).await {
                 Ok(ts) => {
-                    store.lock().unwrap().db.execute("UPDATE outbox_parts SET status='sent',slack_ts=?3 WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index as i64,ts]).map_err(|_|ApiError::Uncertain)?;
+                    store.lock().unwrap().db.execute("UPDATE outbox_parts SET status='sent',slack_ts=?3 WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index,ts]).map_err(|_|ApiError::Uncertain)?;
                     if first.is_none() {
                         first = Some(ts);
                     }
@@ -239,7 +263,7 @@ impl Slack {
                         .db
                         .execute(
                             "UPDATE outbox_parts SET status=?3 WHERE outbox_id=?1 AND part=?2",
-                            rusqlite::params![o.id, index as i64, state],
+                            rusqlite::params![o.id, index, state],
                         )
                         .map_err(|_| ApiError::Uncertain)?;
                     return Err(error);
@@ -249,7 +273,9 @@ impl Slack {
         first.ok_or(ApiError::Uncertain)
     }
     pub async fn publish(&self, o: &Outgoing) -> std::result::Result<String, ApiError> {
-        self.publish_message(o, false).await
+        let mut payload = o.clone();
+        payload.text = crate::reply_parts::markdown(&o.text);
+        self.publish_message(&payload, false).await
     }
     async fn publish_message(
         &self,
@@ -294,8 +320,9 @@ impl Slack {
         // ACP replies remain ordinary Markdown in the outbox. Slack's `text`
         // field uses its different mrkdwn dialect; `markdown_text` asks Slack
         // to translate standard Markdown into its native rich message blocks.
-        // Do not combine this field with `text` or `blocks`, or convert/escape
-        // the Markdown first (which would damage links and code). Validated
+        // Do not combine this field with `text` or `blocks`, or escape Markdown.
+        // New payloads repair fence layout before planning. Persisted parts keep
+        // their exact saved text and identity, including across software upgrades.
         // Each delivery part stays below Slack's 12,000-character limit.
         let mut p = json!({"channel":o.channel,"markdown_text":o.text,"client_msg_id":o.id,"unfurl_links":false,"unfurl_media":false,"parse":"none"});
         if notice {
@@ -410,18 +437,28 @@ impl Slack {
             .call(method, body, false)
             .await
             .map_err(|_| anyhow::anyhow!("Continuation source could not be checked"))?;
-        let current = value["messages"]
+        let raw = value["messages"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|m| m["ts"] == source.ts)
-            .and_then(|m| normalize(&source.team, &source.channel, m, None))
             .context("Continuation source is unavailable")?;
+        let current = normalize(&source.team, &source.channel, raw, None)
+            .context("Continuation source is unavailable")?;
+        // Existing stored triggers may predate structured-table projection.
+        // Accept only the exact Slack fallback they captured; do not rewrite
+        // them or relax any identity, revision, or audience check.
+        let legacy_text: String = raw["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(40000)
+            .collect();
         ensure!(
             !current.deleted
                 && current.sender == source.sender
                 && current.bot == source.bot
-                && current.text == source.text
+                && (current.text == source.text || legacy_text == source.text)
                 && current.revision == source.revision,
             "Continuation source changed"
         );
@@ -761,9 +798,7 @@ pub fn normalize(team: &str, channel: &str, e: &Value, prior: Option<Message>) -
             .into(),
         sender: sender.into(),
         bot: raw.get("bot_id").is_some() || raw["subtype"] == "bot_message",
-        text: raw["text"]
-            .as_str()
-            .unwrap_or("")
+        text: crate::message_content::text(raw)
             .chars()
             .take(40000)
             .collect(),

@@ -11,6 +11,7 @@ pub mod elicitation;
 pub mod error;
 pub mod identity;
 pub mod media;
+mod message_content;
 pub mod model;
 pub mod permissions;
 pub mod process;

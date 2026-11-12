@@ -45,6 +45,13 @@ source links or use the context tools for details. Thread-only grants do not gai
 access to sibling windows. Status reports must consider these newer outcomes
 before repeating an older pending-work summary.
 
+Incoming messages and live context reads preserve Slack's text fallback and append
+the rows of structured table blocks it omits. Other rich-text prose is not appended
+again. Message text shares one 16,000-character response budget rather than an
+additional per-message cutoff. Table values share that budget and truncation reporting; reads
+and literal search retain the original message identity. Reading richer content
+does not rewrite stored messages or schedule another turn for an old revision.
+
 The adapter does not claim to know the user's viewport, selection, unread state
 or unsent draft.
 
