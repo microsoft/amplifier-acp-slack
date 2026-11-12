@@ -141,6 +141,12 @@ fn validate_launch_intent(home: &Path, plan: Option<&str>, nonce: Option<&str>) 
         job["launch"]["binary_sha256"] == *expected && expected.as_str() == Some(actual.as_str()),
         "Update launch executable changed"
     );
+    // Hashing a large executable is not atomic with recovery's journal update.
+    // Recheck the same intent immediately before opening installation state.
+    ensure!(
+        active(home)?.as_ref() == Some(&job),
+        "Update launch was superseded"
+    );
     Ok(true)
 }
 fn worker_guard(home: &Path) -> Result<std::fs::File> {

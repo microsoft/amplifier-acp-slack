@@ -224,7 +224,7 @@ class Worker:
             # Our candidate may own the lock before its API is listening. Reconcile
             # that same known child briefly; never terminate or replace an unknown process.
             child=getattr(self,'started_process',None)
-            deadline=time.monotonic()+10
+            deadline=time.monotonic()+20
             while child is not None and child.poll() is None and time.monotonic()<deadline:
                 try:self.stop()
                 except (OSError,RuntimeError):pass
