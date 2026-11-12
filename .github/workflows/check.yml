@@ -85,7 +85,7 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: ''
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             suffix: ''
           - os: windows-2025
