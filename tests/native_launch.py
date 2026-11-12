@@ -103,6 +103,24 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             status,_,session=request(base,'/api/v1/auth/login',{'username':config['server']['owner'],'password':password});assert status==200 and session['authenticated']
             assert hashlib.sha256((home/'secrets/local-password').read_bytes()).hexdigest()==password_hash;checks.append('restart retains account, identity, configuration and disabled state')
         finally:p.terminate();p.wait(timeout=20);log.close()
+        # Seed a fictional, already configured paused connection while stopped.
+        # This replaces the legacy Linux-only system-Python fixture on native OSes.
+        existing=json.loads(config_bytes);existing['setup_complete']=True
+        existing['slack'].update(team_id='TNATIVEFIXTURE',app_id='ANATIVEFIXTURE',loopback_test=True,api_base='http://127.0.0.1:1/')
+        (home/'adapter.json').write_text(json.dumps(existing),encoding='utf-8')
+        credentials=home/'secrets/slack.json'
+        with open(credentials,'x',opener=lambda p,f:os.open(p,f,0o600)) as stream:json.dump({'app_token':'test-app','bot_token':'test-bot'},stream)
+        paused_config=(home/'adapter.json').read_bytes();paused_credentials=credentials.read_bytes()
+        p,base,log=start()
+        try:
+            status,headers,session=request(base,'/api/v1/auth/login',{'username':existing['server']['owner'],'password':password});assert status==200
+            cookie=headers['set-cookie'].split(';',1)[0]
+            status,_,connected=request(base,'/api/v1/setup/slack',{'action':'connect'},{'Cookie':cookie,'X-CSRF-Token':session['csrf']})
+            assert status==200 and connected['connection_reused'] and connected['connection_ready'] and not connected['connection_running'] and connected['next_action']=='done',connected
+            assert (home/'adapter.json').read_bytes()==paused_config and credentials.read_bytes()==paused_credentials
+            assert not (home/'secrets/slack-setup/project').exists()
+            checks.append('native private helper reuses an existing paused Slack connection without app creation, engine launch or configuration changes')
+        finally:p.terminate();p.wait(timeout=20);log.close()
         if not verify_startup:assert not (home/'startup.json').exists();checks.append('startup false does not register an OS service')
     receipt={'passed':True,'checks':checks,'package':str(package),'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),'limitations':['No real Slack authorization or model/provider call','No publisher signing/notarization claim','Current-user startup registration exercised only when verify_startup is enabled; automatic sign-in launch is not simulated']}
     if result:result.write_text(json.dumps(receipt,indent=2)+'\n')

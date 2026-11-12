@@ -28,6 +28,10 @@ def run(package,result):
    # A new queued source may arrive during installation. It must never be rewound.
    import sqlite3
    with sqlite3.connect(home/'state.sqlite3') as db:db.execute("INSERT INTO records(collection,id,value,updated_at) VALUES('native-fixture','preserved','{\"value\":1}',1)")
+   expected_value=[1]
+   def input_arrived_after_backup():
+    expected_value[0]+=1
+    with sqlite3.connect(home/'state.sqlite3') as db:db.execute("UPDATE records SET value=? WHERE collection='native-fixture' AND id='preserved'",(json.dumps({'value':expected_value[0]},separators=(',',':')),))
    original_binary=home/'bin'/binary.name
    for fail in [None,"health","start"]:
     identifier=str(uuid.uuid4());folder=home/'native-updates'/identifier;folder.mkdir(parents=True)
@@ -39,14 +43,16 @@ def run(package,result):
     if fail=="health":
      def fail_first(expected):
       health_calls.append(expected)
-      if len(health_calls)==1:raise RuntimeError('injected failed health after actual swap')
+      if len(health_calls)==1:
+       input_arrived_after_backup();raise RuntimeError('injected failed health after actual swap')
       return real_health(expected)
      current.health=fail_first
     if fail=="start":
      real_start=current.start;start_calls=[]
      def fail_start():
       start_calls.append(True)
-      if len(start_calls)==1:raise OSError('injected candidate start failure')
+      if len(start_calls)==1:
+       input_arrived_after_backup();raise OSError('injected candidate start failure')
       return real_start()
      current.start=fail_start
     real_rollback=current.rollback;rollback_errors=[]
@@ -60,7 +66,7 @@ def run(package,result):
     assert (home/'adapter.json').read_bytes()==config_bytes
     assert worker.digest(home/'secrets/local-password')==secret_before and worker.digest(home/'secrets/control-token')==private_before
     assert current.api('status')['id']==identity_before
-    with sqlite3.connect(home/'state.sqlite3') as db:assert db.execute("SELECT value FROM records WHERE collection='native-fixture' AND id='preserved'").fetchone()==('{"value":1}',)
+    with sqlite3.connect(home/'state.sqlite3') as db:assert db.execute("SELECT value FROM records WHERE collection='native-fixture' AND id='preserved'").fetchone()==(json.dumps({'value':expected_value[0]},separators=(',',':')),)
     assert not (home/'updates/drain.json').exists()
    checks.append('identity/config/credentials/DB evidence unchanged; no database rewind')
    # A stop failure with the actual server still holding its lock cannot replace anything.

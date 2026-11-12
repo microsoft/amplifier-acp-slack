@@ -44,9 +44,15 @@ class NativeUpdateTests(unittest.TestCase):
   self.assertEqual(worker.job['state'],'deferred')
  def test_rollback_reconciles_the_known_candidate_before_its_api_is_ready(self):
   from types import SimpleNamespace
-  worker=self.worker();backup=self.folder/'backup';backup.mkdir();(backup/'binary').write_bytes(b'previous');worker.job['previous_sha256']=u.digest(backup/'binary');worker.started_process=SimpleNamespace(poll=lambda:None)
-  with patch.object(worker,'stop',side_effect=[ConnectionRefusedError(),None]) as stop,patch.object(worker,'replace'),patch.object(worker,'start'),patch.object(worker,'health'):
-   worker.rollback('fixture_failed_health');self.assertEqual(stop.call_count,2)
+  worker=self.worker();backup=self.folder/'backup';backup.mkdir();(backup/'binary').write_bytes(b'previous');worker.job['previous_sha256']=u.digest(backup/'binary')
+  calls=[]
+  def stop_before_api_ready():
+   calls.append(True)
+   if len(calls)<3:raise ConnectionRefusedError()
+  # The service lock stays free until this known process has actually started.
+  worker.started_process=SimpleNamespace(poll=lambda:0 if len(calls)>=3 else None)
+  with patch.object(worker,'stop',side_effect=stop_before_api_ready),patch.object(worker,'replace'),patch.object(worker,'start'),patch.object(worker,'health'):
+   worker.rollback('fixture_failed_health');self.assertEqual(len(calls),3)
   self.assertEqual(worker.job['state'],'rolled_back')
  def test_identical_release_has_no_cutover(self):
   worker=self.worker();worker.job.update(up_to_date=True,binary_sha256=u.digest(self.binary))

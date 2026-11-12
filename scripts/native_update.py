@@ -154,13 +154,31 @@ class Worker:
         if result.returncode or result.stdout.strip()!='acp-slack-adapter '+version:raise RuntimeError('candidate_version_mismatch')
         self.save('ready',version=version,tag=release['tag_name'],release_id=release['id'],release_url=release['html_url'],archive_sha256=digest(archive),entry=metadata['entry'],binary_sha256=metadata['binary_sha256'],installed_sha256=digest(self.binary),config_sha256=digest(self.home/'adapter.json'),up_to_date=digest(self.binary)==metadata['binary_sha256'])
     def stop(self):
-        self.api('desktop/update-stop',{'plan_id':self.id})
-        deadline=time.monotonic()+20
-        while time.monotonic()<deadline:
-            try:
-                with locked(self.home/'service.lock',False):return
-            except OSError:time.sleep(.1)
-        raise RuntimeError('service_did_not_stop')
+        handle=None
+        if os.name=='nt':
+            # Hold the actual authenticated service process before requesting exit.
+            # Its lock can release before Windows unloads its executable/DLLs.
+            import ctypes as c
+            from ctypes import wintypes as w
+            pid=self.api('status').get('addresses',{}).get('pid')
+            if not isinstance(pid,int) or not 0<pid<2**32:raise RuntimeError('service_process_unknown')
+            kernel=c.WinDLL('kernel32',use_last_error=True)
+            kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];kernel.OpenProcess.restype=w.HANDLE
+            kernel.WaitForSingleObject.argtypes=[w.HANDLE,w.DWORD];kernel.WaitForSingleObject.restype=w.DWORD
+            kernel.CloseHandle.argtypes=[w.HANDLE]
+            handle=kernel.OpenProcess(0x100000,False,pid)
+            if not handle:raise RuntimeError('service_process_unknown')
+        try:
+            self.api('desktop/update-stop',{'plan_id':self.id})
+            if handle and kernel.WaitForSingleObject(handle,20000)!=0:raise RuntimeError('service_did_not_exit')
+            deadline=time.monotonic()+20
+            while time.monotonic()<deadline:
+                try:
+                    with locked(self.home/'service.lock',False):return
+                except OSError:time.sleep(.1)
+            raise RuntimeError('service_did_not_stop')
+        finally:
+            if handle:kernel.CloseHandle(handle)
     def start(self):
         kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL}
         if os.name=='nt':kwargs['creationflags']=subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP
@@ -200,13 +218,12 @@ class Worker:
             child=getattr(self,'started_process',None)
             deadline=time.monotonic()+10
             while child is not None and child.poll() is None and time.monotonic()<deadline:
-                try:
-                    self.stop();break
-                except (OSError,RuntimeError):
-                    try:
-                        with locked(self.home/'service.lock',False):break
-                    except OSError:time.sleep(.1)
-            # A missing API is not proof of a stopped service.
+                try:self.stop()
+                except (OSError,RuntimeError):pass
+                if child.poll() is None:time.sleep(.1)
+            if child is not None and child.poll() is None:
+                raise RuntimeError('candidate_stop_unresolved')
+            # A free lock before the known child starts is not proof it stopped.
             with locked(self.home/'service.lock',False):pass
         backup=self.folder/'backup'
         if digest(backup/'binary')!=self.job['previous_sha256']:raise RuntimeError('rollback_digest_mismatch')

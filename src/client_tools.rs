@@ -6,9 +6,11 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::path::Component;
 use std::{
     collections::HashMap,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -145,6 +147,7 @@ impl ClientTools {
         )?;
         result
     }
+    #[cfg(unix)]
     fn local(&self, path: &str) -> Result<(PathBuf, PathBuf)> {
         let path = PathBuf::from(path);
         ensure!(

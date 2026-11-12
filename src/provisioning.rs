@@ -280,6 +280,9 @@ mod tests {
         (home, state, headers)
     }
 
+    // Uses the legacy PAM/system-Python fixture. The native package fixture covers
+    // this same paused-connection retry with its private Python on every platform.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn retrying_connect_preserves_existing_app_and_paused_state() {
         let (_home, state, headers) = existing();
