@@ -101,7 +101,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(result['app_id'],'ANEW')
             self.assertNotIn('token',json.dumps(result))
         self.assertEqual(self.created,1)
-        self.assertEqual((self.folder/'issued.json').stat().st_mode & 0o777,0o600)
+        if os.name != 'nt': self.assertEqual((self.folder/'issued.json').stat().st_mode & 0o777,0o600)
 
     def test_wrong_workspace_and_app_never_install(self):
         self.auth()
@@ -115,6 +115,16 @@ class SetupTests(unittest.TestCase):
         self.auth()
         with self.assertRaises(s.SetupError):s.execute(self.home,'token',{'team_id':'TTWO'})
         self.assertEqual(s.execute(self.home,'token',{'team_id':'TONE'})['token'],'private-access')
+
+    def test_hook_uses_current_private_python_and_handles_spaces(self):
+        project=self.folder/'project with spaces'
+        project.mkdir()
+        command=s.hook_command(project,'manifest')
+        self.assertIn(s.sys.executable,command)
+        self.assertIn('-I',command);self.assertIn('-B',command)
+        prepared=s.prepare_project(self.folder,{},'',{'team_id':'TONE'})
+        compile((prepared/'hooks.py').read_text(),'hooks.py','exec')
+        self.assertNotIn('python3 hooks.py',(prepared/'.slack/hooks.json').read_text())
 
     def test_existing_app_is_adopted_without_another_identity(self):
         self.auth()

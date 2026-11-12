@@ -1,0 +1,3 @@
+# These files are source-pinned packaging inputs. Preserve distributor bytes and
+# vendored-file hashes on Windows as well as Unix; do not normalize line endings.
+* -text

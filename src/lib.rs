@@ -6,6 +6,7 @@ pub mod client_tools;
 pub mod config;
 pub mod context;
 pub mod conversation_mode;
+pub mod desktop;
 pub mod driver;
 pub mod elicitation;
 pub mod error;
@@ -45,3 +46,5 @@ pub mod diagnostics;
 pub mod public_speech;
 
 pub mod connection;
+
+pub mod native_update;

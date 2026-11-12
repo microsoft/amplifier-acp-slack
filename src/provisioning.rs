@@ -25,7 +25,19 @@ pub async fn helper(home: &Path, action: &str, body: Value) -> anyhow::Result<Va
     // Use a pipe for codes and tokens; no command-line credential or CLI log output.
     let script = home.join("secrets/slack-setup-helper.py");
     private_write(&script, include_bytes!("../scripts/slack_setup.py"))?;
-    let mut command = Command::new("python3");
+    let bundled = crate::desktop::python_path(home);
+    let config = crate::config::Config::load(home)?;
+    let program = if bundled.is_file() {
+        bundled
+    } else {
+        anyhow::ensure!(
+            cfg!(target_os = "linux") && config.server.auth_mode == crate::config::AuthMode::Pam,
+            "The connector's private setup runtime is missing. Reopen the complete downloaded app bundle; no system Python fallback is used"
+        );
+        std::path::PathBuf::from("python3")
+    };
+    let mut command = Command::new(program);
+    command.args(["-I", "-B"]);
     command
         .arg(&script)
         .arg(home)
@@ -297,7 +309,8 @@ mod tests {
         assert!(!state.home.join("secrets/slack-setup/project").exists());
     }
 
-    #[cfg(unix)]
+    // This fixture exercises the legacy Linux system-Python/PAM installation path.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn confirming_access_finishes_existing_setup_without_installing_an_app() {
         use sha2::{Digest, Sha256};

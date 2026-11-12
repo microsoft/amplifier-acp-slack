@@ -31,7 +31,7 @@ for line in sys.stdin:
   send({'id':i,'result':{'stopReason':'end_turn'}})
 "#).unwrap();
     let mut c = Config::new("Bare ACP".into(), "owner".into());
-    c.acp.command = "python3".into();
+    c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
     c.acp.args = vec![script.to_string_lossy().into_owned()];
     c.acp.cwd = workspace.to_string_lossy().into_owned();
     c.acp.client.read_text_file = true;
@@ -58,7 +58,7 @@ for line in sys.stdin:
  print(json.dumps({'jsonrpc':'2.0','id':r['id'],**({'result':result} if result else {'error':{'code':-32000,'message':'DO NOT ECHO PROVIDER SECRET'}})}),flush=True)
 "#).unwrap();
     let mut c = Config::new("Auth".into(), "owner".into());
-    c.acp.command = "python3".into();
+    c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
     c.acp.args = vec![script.to_string_lossy().into_owned()];
     c.acp.cwd = temp.path().to_string_lossy().into_owned();
     let error = driver::check(&c, temp.path()).await.unwrap_err();

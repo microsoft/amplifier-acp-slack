@@ -277,7 +277,7 @@ pub fn admission(home: &Path) -> Result<Option<std::fs::File>> {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    if crate::connection::gated(home) {
+    if crate::connection::gated(home) || crate::native_update::blocks(home) {
         return Ok(None);
     }
     if let Some(job) = active(home)

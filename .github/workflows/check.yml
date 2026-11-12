@@ -71,3 +71,101 @@ jobs:
         working-directory: ui/tests
       - run: npm test
         working-directory: ui/tests
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ''
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: ''
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ''
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: ''
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            suffix: .exe
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux existing PAM build prerequisites
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libclang-dev pkg-config
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Native regression suite (Linux full suite remains in rust job)
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        run: cargo test --locked --all-targets
+      - run: cargo test --locked --test native_auth
+      - run: python tests/slack_setup.py
+      - run: python tests/native_update.py
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package private runtime and verify platform binary
+        shell: bash
+        run: |
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          python scripts/package-native.py --binary target/${{ matrix.target }}/release/acp-slack-adapter${{ matrix.suffix }} --target ${{ matrix.target }} --version "$VERSION"
+      - uses: actions/setup-node@v4
+        if: matrix.os == 'ubuntu-24.04'
+        with:
+          node-version: 22
+      - name: Native first-account browser prerequisites
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: ui/tests
+        run: npm ci && npx playwright install --with-deps chromium
+      - name: Extracted app setup, private Python, proof, restart and continuity (empty PATH)
+        shell: bash
+        run: |
+          ARCHIVE=$(python -c 'import pathlib; print(next(p for p in pathlib.Path("dist").iterdir() if p.name.endswith((".zip", ".tar.gz"))))')
+          EXTRA=""
+          if [[ "${{ matrix.os }}" == "ubuntu-24.04" ]]; then EXTRA="--browser"; fi
+          if [[ "${{ matrix.os }}" == windows* || "${{ matrix.os }}" == macos* ]]; then EXTRA="--verify-startup"; fi
+          python tests/native_launch.py --package "$ARCHIVE" --verify-setup-tool $EXTRA --result ${{ matrix.target }}-native-launch-result.json
+          python tests/native_update_process.py --package "$ARCHIVE" --result ${{ matrix.target }}-native-update-result.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-slack-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            dist/*
+            *-native-launch-result.json
+            *-native-update-result.json
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'microsoft/amplifier-acp-slack'
+    needs: [rust, browser, native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-slack-*-${{ github.sha }}
+          path: release-artifacts
+          merge-multiple: true
+      - name: Publish exact checked native bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python scripts/check-release-assets.py release-artifacts "${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" release-artifacts/dist/* --verify-tag --title "Slack Connector ${GITHUB_REF_NAME#v}" --notes-file docs/native-release-notes.md

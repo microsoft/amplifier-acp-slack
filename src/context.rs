@@ -1016,7 +1016,7 @@ pub async fn mcp(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Response> {
-    auth::same_origin(&headers)?;
+    auth::same_origin(&state, &headers)?;
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

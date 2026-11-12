@@ -26,7 +26,9 @@ pub(crate) fn named_page(html: &str, name: &str, service: &str) -> String {
 }
 use crate::{
     auth,
-    config::{Config, Secrets, private_dir, private_write, valid_secret_name},
+    config::{
+        AuthMode, Config, Secrets, WebTransport, private_dir, private_write, valid_secret_name,
+    },
     driver,
     error::{ApiError, ApiResult},
     runtime, slack,
@@ -66,6 +68,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/context/mcp", post(crate::context::mcp))
         .route("/certificate/root.crt", get(certificate))
         .route("/api/v1/auth/login", post(auth::login))
+        .route(
+            "/api/v1/desktop/updates",
+            get(crate::native_update::get).post(crate::native_update::command),
+        )
+        .route(
+            "/api/v1/desktop/update-readiness",
+            get(crate::native_update::readiness),
+        )
+        .route(
+            "/api/v1/desktop/update-stop",
+            post(crate::native_update::stop),
+        )
+        .route("/api/v1/auth/first-account", post(auth::first_account))
+        .route("/api/v1/local-proof", get(auth::local_proof))
+        .route(
+            "/api/v1/desktop/startup",
+            get(crate::desktop::startup_get).put(crate::desktop::startup_set),
+        )
         .route("/api/v1/auth/session", get(auth::session))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/config", get(config_get).put(config_put))
@@ -179,6 +199,18 @@ async fn security_headers(
     {
         request.headers_mut().insert(header::HOST, value);
     }
+    if state.instance_config().server.web_transport == WebTransport::LocalHttp {
+        let expected = format!("127.0.0.1:{}", state.instance_config().server.port);
+        if request
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            != Some(expected.as_str())
+            || auth::same_origin(&state, request.headers()).is_err()
+        {
+            return ApiError::forbidden().into_response();
+        }
+    }
     let mut response = next.run(request).await;
     let csp = format!(
         "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self' {}",
@@ -205,9 +237,13 @@ struct ConfigUpdate {
     config: Config,
 }
 fn immutable_identity(state: &AppState, old: &Config, new: &Config) -> ApiResult<()> {
-    if old.id != new.id || old.server.owner != new.server.owner {
+    if old.id != new.id
+        || old.server.owner != new.server.owner
+        || old.server.auth_mode != new.server.auth_mode
+        || old.server.web_transport != new.server.web_transport
+    {
         return Err(ApiError::bad(
-            "Adapter ID and installation owner cannot be changed",
+            "Adapter ID, installation owner and sign-in transport cannot be changed",
         ));
     }
     if state.observed()? {
@@ -725,7 +761,9 @@ async fn conversations(
     Ok(Json(Store::open(&state.home)?.conversations()?))
 }
 fn secret_path(state: &AppState, name: &str) -> ApiResult<PathBuf> {
-    if !valid_secret_name(name) || ["control-token", "slack"].contains(&name) {
+    if !valid_secret_name(name)
+        || ["control-token", "slack", "local-password", "first-account"].contains(&name)
+    {
         return Err(ApiError::bad(
             "Choose an unreserved secret name using letters, numbers, underscores, or hyphens",
         ));
@@ -957,7 +995,7 @@ fn cert_names(bind: IpAddr) -> Vec<String> {
     if !bind.is_unspecified() {
         names.push(bind.to_string());
     }
-    if let Ok(ifaces) = get_if_addrs::get_if_addrs() {
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
         names.extend(ifaces.into_iter().map(|i| i.ip().to_string()));
     }
     if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
@@ -1067,20 +1105,29 @@ fn install_redacted_panic_hook() {
     });
 }
 pub async fn serve(home: PathBuf) -> Result<()> {
+    serve_with_browser(home, false).await
+}
+pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()> {
     install_redacted_panic_hook();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let home = home.canonicalize()?;
     let state = Arc::new(AppState::open(home)?);
-    let owner = std::process::Command::new("id")
-        .arg("-un")
-        .output()
-        .context("Cannot determine installation owner")?;
-    ensure!(
-        owner.status.success()
-            && String::from_utf8_lossy(&owner.stdout).trim()
-                == state.instance_config().server.owner,
-        "Run this adapter service as its configured installation owner"
-    );
+    if state.instance_config().server.auth_mode == AuthMode::Pam {
+        ensure!(
+            cfg!(target_os = "linux"),
+            "This installation uses Linux PAM; keep its owner-managed sign-in configuration on Linux"
+        );
+        let owner = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .context("Cannot determine installation owner")?;
+        ensure!(
+            owner.status.success()
+                && String::from_utf8_lossy(&owner.stdout).trim()
+                    == state.instance_config().server.owner,
+            "Run this adapter service as its configured installation owner"
+        );
+    }
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1101,7 +1148,17 @@ pub async fn serve(home: PathBuf) -> Result<()> {
         c.revision += 1;
         c.save(&state.home)?;
     }
+    if state.instance_config().server.web_transport == WebTransport::LocalHttp {
+        let mut c = state.config.write().unwrap();
+        let origin = format!("http://127.0.0.1:{port}");
+        if c.server.public_url.as_deref() != Some(&origin) {
+            c.server.public_url = Some(origin);
+            c.revision += 1;
+            c.save(&state.home)?;
+        }
+    }
     let c = state.instance_config();
+    let local_http = c.server.web_transport == WebTransport::LocalHttp;
     let mut names = cert_names(bind);
     if let Some(host) = c
         .server
@@ -1114,7 +1171,9 @@ pub async fn serve(home: PathBuf) -> Result<()> {
         names.sort();
         names.dedup();
     }
-    prepare_tls(&state.home, &c.id, names)?;
+    if !local_http {
+        prepare_tls(&state.home, &c.id, names)?;
+    }
     let loopback = if bind.is_unspecified() {
         if bind.is_ipv4() {
             "127.0.0.1".parse()?
@@ -1124,10 +1183,14 @@ pub async fn serve(home: PathBuf) -> Result<()> {
     } else {
         bind
     };
-    let base_url = https_url(loopback, port);
+    let base_url = if local_http {
+        format!("http://127.0.0.1:{port}")
+    } else {
+        https_url(loopback, port)
+    };
     let mut urls = vec![base_url.clone()];
     if bind.is_unspecified()
-        && let Ok(ifaces) = get_if_addrs::get_if_addrs()
+        && let Ok(ifaces) = if_addrs::get_if_addrs()
     {
         urls.extend(
             ifaces
@@ -1144,13 +1207,13 @@ pub async fn serve(home: PathBuf) -> Result<()> {
     urls.dedup();
     let cert = state.home.join("tls/cert.pem");
     let key = state.home.join("tls/key.pem");
-    let addresses = json!({"base_url":base_url,"urls":urls,"certificate_file":cert,"trust_certificate_file":state.home.join("tls/root-ca.crt"),"effective_server":c.server,"started_at":now_ms(),"pid":std::process::id()});
+    let addresses = json!({"base_url":base_url,"urls":urls,"certificate_file":(!local_http).then_some(&cert),"trust_certificate_file":(!local_http).then_some(state.home.join("tls/root-ca.crt")),"effective_server":c.server,"started_at":now_ms(),"pid":std::process::id()});
     private_write(
         &state.home.join("endpoints.json"),
         &serde_json::to_vec_pretty(&addresses)?,
     )?;
     *state.addresses.write().unwrap() = addresses;
-    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+
     state.event(
         "management_service_started",
         json!({"version":env!("CARGO_PKG_VERSION"),"port":port}),
@@ -1163,6 +1226,7 @@ pub async fn serve(home: PathBuf) -> Result<()> {
         runtime::supervise(runtime_home, changes),
     ));
     let handle = axum_server::Handle::new();
+    *state.shutdown.lock().unwrap() = Some(handle.clone());
     let shutdown = handle.clone();
     let signal_task = tokio::spawn(async move {
         #[cfg(unix)]
@@ -1183,10 +1247,23 @@ pub async fn serve(home: PathBuf) -> Result<()> {
         c.server.public_url.as_deref().unwrap_or(&base_url),
         c.server.owner
     );
-    let result = axum_server::from_tcp_rustls(listener, tls)?
-        .handle(handle)
-        .serve(router(state.clone()).into_make_service())
-        .await;
+    if open_browser {
+        crate::desktop::ready(&state.home, &c, true)?;
+    } else if local_http {
+        crate::desktop::ready(&state.home, &c, false)?;
+    }
+    let result = if local_http {
+        axum_server::from_tcp(listener)?
+            .handle(handle)
+            .serve(router(state.clone()).into_make_service())
+            .await
+    } else {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+        axum_server::from_tcp_rustls(listener, tls)?
+            .handle(handle)
+            .serve(router(state.clone()).into_make_service())
+            .await
+    };
     runtime_task.abort();
     let _ = runtime_task.await;
     crate::work_status::shutdown(&state.home).await;

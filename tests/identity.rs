@@ -105,7 +105,7 @@ for line in sys.stdin:
     let source = home.join("portrait.json");
     std::fs::write(&source, portrait(50, "uploaded").to_string()).unwrap();
     let mut config = Config::new("Portrait test".into(), "tester".into());
-    config.acp.command = "/usr/bin/python3".into();
+    config.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
     config.acp.cwd = home.to_string_lossy().into();
     config.acp.args = vec![
         peer.to_string_lossy().into(),
@@ -289,7 +289,7 @@ for line in sys.stdin:
    time.sleep(.03)
 "#).unwrap();
     let mut c = Config::new("Observer".into(), "tester".into());
-    c.acp.command = "/usr/bin/python3".into();
+    c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
     c.acp.cwd = home.to_string_lossy().into();
     c.acp.args = vec![
         peer.to_string_lossy().into(),

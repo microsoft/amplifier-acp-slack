@@ -50,7 +50,7 @@ for line in sys.stdin:
  else:send({'id':i,'error':{'code':-32601,'message':'not supported'}})
 "#).unwrap();
         let mut c = Config::new("Mode fixture".into(), "owner".into());
-        c.acp.command = "python3".into();
+        c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
         c.acp.args = vec![
             script.to_string_lossy().into_owned(),
             root.to_string_lossy().into_owned(),

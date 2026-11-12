@@ -16,6 +16,10 @@ Slack app ← Socket Mode → this connector ← standard ACP stdio → your age
 
 ## Start here
 
+Download a [native Slack Connector release](https://github.com/microsoft/amplifier-acp-slack/releases) for Windows, Mac or Linux, extract the complete download, and open the app. Choose a local connector password, then connect an already installed and authorized ACP agent and your Slack workspace. No developer toolchain or system Python is required. See [native installation and recovery](docs/native-installation.md) for platform details.
+
+For an existing Linux server installation:
+
 ```sh
 git clone https://github.com/microsoft/amplifier-acp-slack.git
 cd amplifier-acp-slack

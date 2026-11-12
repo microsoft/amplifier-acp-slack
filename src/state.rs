@@ -25,6 +25,7 @@ pub struct AppState {
     pub check_gate: Arc<Semaphore>,
     pub setup_gate: Semaphore,
     pub runtime_failure: RwLock<Option<Value>>,
+    pub shutdown: Mutex<Option<axum_server::Handle<std::net::SocketAddr>>>,
 }
 impl AppState {
     pub fn open(home: PathBuf) -> Result<Self> {
@@ -60,6 +61,7 @@ impl AppState {
             check_gate: Arc::new(Semaphore::new(1)),
             setup_gate: Semaphore::new(1),
             runtime_failure: RwLock::new(None),
+            shutdown: Mutex::new(None),
         })
     }
     pub fn instance_config(&self) -> Config {
