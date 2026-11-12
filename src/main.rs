@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use acp_slack_adapter::{
     config::{self, Config},
     driver, slack,
@@ -104,8 +105,21 @@ enum ConfigAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let show_error = cli.command.is_none() && !cli.no_browser;
+    if let Err(error) = run(cli).await {
+        if show_error {
+            amplifier_native_platform::show_launch_error(
+                &acp_slack_adapter::desktop::APPLICATION,
+                &error.to_string(),
+            );
+        }
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+async fn run(cli: Cli) -> Result<()> {
     if cli.command.is_none() {
         let home = cli
             .home
