@@ -76,7 +76,10 @@ def ensure_cli(folder):
             data = bundle.read(candidates[0])
     else:
         with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
-            member = bundle.getmember('bin/slack')
+            candidates = [m for m in bundle.getmembers() if m.name in {'bin/slack', './bin/slack'}]
+            if len(candidates) != 1:
+                raise SetupError('The Slack setup download is invalid.')
+            member = candidates[0]
             if not member.isfile() or member.size > 150 * 1024 * 1024:
                 raise SetupError('The Slack setup download is invalid.')
             data = bundle.extractfile(member).read()

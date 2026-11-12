@@ -36,7 +36,7 @@ def run(package,result):
    for fail in [None,"health","start"]:
     identifier=str(uuid.uuid4());folder=home/'native-updates'/identifier;folder.mkdir(parents=True)
     shutil.copytree(bundle,folder/'candidate');entry=binary.relative_to(bundle).as_posix()
-    job={'schema':1,'id':identifier,'state':'ready','action':'apply','entry':entry,'binary_sha256':worker.digest(binary),'installed_sha256':worker.digest(original_binary),'config_sha256':worker.digest(home/'adapter.json'),'version':subprocess.check_output([str(binary),'--version'],text=True).strip().split()[-1],'release_url':'https://example.invalid/disposable-fixture'}
+    job={'schema':1,'id':identifier,'state':'ready','action':'apply','entry':entry,'binary_sha256':worker.digest(binary),'installed_sha256':worker.digest(original_binary),'config_sha256':worker.digest(home/'adapter.json'),'version':subprocess.check_output([str(binary),'--version'],text=True,encoding='utf-8').strip().split()[-1],'release_url':'https://example.invalid/disposable-fixture'}
     worker.write(folder/'plan.json',job);worker.write(home/'native-updates/active.json',{'id':identifier})
     current=worker.Worker(home,identifier)
     real_health=current.health;health_calls=[]

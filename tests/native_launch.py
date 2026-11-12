@@ -66,10 +66,10 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             assert status==200 and session['authenticated']
             encoded=(home/'secrets/local-password').read_bytes();assert encoded.startswith(b'$argon2id$') and password.encode() not in encoded;checks.append('create-only protected local account')
             config_bytes=(home/'adapter.json').read_bytes();password_hash=hashlib.sha256(encoded).hexdigest()
-            reopened=subprocess.run([str(binary),'--home',str(home),'--no-browser'],env=env,capture_output=True,text=True,timeout=20);assert reopened.returncode==0,reopened.stderr;assert (home/'adapter.json').read_bytes()==config_bytes;checks.append('second open verifies existing identity without replacement')
-            status_run=subprocess.run([str(binary),'--home',str(home),'api','GET','status'],env=env,capture_output=True,text=True,timeout=20);assert status_run.returncode==0,status_run.stderr;assert json.loads(status_run.stdout)['id']==config['id'];checks.append('same-connection listener proof before CLI authorization')
+            reopened=subprocess.run([str(binary),'--home',str(home),'--no-browser'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert reopened.returncode==0,reopened.stderr;assert (home/'adapter.json').read_bytes()==config_bytes;checks.append('second open verifies existing identity without replacement')
+            status_run=subprocess.run([str(binary),'--home',str(home),'api','GET','status'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert status_run.returncode==0,status_run.stderr;assert json.loads(status_run.stdout)['id']==config['id'];checks.append('same-connection listener proof before CLI authorization')
             private_python=home/'runtime/python'/('python.exe' if os.name=='nt' else 'bin/python3')
-            py=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c','import ssl,sqlite3,json; print(json.dumps({"isolated":__import__("sys").flags.isolated,"ssl":bool(ssl.OPENSSL_VERSION)}))'],env=env,capture_output=True,text=True,timeout=20);assert py.returncode==0,py.stderr;assert json.loads(py.stdout)=={'isolated':1,'ssl':True};checks.append('private Python starts without system tools')
+            py=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c','import ssl,sqlite3,json; print(json.dumps({"isolated":__import__("sys").flags.isolated,"ssl":bool(ssl.OPENSSL_VERSION)}))'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert py.returncode==0,py.stderr;assert json.loads(py.stdout)=={'isolated':1,'ssl':True};checks.append('private Python starts without system tools')
             cookie=headers['set-cookie'].split(';',1)[0];status,_,_=request(base,'/api/v1/setup/slack',headers={'Cookie':cookie});assert status==200;checks.append('guided Slack setup status uses bundled runtime without network or credentials')
             if verify_startup:
                 if os.name!='nt' and __import__('sys').platform!='darwin':raise AssertionError('Startup fixture is limited to native Windows/Mac CI')
@@ -91,9 +91,9 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                 checks.append('startup removal preserves installation and account')
 
             if verify_setup_tool:
-                code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
+                code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
                 vendor_env={**env,'SLACK_SKIP_UPDATE':'true','NO_COLOR':'1'}
-                verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,timeout=150)
+                verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150)
                 assert verified.returncode==0,verified.stderr
                 checks.append('actual checksum-pinned official Slack CLI starts on this platform')
 
