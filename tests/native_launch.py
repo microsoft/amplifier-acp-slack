@@ -81,13 +81,20 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                     if os.name=='nt':
                         xml=subprocess.check_output([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Query','/TN',label,'/XML'])
                         observed=xml.decode('utf-16') if xml.startswith(b'\xff\xfe') else xml.decode('utf-16-le') if xml.startswith(b'<\x00') else xml.decode('utf-8')
-                        assert 'acp-slack-adapter.exe' in observed and str(home) in observed
+                        assert 'acp-slack-adapter.exe' in observed and str(home) in observed, json.dumps({'expected_home':str(home),'registered_xml':(home/'startup.xml').read_text(encoding='utf-16'),'observed_xml':observed},ensure_ascii=True)
                     else:
                         observed=(Path.home()/'Library/LaunchAgents'/(label+'.plist')).read_text(encoding='utf-8');assert str(home) in observed and 'acp-slack-adapter' in observed
                     checks.append('actual current-user startup registration points to the preserved installation')
                 finally:
                     r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':False}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
-                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert not json.load(response)['configured']
+                    try:
+                        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert not json.load(response)['configured']
+                    except urllib.error.HTTPError as error:
+                        # Only this fresh fixture task is eligible for cleanup.
+                        # Retain the product refusal instead of weakening its guard.
+                        detail=error.read().decode('utf-8',errors='replace')
+                        if os.name=='nt':subprocess.run([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Delete','/TN',label,'/F'],capture_output=True,check=False)
+                        raise AssertionError('Startup removal refused: '+detail) from error
                 checks.append('startup removal preserves installation and account')
 
             if verify_setup_tool:
