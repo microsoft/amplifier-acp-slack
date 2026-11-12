@@ -35,7 +35,7 @@ for line in sys.stdin:
         c.context.enabled = false;
         c.participation = "ambient".into();
         c.slack.bot_user_id = "Uagent".into();
-        c.acp.command = "python3".into();
+        c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
         c.acp.args = vec![
             script.to_string_lossy().into(),
             t.path().to_string_lossy().into(),

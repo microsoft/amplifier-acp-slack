@@ -232,7 +232,7 @@ for line in sys.stdin:
  if i is not None:send({'id':i,'result':result})
 "#).unwrap();
         c.context.enabled = false;
-        c.acp.command = "python3".into();
+        c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
         c.acp.cwd = home.path().to_string_lossy().into();
         c.acp.args = vec![
             script.to_string_lossy().into(),

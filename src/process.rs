@@ -2,10 +2,20 @@
 use anyhow::Result;
 use tokio::process::{Child, Command};
 
+/// fs2 preserves Windows ERROR_LOCK_VIOLATION, which is not WouldBlock.
+pub(crate) fn lock_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
 pub fn prepare(command: &mut Command) {
     #[cfg(unix)]
     command.process_group(0);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    #[cfg(not(any(unix, windows)))]
     let _ = command;
 }
 
@@ -28,7 +38,7 @@ impl ProcessTree {
         }
         #[cfg(windows)]
         {
-            use std::{mem, ptr, size_of};
+            use std::{mem, ptr};
             use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::*};
             let handle = child
                 .raw_handle()
@@ -47,7 +57,7 @@ impl ProcessTree {
                     job,
                     JobObjectExtendedLimitInformation,
                     &info as *const _ as _,
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 ) == 0
                     || AssignProcessToJobObject(job, handle as _) == 0
                 {
@@ -55,7 +65,13 @@ impl ProcessTree {
                     CloseHandle(job);
                     return Err(error.into());
                 }
-                Ok(Self { job: job as usize })
+                let tree = Self { job: job as usize };
+                resume_suspended(
+                    child
+                        .id()
+                        .ok_or_else(|| anyhow::anyhow!("Child exited before resume"))?,
+                )?;
+                Ok(tree)
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -84,4 +100,44 @@ impl Drop for ProcessTree {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn resume_suspended(pid: u32) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::*,
+        System::{Diagnostics::ToolHelp::*, Threading::*},
+    };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    anyhow::ensure!(
+        snapshot != INVALID_HANDLE_VALUE,
+        "Could not inspect the suspended child process"
+    );
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut found = None;
+    let mut available = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while available {
+        if entry.th32OwnerProcessID == pid {
+            found = Some(entry.th32ThreadID);
+            break;
+        }
+        available = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    let id = found
+        .ok_or_else(|| anyhow::anyhow!("The suspended child process has no initial thread"))?;
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, id) };
+    anyhow::ensure!(
+        !thread.is_null(),
+        "Could not open the suspended child thread"
+    );
+    let resumed = unsafe { ResumeThread(thread) };
+    unsafe {
+        CloseHandle(thread);
+    }
+    anyhow::ensure!(resumed == 1, "Could not resume the suspended child process");
+    Ok(())
 }

@@ -158,9 +158,27 @@ impl Default for Attention {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    #[default]
+    Pam,
+    LocalPassword,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebTransport {
+    #[default]
+    Https,
+    LocalHttp,
+}
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub auth_mode: AuthMode,
+    #[serde(default)]
+    pub web_transport: WebTransport,
     pub bind: String,
     pub port: u16,
     pub owner: String,
@@ -195,6 +213,8 @@ impl Config {
             context: ContextConfig::default(),
             media: MediaConfig::default(),
             server: ServerConfig {
+                auth_mode: AuthMode::Pam,
+                web_transport: WebTransport::Https,
                 bind: "127.0.0.1".into(),
                 port: 0,
                 owner,
@@ -334,7 +354,12 @@ impl Config {
             );
         }
         for name in self.acp.secret_env.values() {
-            ensure!(valid_secret_name(name), "Invalid secret reference");
+            ensure!(
+                valid_secret_name(name)
+                    && !["control-token", "local-password", "first-account"]
+                        .contains(&name.as_str()),
+                "Invalid or reserved secret reference"
+            );
         }
         ensure!(
             self.slack.channels.len() <= 500
@@ -372,12 +397,30 @@ impl Config {
             valid_secret_name(&self.server.pam_service),
             "Invalid PAM service name"
         );
-        for origin in self
-            .server
-            .embed_origins
-            .iter()
-            .chain(self.server.public_url.iter())
-        {
+        if self.server.web_transport == WebTransport::LocalHttp {
+            ensure!(
+                self.server.bind == "127.0.0.1" && self.server.auth_mode == AuthMode::LocalPassword,
+                "Local HTTP requires local-password sign-in and the 127.0.0.1 loopback address"
+            );
+            ensure!(
+                self.server.embed_origins.is_empty(),
+                "Local HTTP cannot be embedded by other origins"
+            );
+            if let Some(origin) = &self.server.public_url {
+                ensure!(
+                    self.server.port > 0
+                        && origin.trim_end_matches('/')
+                            == format!("http://127.0.0.1:{}", self.server.port),
+                    "Local HTTP must use this installation's exact loopback origin"
+                );
+            }
+        }
+        for origin in self.server.embed_origins.iter().chain(
+            self.server
+                .public_url
+                .iter()
+                .filter(|_| self.server.web_transport == WebTransport::Https),
+        ) {
             let u = reqwest::Url::parse(origin)?;
             ensure!(
                 u.scheme() == "https"
@@ -464,38 +507,17 @@ pub fn looks_secret(s: &str) -> bool {
         .any(|p| s.contains(p))
 }
 pub fn private_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    amplifier_native_platform::private_dir(path)
 }
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("Missing parent folder")?;
-    private_dir(parent)?;
-    let temp = parent.join(format!(".write-{}", uuid::Uuid::new_v4()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&temp)?;
-    use std::io::Write;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    amplifier_native_platform::private_write(path, bytes)
 }
-pub fn check_private(path: &Path) -> Result<()> {
+pub fn check_private(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         ensure!(
-            std::fs::metadata(path)?.permissions().mode() & 0o077 == 0,
+            std::fs::metadata(_path)?.permissions().mode() & 0o077 == 0,
             "Credential file permissions must be private (600)"
         );
     }

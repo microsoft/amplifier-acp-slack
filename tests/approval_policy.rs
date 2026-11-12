@@ -48,7 +48,7 @@ for line in sys.stdin:
         let mut c = Config::new("Policy fixture".into(), "owner".into());
         c.enabled = true;
         c.setup_complete = true;
-        c.acp.command = "python3".into();
+        c.acp.command = (if cfg!(windows) { "python" } else { "python3" }).into();
         c.acp.args = vec![
             peer.to_string_lossy().into_owned(),
             home.to_string_lossy().into_owned(),

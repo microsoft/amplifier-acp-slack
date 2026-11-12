@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use acp_slack_adapter::{
     config::{self, Config},
     driver, slack,
@@ -17,7 +18,9 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
     #[command(subcommand)]
-    command: Action,
+    command: Option<Action>,
+    #[arg(long, global = true)]
+    no_browser: bool,
 }
 #[derive(Subcommand)]
 enum Action {
@@ -102,12 +105,32 @@ enum ConfigAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let show_error = cli.command.is_none() && !cli.no_browser;
+    if let Err(error) = run(cli).await {
+        if show_error {
+            amplifier_native_platform::show_launch_error(
+                &acp_slack_adapter::desktop::APPLICATION,
+                &error.to_string(),
+            );
+        }
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+async fn run(cli: Cli) -> Result<()> {
+    if cli.command.is_none() {
+        let home = cli
+            .home
+            .map(Ok)
+            .unwrap_or_else(acp_slack_adapter::desktop::default_home)?;
+        return acp_slack_adapter::desktop::launch(home, !cli.no_browser).await;
+    }
     let home = cli
         .home
         .context("Supply --home with this adapter installation folder")?;
-    match cli.command {
+    match cli.command.expect("Command checked above") {
         Action::Init {
             label,
             owner,
@@ -138,7 +161,11 @@ async fn main() -> Result<()> {
                 let raw: Value =
                     serde_json::from_slice(&std::fs::read(agent.join("config.json"))?)?;
                 let raw = raw.get("config").unwrap_or(&raw);
-                let binary = agent.join("bin/agent-instance");
+                let binary = agent.join(if cfg!(windows) {
+                    "bin/agent-instance.exe"
+                } else {
+                    "bin/agent-instance"
+                });
                 ensure!(binary.is_file(), "Agent executable was not found");
                 c.acp.command = binary.to_string_lossy().into_owned();
                 c.acp.args = vec![
@@ -313,7 +340,8 @@ async fn main() -> Result<()> {
         Action::Secret { name, file } => {
             ensure!(
                 config::valid_secret_name(&name)
-                    && !["control-token", "slack"].contains(&name.as_str()),
+                    && !["control-token", "slack", "local-password", "first-account"]
+                        .contains(&name.as_str()),
                 "Choose a valid non-reserved secret name"
             );
             let bytes = std::fs::read(file)?;
@@ -340,51 +368,5 @@ fn print(value: Value) -> Result<()> {
     Ok(())
 }
 async fn api(home: &Path, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-    ensure!(
-        !path.contains("..") && !path.contains("://") && !path.starts_with('/'),
-        "Use a relative API path"
-    );
-    let endpoints: Value = serde_json::from_slice(
-        &std::fs::read(home.join("endpoints.json")).context("Start the adapter service first")?,
-    )?;
-    let base = endpoints["base_url"]
-        .as_str()
-        .context("No local service URL")?;
-    let certificate = endpoints["trust_certificate_file"]
-        .as_str()
-        .or_else(|| endpoints["certificate_file"].as_str())
-        .context("No local service certificate")?;
-    let token_path = home.join("secrets/control-token");
-    config::check_private(&token_path)?;
-    let token = std::fs::read_to_string(token_path)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(90))
-        .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(
-            certificate,
-        )?)?)
-        .build()?;
-    let mut r = client
-        .request(
-            method.parse()?,
-            format!("{}/api/v1/{path}", base.trim_end_matches('/')),
-        )
-        .bearer_auth(token.trim());
-    if let Some(value) = body {
-        r = r.json(&value);
-    }
-    let response = r
-        .send()
-        .await
-        .context("Could not reach the adapter service")?;
-    let status = response.status();
-    let value: Value = response.json().await?;
-    ensure!(
-        status.is_success(),
-        "{}",
-        value["error"]
-            .as_str()
-            .unwrap_or("Management operation failed")
-    );
-    Ok(value)
+    acp_slack_adapter::desktop::local_api(home, method, path, body).await
 }

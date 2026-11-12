@@ -37,7 +37,7 @@ pub(crate) async fn turn_lock(home: &FsPath, context: &str) -> anyhow::Result<Fi
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if crate::process::lock_busy(&error) => {
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
             Err(error) => return Err(error.into()),

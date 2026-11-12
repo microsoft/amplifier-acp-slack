@@ -101,7 +101,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(result['app_id'],'ANEW')
             self.assertNotIn('token',json.dumps(result))
         self.assertEqual(self.created,1)
-        self.assertEqual((self.folder/'issued.json').stat().st_mode & 0o777,0o600)
+        if os.name != 'nt': self.assertEqual((self.folder/'issued.json').stat().st_mode & 0o777,0o600)
 
     def test_wrong_workspace_and_app_never_install(self):
         self.auth()
@@ -115,6 +115,37 @@ class SetupTests(unittest.TestCase):
         self.auth()
         with self.assertRaises(s.SetupError):s.execute(self.home,'token',{'team_id':'TTWO'})
         self.assertEqual(s.execute(self.home,'token',{'team_id':'TONE'})['token'],'private-access')
+
+    def test_hook_uses_current_private_python_and_handles_spaces(self):
+        project=self.folder/'project with spaces'
+        project.mkdir()
+        command=s.hook_command(project,'manifest')
+        self.assertIn(s.sys.executable,command)
+        self.assertIn('-I',command);self.assertIn('-B',command);self.assertIn('-X',command);self.assertIn('utf8',command)
+        prepared=s.prepare_project(self.folder,{},'',{'team_id':'TONE'})
+        compile((prepared/'hooks.py').read_text(),'hooks.py','exec')
+        self.assertNotIn('python3 hooks.py',(prepared/'.slack/hooks.json').read_text())
+
+    def test_official_mac_dot_prefix_and_linux_archive_layouts(self):
+        import io,tarfile,hashlib
+        for name in ['bin/slack','./bin/slack']:
+            archive=io.BytesIO()
+            with tarfile.open(fileobj=archive,mode='w:gz') as bundle:
+                member=tarfile.TarInfo(name);member.size=6;bundle.addfile(member,io.BytesIO(b'native'))
+            data=archive.getvalue();target=('macOS_arm64',hashlib.sha256(data).hexdigest())
+            folder=self.folder/name.replace('/','_')
+            with patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
+                self.assertEqual(s.ensure_cli(folder).read_bytes(),b'native')
+
+    def test_verified_archive_still_rejects_ambiguous_binary_entries(self):
+        import io,tarfile,hashlib
+        archive=io.BytesIO()
+        with tarfile.open(fileobj=archive,mode='w:gz') as bundle:
+            for name in ['bin/slack','./bin/slack']:
+                member=tarfile.TarInfo(name);member.size=6;bundle.addfile(member,io.BytesIO(b'native'))
+        data=archive.getvalue();target=('macOS_arm64',hashlib.sha256(data).hexdigest())
+        with patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
+            with self.assertRaises(s.SetupError):s.ensure_cli(self.folder)
 
     def test_existing_app_is_adopted_without_another_identity(self):
         self.auth()

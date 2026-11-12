@@ -1,11 +1,19 @@
 use acp_slack_adapter::{client_tools::ClientTools, config::Config};
-use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
 fn setup() -> (tempfile::TempDir, Config, ClientTools) {
     let t = tempfile::tempdir().unwrap();
     std::fs::create_dir(t.path().join("adapter")).unwrap();
     std::fs::create_dir(t.path().join("workspace")).unwrap();
     let mut c = Config::new("Client tools".into(), "owner".into());
-    c.acp.cwd = t.path().join("workspace").to_str().unwrap().into();
+    c.acp.cwd = std::fs::canonicalize(t.path().join("workspace"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .into();
     c.acp.client.workspace_roots = vec![c.acp.cwd.clone()];
     c.acp.client.read_text_file = true;
     c.acp.client.write_text_file = true;
@@ -14,6 +22,7 @@ fn setup() -> (tempfile::TempDir, Config, ClientTools) {
     let tools = ClientTools::new(&c, &t.path().join("adapter"), "session").unwrap();
     (t, c, tools)
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn bounded_files_and_paths() {
     let (t, c, tools) = setup();
@@ -62,10 +71,11 @@ async fn bounded_files_and_paths() {
     {
         std::os::unix::fs::symlink(t.path().join("adapter"), t.path().join("workspace/escape"))
             .unwrap();
-        assert!(tools.call("fs/write_text_file",&json!({"sessionId":"session","path":t.path().join("workspace/escape/no.txt"),"content":"bad"})).await.is_err());
+        assert!(tools.call("fs/write_text_file",&json!({"sessionId":"session","path":std::path::Path::new(&c.acp.cwd).join("escape/no.txt"),"content":"bad"})).await.is_err());
         assert!(!t.path().join("adapter/no.txt").exists());
     }
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn capabilities_are_opt_in_and_cannot_expose_adapter_home() {
     let (t, mut c, _) = setup();
@@ -148,4 +158,22 @@ async fn read_only_terminal_and_lifetime_are_enforced() {
     .unwrap()
     .unwrap();
     assert_ne!(exit["exitCode"], 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_does_not_advertise_unavailable_filesystem_or_terminal() {
+    let mut c = Config::new("Native".into(), "owner".into());
+    c.acp.client.read_text_file = true;
+    c.acp.client.write_text_file = true;
+    c.acp.client.terminal = true;
+    assert_eq!(
+        acp_slack_adapter::client_tools::advertised(&c)["fs"]["readTextFile"],
+        false
+    );
+    assert_eq!(
+        acp_slack_adapter::client_tools::advertised(&c)["terminal"],
+        false
+    );
+    assert!(ClientTools::new(&c, std::path::Path::new("unused"), "session").is_err());
 }

@@ -4,7 +4,11 @@
 The service invokes this helper with JSON on stdin. Only the internal `token`
 operation returns an access token, directly to the service's private pipe.
 """
-import fcntl
+import os
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 import hashlib
 import io
 import json
@@ -13,6 +17,8 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import shlex
+import zipfile
 import sys
 import tarfile
 import time
@@ -24,6 +30,9 @@ ARCHIVES = {
     ('Linux', 'aarch64'): ('linux_arm64', 'd98ad8ba0848958a47befb73761a51ebd97a363b431758e177a828c7774bdb7d'),
     ('Darwin', 'x86_64'): ('macOS_amd64', '838aa81d10f82e5e9212800d084924ac66e5807aecaac16ae747c90d985352a2'),
     ('Darwin', 'arm64'): ('macOS_arm64', '23a5001854d2bb283ded8ad941cff13d4b2573ba922233087609b70ce53e4b6d'),
+    # Slack publishes x64 only. Windows 11 ARM runs this official CLI through OS x64 compatibility.
+    ('Windows', 'AMD64'): ('windows_64-bit', 'b1ca5e13e7c90cc7a9dfcb2af055f91d9a1e22db20790caa50ab530c07d4e914'),
+    ('Windows', 'ARM64'): ('windows_64-bit', 'b1ca5e13e7c90cc7a9dfcb2af055f91d9a1e22db20790caa50ab530c07d4e914'),
 }
 
 
@@ -44,29 +53,41 @@ def write(path, value):
 
 
 def ensure_cli(folder):
-    binary = folder / 'bin/slack'
+    binary = folder / ('bin/slack.exe' if os.name == 'nt' else 'bin/slack')
     receipt = read(folder / 'cli.json', {})
     if binary.exists() and receipt.get('version') == VERSION:
         if hashlib.sha256(binary.read_bytes()).hexdigest() == receipt.get('sha256'):
             return binary
     target = ARCHIVES.get((platform.system(), platform.machine()))
     if not target:
-        raise SetupError('Automatic Slack setup supports Linux and macOS. Manual credentials remain available in Advanced setup.')
+        raise SetupError('Automatic Slack setup is not available for this processor. Manual credentials remain available in Advanced setup.')
     suffix, checksum = target
-    url = f'https://github.com/slackapi/slack-cli/releases/download/v{VERSION}/slack_cli_{VERSION}_{suffix}.tar.gz'
+    extension = 'zip' if suffix.startswith('windows_') else 'tar.gz'
+    url = f'https://github.com/slackapi/slack-cli/releases/download/v{VERSION}/slack_cli_{VERSION}_{suffix}.{extension}'
     with urllib.request.urlopen(url, timeout=45) as response:
         archive = response.read(100 * 1024 * 1024 + 1)
     if len(archive) > 100 * 1024 * 1024 or hashlib.sha256(archive).hexdigest() != checksum:
         raise SetupError('The Slack setup tool could not be verified. Retry the download.')
-    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
-        member = bundle.getmember('bin/slack')
-        if not member.isfile() or member.size > 150 * 1024 * 1024:
-            raise SetupError('The Slack setup download is invalid.')
-        binary.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temporary = binary.with_suffix('.new')
-        temporary.write_bytes(bundle.extractfile(member).read())
-        temporary.chmod(0o700)
-        temporary.replace(binary)
+    if extension == 'zip':
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            candidates = [m for m in bundle.infolist() if m.filename.replace('\\', '/').split('/')[-1] == 'slack.exe' and not m.is_dir()]
+            if len(candidates) != 1 or candidates[0].file_size > 150 * 1024 * 1024:
+                raise SetupError('The Slack setup download is invalid.')
+            data = bundle.read(candidates[0])
+    else:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
+            candidates = [m for m in bundle.getmembers() if m.name in {'bin/slack', './bin/slack'}]
+            if len(candidates) != 1:
+                raise SetupError('The Slack setup download is invalid.')
+            member = candidates[0]
+            if not member.isfile() or member.size > 150 * 1024 * 1024:
+                raise SetupError('The Slack setup download is invalid.')
+            data = bundle.extractfile(member).read()
+    binary.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = binary.with_suffix('.new')
+    temporary.write_bytes(data)
+    temporary.chmod(0o700)
+    temporary.replace(binary)
     write(folder / 'cli.json', {'version': VERSION, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()})
     return binary
 
@@ -135,9 +156,9 @@ def prepare_project(folder, manifest, app_id, auth):
     project = folder / 'project'
     (project / '.slack').mkdir(mode=0o700, parents=True, exist_ok=True)
     write(project / 'manifest.json', manifest)
-    write(project / '.slack/hooks.json', {'hooks': {'get-hooks': 'python3 hooks.py hooks'}})
+    write(project / '.slack/hooks.json', {'hooks': {'get-hooks': hook_command(project, 'hooks')}})
     write(project / '.slack/config.json', {'manifest': {'source': 'local'}})
-    (project / 'hooks.py').write_text(HOOK)
+    (project / 'hooks.py').write_text(HOOK.replace('__MANIFEST_COMMAND__', repr(hook_command(project, 'manifest'))).replace('__INSTALL_COMMAND__', repr(hook_command(project, 'install'))))
     apps_path = project / '.slack/apps.json'
     apps = read(apps_path, {'apps': {}})
     existing = apps.get('apps', {}).get(auth['team_id'], {}).get('app_id')
@@ -149,10 +170,15 @@ def prepare_project(folder, manifest, app_id, auth):
     return project
 
 
+def hook_command(project, action):
+    args = [sys.executable, '-I', '-B', '-X', 'utf8', str(project / 'hooks.py'), action]
+    return subprocess.list2cmdline(args) if os.name == 'nt' else shlex.join(args)
+
+
 HOOK = '''import json, os, pathlib, sys
 p = pathlib.Path(__file__).resolve().parent
 if sys.argv[1] == "hooks":
-    print(json.dumps({"runtime":"rust", "hooks":{"get-manifest":"python3 hooks.py manifest", "deploy":"python3 hooks.py install"}}))
+    print(json.dumps({"runtime":"rust", "hooks":{"get-manifest":__MANIFEST_COMMAND__, "deploy":__INSTALL_COMMAND__}}))
 elif sys.argv[1] == "manifest":
     print((p/"manifest.json").read_text())
 elif sys.argv[1] == "install":
@@ -170,8 +196,14 @@ def execute(home, action, body):
         return summary(folder)
     with open(folder / 'owner.lock', 'a') as guard:
         try:
-            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            if os.name == 'nt':
+                guard.seek(0, os.SEEK_END)
+                if guard.tell() == 0: guard.write(' '); guard.flush()
+                guard.seek(0)
+                msvcrt.locking(guard.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, PermissionError):
             raise SetupError('A Slack setup operation is already running. Try again shortly.')
         if action == 'authorize':
             pending = read(folder / 'pending.json', {})
@@ -238,7 +270,7 @@ def main():
     except SetupError as error:
         print(json.dumps({'ok': False, 'error': str(error)}))
     except Exception:
-        print(json.dumps({'ok': False, 'error': 'The local Slack setup tool could not complete. Check network access and Python 3, then retry. Saved connection state is preserved.'}))
+        print(json.dumps({'ok': False, 'error': 'The local Slack setup tool could not complete. Check network access and reopen the installed connector, then retry. Saved connection state is preserved.'}))
 
 
 if __name__ == '__main__':

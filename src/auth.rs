@@ -1,10 +1,11 @@
 use crate::{
+    config::{AuthMode, WebTransport},
     error::{ApiError, ApiResult},
     state::{AppState, now_ms},
 };
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -13,13 +14,16 @@ use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
 struct PasswordConversation {
     password: String,
     answered: bool,
 }
+#[cfg(target_os = "linux")]
 impl pam_client::ConversationHandler for PasswordConversation {
     fn prompt_echo_on(&mut self, _: &CStr) -> Result<CString, pam_client::ErrorCode> {
         Err(pam_client::ErrorCode::CONV_ERR)
@@ -126,7 +130,7 @@ pub fn check(
         .optional()?;
     let (owner, csrf) = row.ok_or_else(ApiError::unauthorized)?;
     if mutation {
-        same_origin(headers)?;
+        same_origin(state, headers)?;
         if !headers
             .get("x-csrf-token")
             .and_then(|v| v.to_str().ok())
@@ -141,13 +145,18 @@ pub fn check(
         session_hash: Some(hash),
     })
 }
-pub fn same_origin(headers: &HeaderMap) -> ApiResult<()> {
+pub fn same_origin(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     if let Some(origin) = headers.get(header::ORIGIN) {
         let host = headers
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(ApiError::forbidden)?;
-        if origin.to_str().ok() != Some(format!("https://{host}").as_str()) {
+        let scheme = if state.instance_config().server.web_transport == WebTransport::LocalHttp {
+            "http"
+        } else {
+            "https"
+        };
+        if origin.to_str().ok() != Some(format!("{scheme}://{host}").as_str()) {
             return Err(ApiError::forbidden());
         }
     }
@@ -202,7 +211,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(login): Json<Login>,
 ) -> ApiResult<Response> {
-    same_origin(&headers)?;
+    same_origin(&state, &headers)?;
     if login.username.len() > 100 || login.password.len() > 1024 || login.password.is_empty() {
         return Err(ApiError::unauthorized());
     }
@@ -236,23 +245,26 @@ pub async fn login(
         )?;
     }
     let owner = config.server.owner.clone();
+    let mode = config.server.auth_mode;
     let service = config.server.pam_service;
+    let password_path = state.home.join("secrets/local-password");
     let success = if login.username == owner {
-        let worker = tokio::task::spawn_blocking(move || {
-            // The permit stays with a timed-out PAM call, bounding blocked workers too.
-            let _permit = permit;
-            let username = login.username;
-            let conversation = PasswordConversation {
-                password: login.password,
-                answered: false,
-            };
-            let Ok(mut context) = pam_client::Context::new(&service, Some(&username), conversation)
-            else {
-                return false;
-            };
-            context.authenticate(pam_client::Flag::NONE).is_ok()
-                && context.acct_mgmt(pam_client::Flag::NONE).is_ok()
-        });
+        let worker =
+            tokio::task::spawn_blocking(move || {
+                // Keep the permit with expensive or stalled authentication work.
+                let _permit = permit;
+                match mode {
+                    AuthMode::LocalPassword => std::fs::read_to_string(password_path)
+                        .ok()
+                        .is_some_and(|encoded| {
+                            amplifier_native_platform::local_auth::verify_password(
+                                encoded.trim(),
+                                &login.password,
+                            )
+                        }),
+                    AuthMode::Pam => pam_authenticate(&service, &login.username, login.password),
+                }
+            });
         tokio::time::timeout(std::time::Duration::from_secs(20), worker)
             .await
             .ok()
@@ -263,9 +275,12 @@ pub async fn login(
     };
     if !success {
         state.db.lock().unwrap().execute("INSERT INTO login_attempts(key,failures,locked_until) VALUES('owner',1,0) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN locked_until>0 AND locked_until<?1 THEN 1 ELSE failures+1 END, locked_until=CASE WHEN failures>=4 THEN ?1+60000 ELSE 0 END",[now_ms()])?;
-        state.event("auth.failed", json!({"method":"pam"}))?;
+        state.event("auth.failed", json!({"method":mode}))?;
         return Err(ApiError::unauthorized());
     }
+    signed_in(&state, &owner, mode)
+}
+fn signed_in(state: &AppState, owner: &str, mode: AuthMode) -> ApiResult<Response> {
     let token = random_token();
     let csrf = random_token();
     {
@@ -276,11 +291,12 @@ pub async fn login(
             params![digest(&token), owner, csrf, now_ms() + 8 * 3600 * 1000],
         )?;
     }
-    state.event("auth.signed_in", json!({"actor":owner,"method":"pam"}))?;
+    state.event("auth.signed_in", json!({"actor":owner,"method":mode}))?;
     let cookie = format!(
-        "{}={}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800",
-        cookie_name(&state),
-        token
+        "{}={}; {}HttpOnly; SameSite=Strict; Path=/; Max-Age=28800",
+        cookie_name(state),
+        token,
+        secure_cookie(state)
     );
     Ok((
         [(header::SET_COOKIE, cookie)],
@@ -292,12 +308,15 @@ pub async fn session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
+    let config = state.instance_config();
+    let first_account_needed = config.server.auth_mode == AuthMode::LocalPassword
+        && !state.home.join("secrets/local-password").exists();
     match check(&state, &headers, "observe", false) {
         Ok(p) => Ok(Json(
-            json!({"authenticated":true,"owner":state.instance_config().server.owner,"csrf":p.csrf}),
+            json!({"authenticated":true,"owner":state.instance_config().server.owner,"csrf":p.csrf,"auth_mode":config.server.auth_mode,"first_account_needed":first_account_needed}),
         )),
         Err(e) if e.0 == StatusCode::UNAUTHORIZED => Ok(Json(
-            json!({"authenticated":false,"owner":state.instance_config().server.owner,"csrf":null}),
+            json!({"authenticated":false,"owner":state.instance_config().server.owner,"csrf":null,"auth_mode":config.server.auth_mode,"first_account_needed":first_account_needed}),
         )),
         Err(e) => Err(e),
     }
@@ -316,8 +335,9 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> A
         [(
             header::SET_COOKIE,
             format!(
-                "{}=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                cookie_name(&state)
+                "{}=; {}HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                cookie_name(&state),
+                secure_cookie(&state)
             ),
         )],
         Json(json!({"ok":true})),
@@ -325,7 +345,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> A
         .into_response())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use pam_client::ConversationHandler;
@@ -340,4 +360,168 @@ mod tests {
         assert!(c.prompt_echo_off(c"Password:").is_err());
         assert!(c.prompt_echo_on(c"Username:").is_err());
     }
+}
+
+fn secure_cookie(state: &AppState) -> &'static str {
+    if state.instance_config().server.web_transport == WebTransport::LocalHttp {
+        ""
+    } else {
+        "Secure; "
+    }
+}
+#[cfg(target_os = "linux")]
+fn pam_authenticate(service: &str, username: &str, password: String) -> bool {
+    let conversation = PasswordConversation {
+        password,
+        answered: false,
+    };
+    let Ok(mut context) = pam_client::Context::new(service, Some(username), conversation) else {
+        return false;
+    };
+    context.authenticate(pam_client::Flag::NONE).is_ok()
+        && context.acct_mgmt(pam_client::Flag::NONE).is_ok()
+}
+#[cfg(not(target_os = "linux"))]
+fn pam_authenticate(_: &str, _: &str, _: String) -> bool {
+    false
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstAccount {
+    setup_token: String,
+    password: String,
+    #[serde(default)]
+    start_at_signin: bool,
+}
+pub async fn first_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<FirstAccount>,
+) -> ApiResult<Response> {
+    same_origin(&state, &headers)?;
+    let config = state.instance_config();
+    if config.server.auth_mode != AuthMode::LocalPassword
+        || config.server.web_transport != WebTransport::LocalHttp
+    {
+        return Err(ApiError::forbidden());
+    }
+    if state.home.join("secrets/local-password").exists() {
+        return Err(ApiError::conflict(
+            json!({"account_created":true,"next":"Sign in with the password you already chose"}),
+        ));
+    }
+    let _permit = state
+        .login_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::bad("Sign-in is busy; try again shortly"))?;
+    let capability: Value = serde_json::from_slice(
+        &std::fs::read(state.home.join("secrets/first-account"))
+            .map_err(|_| ApiError::forbidden())?,
+    )
+    .map_err(|_| ApiError::forbidden())?;
+    if input.setup_token.len() != 64
+        || !capability["token"]
+            .as_str()
+            .is_some_and(|token| constant_equal(token, &input.setup_token))
+        || capability["expires_at"].as_i64().unwrap_or(0) <= now_ms()
+    {
+        return Err(ApiError::forbidden());
+    }
+    amplifier_native_platform::local_auth::validate_password(&input.password)
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    let encoded = tokio::task::spawn_blocking(move || {
+        amplifier_native_platform::local_auth::hash_password(&input.password)
+    })
+    .await
+    .map_err(|_| ApiError::bad("Could not prepare sign-in; try again"))??;
+    let path = state.home.join("secrets/local-password");
+    if let Err(error) = amplifier_native_platform::private_create(&path, encoded.as_bytes()) {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+        {
+            return Err(ApiError::conflict(
+                json!({"account_created":true,"next":"Sign in with the password you already chose"}),
+            ));
+        }
+        return Err(error.into());
+    }
+    // The successful create-only credential is the authority. Cleanup failure cannot recreate it.
+    let _ = std::fs::remove_file(state.home.join("secrets/first-account"));
+    state.event("auth.account_created", json!({"owner":config.server.owner}))?;
+    let startup_error = if input.start_at_signin {
+        crate::desktop::set_startup(&state.home, true)
+            .err()
+            .map(|e| e.to_string())
+    } else {
+        None
+    };
+    let mut response = signed_in(&state, &config.server.owner, AuthMode::LocalPassword)?;
+    if startup_error.is_some() {
+        response
+            .headers_mut()
+            .insert("x-startup-warning", "not-installed".parse().unwrap());
+    }
+    // Startup state is readable after sign-in, independent of account creation.
+    Ok(response)
+}
+
+pub const PROOF_DOMAIN: &str = "acp-slack-adapter.local-proof/1";
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofQuery {
+    nonce: String,
+}
+pub async fn local_proof(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProofQuery>,
+) -> ApiResult<Json<Value>> {
+    let config = state.instance_config();
+    if config.server.web_transport != WebTransport::LocalHttp {
+        return Err(ApiError::missing());
+    }
+    let origin = config
+        .server
+        .public_url
+        .as_deref()
+        .ok_or_else(ApiError::forbidden)?;
+    let secret = std::fs::read_to_string(state.home.join("secrets/control-token"))?;
+    let proof = amplifier_native_platform::local_auth::listener_proof(
+        PROOF_DOMAIN,
+        &config.id,
+        origin,
+        &query.nonce,
+        secret.trim(),
+    )
+    .map_err(|_| ApiError::bad("Invalid local proof challenge"))?;
+    Ok(Json(
+        json!({"schema":1,"id":config.id,"origin":origin,"nonce":query.nonce,"proof":proof}),
+    ))
+}
+pub fn verify_local_proof(
+    config: &crate::config::Config,
+    nonce: &str,
+    secret: &str,
+    value: &Value,
+) -> bool {
+    let Some(origin) = config.server.public_url.as_deref() else {
+        return false;
+    };
+    value["schema"] == 1
+        && value["id"] == config.id
+        && value["origin"] == origin
+        && value["nonce"] == nonce
+        && value["proof"].as_str().is_some_and(|proof| {
+            amplifier_native_platform::local_auth::verify_listener_proof(
+                PROOF_DOMAIN,
+                &config.id,
+                origin,
+                nonce,
+                secret,
+                proof,
+            )
+            .is_ok()
+        })
 }

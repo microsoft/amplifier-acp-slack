@@ -10,7 +10,8 @@ use std::path::Path;
 
 pub fn workspace(home: &Path, cwd: &str, expected_revision: u64, reason: &str) -> Result<Value> {
     ensure!(
-        Path::new(cwd).is_absolute() && !cwd.chars().any(char::is_control),
+        (Path::new(cwd).is_absolute() || cwd.starts_with('/'))
+            && !cwd.chars().any(char::is_control),
         "Supply an absolute working directory on the agent host"
     );
     ensure!(
