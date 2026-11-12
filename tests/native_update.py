@@ -17,6 +17,9 @@ class NativeUpdateTests(unittest.TestCase):
  def test_atomic_write_and_existing_owner_restriction(self):
   self.assertEqual(self.worker().config['id'],self.agent);u.write(self.home/'saved-connections.json',{'url':'https://owner.example'})
   with self.assertRaisesRegex(RuntimeError,'externally_managed'):self.worker()
+ def test_malformed_journal_is_not_treated_as_absent(self):
+  p=self.folder/'malformed.json';p.write_bytes(b'{"state":')
+  with self.assertRaises(json.JSONDecodeError):u.read(p)
  def test_archive_refuses_escape_and_symlink(self):
   for name,mode in [('../escape',0o100644),('link',0o120777)]:
    file=self.folder/'test.zip'
@@ -188,4 +191,17 @@ class WindowsJournalTests(unittest.TestCase):
   p=self.root/'plan.json';p.mkdir();(p/'kept').write_bytes(b'evidence')
   with self.assertRaises(OSError):u.write(p,{'generation':1})
   self.assertEqual((p/'kept').read_bytes(),b'evidence')
+ def test_failed_post_rename_flush_reports_uncertainty_without_undoing_publication(self):
+  import contextlib
+  from types import SimpleNamespace
+  p=self.root/'plan.json';u.write(p,{'generation':0});original=u._windows_handle
+  def refused_flush(handle):self.c.set_last_error(5);return False
+  @contextlib.contextmanager
+  def fail_after_actual_rename(path,access):
+   with original(path,access) as (kernel,handle):
+    yield SimpleNamespace(SetFileInformationByHandle=kernel.SetFileInformationByHandle,FlushFileBuffers=refused_flush),handle
+  with patch.object(u,'_windows_handle',side_effect=fail_after_actual_rename),self.assertRaises(OSError) as raised:u.write(p,{'generation':1})
+  self.assertEqual(raised.exception.winerror,5)
+  # Publication occurred, but the caller received an error, never false success.
+  self.assertEqual(u.read(p),{'generation':1})
 if __name__=='__main__':unittest.main()
