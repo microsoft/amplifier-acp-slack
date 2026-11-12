@@ -1,8 +1,12 @@
 # Release notes
 
-## 0.17.0
+## 0.17.1
 
 Native downloads include a private setup runtime and a first-account browser flow for Windows, Mac and Linux. Independent native installations can check published bundles and restore their previous executable without rewinding credentials or conversation state. Existing Linux PAM/HTTPS and enrolled update ownership remain unchanged. See [native installation](docs/native-installation.md).
+
+## 0.17.0
+
+Routine coordination can use inspectable Slack discussion threads and return meaningful results to the original conversation. See [release notes](docs/releases/0.17.0.md).
 
 ## 0.12.0
 

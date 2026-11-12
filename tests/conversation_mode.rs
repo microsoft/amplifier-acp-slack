@@ -142,6 +142,35 @@ for line in sys.stdin:
             .trim()
             .into()
     }
+    async fn wait_mode_settled(&self, context: &str) {
+        // A completed management reply precedes asynchronous ACP transport
+        // teardown. Wait for that exact conversation lock before introducing
+        // the next independent request; do not retry a mutating HTTP request.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                self.state
+                    .home
+                    .join("conversation-locks")
+                    .join(auth::digest(context)),
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match lock.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("Could not inspect fixture settlement: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Completed mode request did not settle its transport");
+        drop(lock);
+    }
 }
 
 #[tokio::test]
@@ -152,6 +181,7 @@ async fn owner_changes_only_the_selected_saved_session_without_a_model_prompt() 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(current["current_mode_id"], "ask");
     assert_eq!(current["available_modes"].as_array().unwrap().len(), 2);
+    f.wait_mode_settled(&f.context).await;
     let (status, result) = f
         .call(
             "POST",
@@ -162,6 +192,7 @@ async fn owner_changes_only_the_selected_saved_session_without_a_model_prompt() 
         .await;
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["current_mode_id"], "workspace");
+    f.wait_mode_settled(&f.context).await;
     assert_eq!(
         f.call("GET", &f.sibling, json!(null), Some(&token)).await.1["current_mode_id"],
         "ask"
@@ -201,6 +232,7 @@ async fn unadvertised_stale_busy_and_unauthorized_changes_fail_before_setting_mo
         .0,
         StatusCode::BAD_REQUEST
     );
+    f.wait_mode_settled(&f.context).await;
     assert_eq!(
         f.call(
             "POST",
@@ -259,6 +291,7 @@ async fn unsupported_modes_and_missing_csrf_do_not_mutate() {
     let (status, result) = f.call("GET", &f.context, json!(null), Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["supported"], false);
+    f.wait_mode_settled(&f.context).await;
     assert_eq!(
         f.call(
             "POST",
