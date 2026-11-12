@@ -115,9 +115,28 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                     r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':True}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
                     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert json.load(response)['configured']
                     if os.name=='nt':
-                        xml=subprocess.check_output([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Query','/TN',label,'/XML'])
-                        observed=xml.decode('utf-16') if xml.startswith(b'\xff\xfe') else xml.decode('utf-16-le') if xml.startswith(b'<\x00') else xml.decode('utf-8')
+                        # Query native Task Scheduler without changing PowerShell
+                        # script policy. Exported owners can be names or SIDs.
+                        query = r"""$ErrorActionPreference='Stop'
+function OwnerSid([string] $name) {
+ if ([string]::IsNullOrWhiteSpace($name)) { throw 'Task owner missing' }
+ if ($name.StartsWith('S-1-')) { return $name }
+ return ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+$s=New-Object -ComObject Schedule.Service; $s.Connect()
+$t=$s.GetFolder('\').GetTask($env:SLACK_FIXTURE_TASK); $d=$t.Definition
+$owners=@(); foreach ($trigger in $d.Triggers) { if ($trigger.Type -ne 9) { throw 'Unexpected trigger' }; $owners += OwnerSid $trigger.UserId }
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+@{xml=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t.Xml));sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;principal_sid=(OwnerSid $d.Principal.UserId);trigger_sids=@($owners)}|ConvertTo-Json -Compress
+"""
+                        powershell=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
+                        value=json.loads(subprocess.check_output([str(powershell),'-NoProfile','-NonInteractive','-Command',query],env={**env,'SLACK_FIXTURE_TASK':label},timeout=30).decode('utf-8'))
+                        assert value['principal_sid']==value['sid'] and value['trigger_sids']==[value['sid']]
+                        observed=__import__('base64').b64decode(value['xml']).decode('utf-8')
                         task=ET.fromstring(observed);ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+                        principals=task.findall('./t:Principals/t:Principal',ns);assert len(principals)==1
+                        assert principals[0].findtext('t:LogonType',namespaces=ns)=='InteractiveToken'
+                        assert principals[0].findtext('t:RunLevel',namespaces=ns) in (None,'LeastPrivilege')
                         commands=task.findall('./t:Actions/t:Exec/t:Command',ns);arguments=task.findall('./t:Actions/t:Exec/t:Arguments',ns)
                         assert len(commands)==len(arguments)==1
                         assert os.path.samefile(commands[0].text,home/'bin/acp-slack-adapter.exe')
@@ -128,7 +147,8 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                         assert os.path.samefile(invocation[len('--home "'):-len('" serve')],home)
                     else:
                         observed=(Path.home()/'Library/LaunchAgents'/(label+'.plist')).read_text(encoding='utf-8');assert str(home) in observed and 'acp-slack-adapter' in observed
-                    checks.append('actual current-user startup registration points to the preserved installation')
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert json.load(response)['configured']
+                    checks.append('actual owner-only startup registration, native readback and idempotent enable preserve installation')
                 finally:
                     r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':False}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
                     try:
@@ -139,6 +159,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                         detail=error.read().decode('utf-8',errors='replace')
                         if os.name=='nt':subprocess.run([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Delete','/TN',label,'/F'],capture_output=True,check=False)
                         raise AssertionError('Startup removal refused: '+detail) from error
+                assert (home/'adapter.json').read_bytes()==config_bytes and hashlib.sha256((home/'secrets/local-password').read_bytes()).hexdigest()==password_hash
                 checks.append('startup removal preserves installation and account')
 
             if verify_setup_tool:
