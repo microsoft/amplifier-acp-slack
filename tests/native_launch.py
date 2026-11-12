@@ -13,6 +13,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 import zipfile
 
 def extract(package,folder):
@@ -81,7 +82,15 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                     if os.name=='nt':
                         xml=subprocess.check_output([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Query','/TN',label,'/XML'])
                         observed=xml.decode('utf-16') if xml.startswith(b'\xff\xfe') else xml.decode('utf-16-le') if xml.startswith(b'<\x00') else xml.decode('utf-8')
-                        assert 'acp-slack-adapter.exe' in observed and str(home) in observed, json.dumps({'expected_home':str(home),'registered_xml':(home/'startup.xml').read_text(encoding='utf-16'),'observed_xml':observed},ensure_ascii=True)
+                        task=ET.fromstring(observed);ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+                        commands=task.findall('./t:Actions/t:Exec/t:Command',ns);arguments=task.findall('./t:Actions/t:Exec/t:Arguments',ns)
+                        assert len(commands)==len(arguments)==1
+                        assert os.path.samefile(commands[0].text,home/'bin/acp-slack-adapter.exe')
+                        invocation=arguments[0].text
+                        assert invocation.startswith('--home "') and invocation.endswith('" serve')
+                        # The service uses a canonical home; Windows may expand
+                        # an 8.3 input spelling and add the extended-path prefix.
+                        assert os.path.samefile(invocation[len('--home "'):-len('" serve')],home)
                     else:
                         observed=(Path.home()/'Library/LaunchAgents'/(label+'.plist')).read_text(encoding='utf-8');assert str(home) in observed and 'acp-slack-adapter' in observed
                     checks.append('actual current-user startup registration points to the preserved installation')
