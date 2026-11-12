@@ -1,6 +1,7 @@
 //! Slack conversation context and own reactions, with fresh audience checks at every use.
 //!
-//! The provider never reads agent history or publishes Slack messages. Reactions
+//! Source queries never read agent history or publish Slack messages. Explicit huddle
+//! tools use the existing durable publisher within the originating conversation's audience. Reactions
 //! are explicit, current-conversation-only bot actions through separate MCP tools. A grant is
 //! a short-lived reference to an adapter-observed trigger, not a cached permission.
 
@@ -1061,6 +1062,17 @@ pub async fn mcp(
         "ping" => Ok(rpc(id, json!({}))),
         "tools/list" => {
             let mut result = mcp_tools();
+            if grant.job_id.is_some()
+                && authority.origin.as_ref().is_some_and(|c| !c.direct)
+                && (authority.owner
+                    || !config.context.thread_only_grants
+                    || grant.thread.is_empty())
+            {
+                result["tools"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(crate::huddles::tools());
+            }
             if grant.job_id.is_some() {
                 result["tools"].as_array_mut().unwrap().push(json!({
                     "name":"slack_follow_up",
@@ -1109,6 +1121,34 @@ pub async fn mcp(
             Ok(rpc(id, result))
         }
         "tools/call" => {
+            if let Some(name) = body["params"]["name"]
+                .as_str()
+                .filter(|n| n.starts_with("slack_huddle_"))
+            {
+                let Some(job) = grant.job_id.as_deref() else {
+                    return Err(ApiError::forbidden());
+                };
+                let channel_scope = authority.origin.as_ref().is_some_and(|c| !c.direct)
+                    && (authority.owner
+                        || !config.context.thread_only_grants
+                        || grant.thread.is_empty());
+                if !channel_scope {
+                    return Err(ApiError::forbidden());
+                }
+                let value = crate::huddles::call(
+                    &config,
+                    &state.home,
+                    job,
+                    name,
+                    &body["params"]["arguments"],
+                    channel_scope,
+                )
+                .await?;
+                return Ok(rpc(
+                    id,
+                    json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
+                ));
+            }
             if body["params"]["name"] == "slack_follow_up" {
                 let Some(job) = grant.job_id.as_deref() else {
                     return Err(ApiError::forbidden());

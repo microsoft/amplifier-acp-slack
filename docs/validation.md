@@ -12,6 +12,7 @@ python3 tests/process_integration.py
 python3 tests/media.py
 python3 tests/client_capabilities.py
 python3 tests/morning_reliability.py
+python3 tests/slack_huddles.py
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
@@ -32,3 +33,9 @@ The [Actions page](https://github.com/microsoft/amplifier-acp-slack/actions) rec
 against the published source. Earlier private deployment reports and their
 transcripts are excluded. A passing fixture verifies its tested boundary, not
 general agent quality, human approval, or live tenant compatibility.
+
+The side-conversation fixture uses the actual adapter, its granted MCP tools and
+ordinary ACP with a local Slack substitute. It checks quiet thread routing and
+the original result destination, source/audience limits, and recovery of retained
+sends. These checks do not establish real Slack notification preferences or
+sustained social judgment; those remain separate from protocol coverage.

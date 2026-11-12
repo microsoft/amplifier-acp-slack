@@ -97,6 +97,7 @@ impl Store {
         crate::handoff::initialize(&store)?;
         crate::steering::initialize(&store)?;
         crate::public_speech::initialize(&store)?;
+        crate::huddles::initialize(&store)?;
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
