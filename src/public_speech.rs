@@ -38,40 +38,68 @@ pub fn enqueue(s: &Store, job: &str, utterance: &Utterance) -> Result<()> {
         return Ok(());
     }
     ensure!(utterance.id.len() <= 1024, "Public message ID too long");
-    let (context, raw): (String, String) =
+    let (_context, raw): (String, String) =
         s.db.query_row("SELECT context,trigger FROM jobs WHERE id=?1", [job], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
     let m: Message = serde_json::from_str(&raw)?;
-    let parts = crate::reply_parts::split(&utterance.text)?;
-    let tx = s.db.unchecked_transaction()?;
-    for (part, text) in parts.iter().enumerate() {
-        let id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            serde_json::to_string(&(job, &utterance.id, part))?.as_bytes(),
-        )
-        .to_string();
-        let existing: Option<String> = tx
-            .query_row("SELECT text FROM public_speech WHERE id=?1", [&id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        ensure!(
-            existing.as_ref().is_none_or(|old| old == &text.markdown),
-            "A completed public message cannot be revised"
-        );
-        tx.execute("INSERT OR IGNORE INTO public_speech(id,job_id,message_id,part,context,channel,thread,text,status,created,available) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'ready',?9,?9)",params![id,job,utterance.id,part as i64,context,m.channel,m.thread,text.markdown,now_ms()])?;
-    }
-    // No text or tool arguments in diagnostics.
-    tx.execute(
-        "INSERT INTO audit(time,kind,data) VALUES(?1,'public_speech_ready',?2)",
-        params![
-            now_ms(),
-            json!({"job_id":job,"parts":parts.len(),"bytes":utterance.text.len()}).to_string()
-        ],
+    let tx = rusqlite::Transaction::new_unchecked(&s.db, rusqlite::TransactionBehavior::Immediate)?;
+    enqueue_routed(
+        &tx,
+        job,
+        &utterance.id,
+        &utterance.text,
+        &m.channel,
+        &m.thread,
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Reuse the ordinary speech journal for an installation-resolved destination.
+/// The caller owns a transaction and must bind any route change to its source.
+pub(crate) fn enqueue_routed(
+    db: &Connection,
+    job: &str,
+    message_id: &str,
+    text: &str,
+    channel: &str,
+    thread: &str,
+) -> Result<Vec<String>> {
+    let context: String =
+        db.query_row("SELECT context FROM jobs WHERE id=?1", [job], |r| r.get(0))?;
+    let parts = crate::reply_parts::split(text)?;
+    let mut ids = Vec::new();
+    for (part, text) in parts.iter().enumerate() {
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            serde_json::to_string(&(job, message_id, part))?.as_bytes(),
+        )
+        .to_string();
+        let existing: Option<(String, String, String)> = db
+            .query_row(
+                "SELECT text,channel,thread FROM public_speech WHERE id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        ensure!(
+            existing.as_ref().is_none_or(
+                |old| old == &(text.markdown.clone(), channel.to_owned(), thread.to_owned())
+            ),
+            "A completed public message or destination cannot be revised"
+        );
+        db.execute("INSERT OR IGNORE INTO public_speech(id,job_id,message_id,part,context,channel,thread,text,status,created,available) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'ready',?9,?9)",params![id,job,message_id,part as i64,context,channel,thread,text.markdown,now_ms()])?;
+        ids.push(id);
+    }
+    db.execute(
+        "INSERT INTO audit(time,kind,data) VALUES(?1,'public_speech_ready',?2)",
+        params![
+            now_ms(),
+            json!({"job_id":job,"parts":parts.len(),"bytes":text.len()}).to_string()
+        ],
+    )?;
+    Ok(ids)
 }
 
 pub(crate) fn reserved(db: &Connection, job: &str) -> Result<bool> {
@@ -101,7 +129,8 @@ pub fn claim(s: &mut Store, c: &Config) -> Result<Option<Outgoing>> {
     let source = source
         .map(|raw| serde_json::from_str::<Message>(&raw))
         .transpose()?;
-    let allowed = c.enabled
+    let allowed = crate::huddles::delivery_current(&tx, c, &out.id)?
+        && c.enabled
         && c.allows(&out.channel, "")
         && version >= current
         && !matches!(state.as_str(), "superseded" | "cancelled")
@@ -164,7 +193,28 @@ pub async fn pump(
     let Some(out) = next else {
         return Ok(false);
     };
-    let result = client.publish(&out).await;
+    // Huddle returns retain their original audience even when the current turn
+    // was caused by a peer in a separate Slack thread. A failed read is not a send.
+    if crate::huddles::authorize_delivery(home, c, &out.id, client)
+        .await
+        .is_err()
+    {
+        let s = Store::open(home)?;
+        settle(
+            &s,
+            &out.id,
+            "ready",
+            None,
+            "Original huddle source or audience could not be verified; not sent",
+            30_000,
+        )?;
+        return Ok(true);
+    }
+    let metadata = {
+        let s = Store::open(home)?;
+        crate::huddles::delivery_metadata(&s.db, &out.id)?
+    };
+    let result = client.publish_with_metadata(&out, metadata.as_ref()).await;
     let s = Store::open(home)?;
     match result {
         Ok(ts) => settle(&s, &out.id, "sent", Some(&ts), "Confirmed by Slack", 0)?,

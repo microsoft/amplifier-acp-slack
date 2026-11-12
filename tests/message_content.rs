@@ -1,6 +1,26 @@
 use acp_slack_adapter::{config::Attention, slack, store::Store};
 use serde_json::{Value, json};
 
+#[test]
+fn coordination_root_routes_to_its_own_thread_without_inventing_authority() {
+    let raw = json!({"ts":"1000.000001","user":"UPEER","bot_id":"BPEER",
+        "text":"Coordinate here", "metadata":{"event_type":"acp_coordination_thread",
+        "event_payload":{"version":1,"id":"delivery-id"}}});
+    let root = slack::normalize("T", "C", &raw, None).unwrap();
+    assert_eq!(root.thread, root.ts);
+    assert!(root.bot);
+    assert_eq!(root.sender, "UPEER");
+    let mut later = raw.clone();
+    later.as_object_mut().unwrap().remove("metadata");
+    let remembered = slack::normalize("T", "C", &later, Some(root.clone())).unwrap();
+    assert_eq!(remembered.context(), root.context());
+    let mut human = raw;
+    human.as_object_mut().unwrap().remove("bot_id");
+    let ordinary = slack::normalize("T", "C", &human, None).unwrap();
+    assert!(ordinary.thread.is_empty());
+    assert!(!ordinary.bot);
+}
+
 fn table_message() -> Value {
     json!({"type":"message","ts":"1000.000001","user":"UPEER","bot_id":"BPEER",
     "text":"Saved results. No new run is needed.",

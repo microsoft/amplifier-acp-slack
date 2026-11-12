@@ -34,6 +34,8 @@ pub mod delivery_recovery;
 
 pub mod handoff;
 
+pub mod huddles;
+
 pub mod reconnect;
 
 pub mod steering;

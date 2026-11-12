@@ -16,6 +16,8 @@ pub struct Slack {
     base: String,
     secrets: Secrets,
     test: bool,
+    bot_user: String,
+    bot_id: String,
     people: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     granted_scopes: Arc<Mutex<Option<Vec<String>>>>,
 }
@@ -36,6 +38,8 @@ impl Slack {
             base: c.slack.api_base.clone(),
             secrets: s,
             test: c.slack.loopback_test,
+            bot_user: c.slack.bot_user_id.clone(),
+            bot_id: c.slack.bot_id.clone(),
             people: Arc::new(Mutex::new(std::collections::HashMap::new())),
             granted_scopes: Arc::new(Mutex::new(None)),
         })
@@ -63,6 +67,7 @@ impl Slack {
             "users.info",
             "bots.info",
             "files.info",
+            "chat.getPermalink",
         ]
         .contains(&method)
         {
@@ -199,7 +204,7 @@ impl Slack {
         if let Some(text) = single {
             let mut payload = o.clone();
             payload.text = text;
-            return self.publish_message(&payload, notice).await;
+            return self.publish_message(&payload, notice, None).await;
         }
         let mut first = None;
         for (position, index) in indices.iter().enumerate() {
@@ -244,7 +249,7 @@ impl Slack {
                     vec![]
                 },
             };
-            match self.publish_message(&part, notice).await {
+            match self.publish_message(&part, notice, None).await {
                 Ok(ts) => {
                     store.lock().unwrap().db.execute("UPDATE outbox_parts SET status='sent',slack_ts=?3 WHERE outbox_id=?1 AND part=?2",rusqlite::params![o.id,index,ts]).map_err(|_|ApiError::Uncertain)?;
                     if first.is_none() {
@@ -273,14 +278,48 @@ impl Slack {
         first.ok_or(ApiError::Uncertain)
     }
     pub async fn publish(&self, o: &Outgoing) -> std::result::Result<String, ApiError> {
+        self.publish_with_metadata(o, None).await
+    }
+    pub async fn publish_with_metadata(
+        &self,
+        o: &Outgoing,
+        metadata: Option<&Value>,
+    ) -> std::result::Result<String, ApiError> {
         let mut payload = o.clone();
         payload.text = crate::reply_parts::markdown(&o.text);
-        self.publish_message(&payload, false).await
+        self.publish_message(&payload, false, metadata).await
+    }
+    pub async fn permalink(
+        &self,
+        channel: &str,
+        ts: &str,
+    ) -> std::result::Result<String, ApiError> {
+        let value = self
+            .call(
+                "chat.getPermalink",
+                json!({"channel":channel,"message_ts":ts}),
+                false,
+            )
+            .await?;
+        let link = value["permalink"].as_str().ok_or(ApiError::Uncertain)?;
+        let url = reqwest::Url::parse(link).map_err(|_| ApiError::Uncertain)?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some_and(|p| p != 443)
+            || !url
+                .host_str()
+                .is_some_and(|h| h == "slack.com" || h.ends_with(".slack.com"))
+        {
+            return Err(ApiError::Rejected("invalid_permalink".into()));
+        }
+        Ok(link.to_owned())
     }
     async fn publish_message(
         &self,
         o: &Outgoing,
         notice: bool,
+        metadata: Option<&Value>,
     ) -> std::result::Result<String, ApiError> {
         // Upload bytes first without sharing them. Once the message has been
         // posted, any file-completion failure is uncertain, never safe to retry.
@@ -325,12 +364,16 @@ impl Slack {
         // their exact saved text and identity, including across software upgrades.
         // Each delivery part stays below Slack's 12,000-character limit.
         let mut p = json!({"channel":o.channel,"markdown_text":o.text,"client_msg_id":o.id,"unfurl_links":false,"unfurl_media":false,"parse":"none"});
+        if let Some(metadata) = metadata {
+            p["metadata"] = metadata.clone();
+        }
         if notice {
             p["metadata"] =
                 json!({"event_type":"acp_connector_notice","event_payload":{"id":o.id}});
         }
         if !o.thread.is_empty() {
             p["thread_ts"] = o.thread.clone().into();
+            p["reply_broadcast"] = false.into();
         }
         let d = self.call("chat.postMessage", p, false).await?;
         let ts = d["ts"]
@@ -488,7 +531,10 @@ impl Slack {
             .into_iter()
             .flatten()
             .find(|m| {
-                m["client_msg_id"] == client_id || m["metadata"]["event_payload"]["id"] == client_id
+                ((!self.bot_user.is_empty() && m["user"] == self.bot_user)
+                    || (!self.bot_id.is_empty() && m["bot_id"] == self.bot_id))
+                    && (m["client_msg_id"] == client_id
+                        || m["metadata"]["event_payload"]["id"] == client_id)
             })
             .and_then(|m| m["ts"].as_str())
             .map(str::to_owned))
@@ -523,6 +569,64 @@ impl Slack {
         }
         // The prompt states that this bounded view is not the full room archive.
         Ok(out)
+    }
+    /// Verify the requested peers rather than treating the bounded prompt roster
+    /// as the complete channel membership list.
+    pub async fn authorize_bot_members(&self, channel: &str, ids: &[String]) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut pending: std::collections::HashSet<&str> =
+                ids.iter().map(String::as_str).collect();
+            let mut cursor = String::new();
+            let mut seen = std::collections::HashSet::new();
+            while !pending.is_empty() {
+                let page = self
+                    .call(
+                        "conversations.members",
+                        json!({"channel":channel,"limit":200,"cursor":cursor}),
+                        false,
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Peer membership is unavailable"))?;
+                for member in page["members"]
+                    .as_array()
+                    .context("Peer membership is unavailable")?
+                {
+                    if let Some(id) = member.as_str() {
+                        pending.remove(id);
+                    }
+                }
+                if pending.is_empty() {
+                    break;
+                }
+                cursor = page["response_metadata"]["next_cursor"]
+                    .as_str()
+                    .unwrap_or("")
+                    .into();
+                ensure!(
+                    !cursor.is_empty(),
+                    "A requested peer is not a member of this channel"
+                );
+                ensure!(
+                    seen.insert(cursor.clone()),
+                    "Peer membership pagination did not advance"
+                );
+            }
+            for id in ids {
+                let value = self
+                    .call("users.info", json!({"user":id}), false)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Peer identity is unavailable"))?;
+                ensure!(
+                    value["user"]["id"] == *id
+                        && value["user"]["is_bot"] == true
+                        && value["user"]["deleted"] != true,
+                    "Invited peers must be active bot members of this channel"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .context("Peer verification timed out")?
     }
     pub async fn participants(&self, channel: &str) -> Vec<Value> {
         let Ok(r) = self
@@ -779,7 +883,20 @@ pub fn normalize(team: &str, channel: &str, e: &Value, prior: Option<Message>) -
     let raw = if changed { &e["message"] } else { e };
     let ts = raw["ts"].as_str()?;
     let sender = raw["user"].as_str().or_else(|| raw["bot_id"].as_str())?;
-    let thread = raw["thread_ts"].as_str().filter(|s| *s != ts).unwrap_or("");
+    let bot = raw.get("bot_id").is_some() || raw["subtype"] == "bot_message";
+    // A bot may invite discussion in its own root's thread. This changes only
+    // the reply destination within the same channel, never source authority.
+    // Slack may omit metadata on later bookkeeping events; retain the observed
+    // self-thread route rather than creating a second channel-context job.
+    let coordination_root = bot
+        && (raw["metadata"]["event_type"] == "acp_coordination_thread"
+            || prior
+                .as_ref()
+                .is_some_and(|m| m.bot && m.ts == ts && m.thread == ts));
+    let thread = raw["thread_ts"]
+        .as_str()
+        .filter(|s| *s != ts)
+        .unwrap_or(if coordination_root { ts } else { "" });
     Some(Message {
         team: team.into(),
         channel: channel.into(),
@@ -797,7 +914,7 @@ pub fn normalize(team: &str, channel: &str, e: &Value, prior: Option<Message>) -
             .unwrap_or(ts)
             .into(),
         sender: sender.into(),
-        bot: raw.get("bot_id").is_some() || raw["subtype"] == "bot_message",
+        bot,
         text: crate::message_content::text(raw)
             .chars()
             .take(40000)
@@ -861,10 +978,10 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
         }
         return Ok(());
     }
-    let prior = if e["subtype"] == "message_deleted" {
-        store.message(channel, e["deleted_ts"].as_str().unwrap_or(""))?
-    } else {
+    let prior = if activity_ts.is_empty() {
         None
+    } else {
+        store.message(channel, activity_ts)?
     };
     let Some(m) = normalize(&c.slack.team_id, channel, e, prior) else {
         return Ok(());
