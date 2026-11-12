@@ -42,8 +42,10 @@ function OwnerSid([string] $name) {
  return ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
 }
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-Mark 'before-service'
-$s=New-Object -ComObject Schedule.Service
+Mark 'before-service-type'
+$serviceType=[Type]::GetTypeFromProgID('Schedule.Service',$true)
+Mark 'before-service-create'
+$s=[Activator]::CreateInstance($serviceType)
 Mark 'before-connect'
 $s.Connect()
 Mark 'before-folder'
@@ -53,7 +55,7 @@ try { $t=$folder.GetTask($env:SLACK_FIXTURE_TASK) }
 catch {
  Mark 'query-exception'
  $e=$_.Exception
- $seen=New-Object 'System.Collections.Generic.List[object]'
+ $seen=[Collections.Generic.List[object]]::new()
  for ($i=0; $i -lt 12; $i++) {
   foreach ($old in $seen) { if ([Object]::ReferenceEquals($old,$e)) { throw 'Startup inspection exception cycle' } }
   $seen.Add($e)
