@@ -10,7 +10,7 @@ description = "Generic ACP integration with Slack conversations and presentation
 
 [dependencies]
 amplifier-acp-connection = { git = "https://github.com/microsoft/amplifier-constellation", rev = "17024ba5a9834a69fc4835134bb499347bebb29d" }
-amplifier-native-platform = { git = "https://github.com/microsoft/amplifier-constellation", rev = "178aed21d183adbe95acff7c22e2adfd0da3d268", features = ["local-auth"] }
+amplifier-native-platform = { git = "https://github.com/microsoft/amplifier-constellation", rev = "9fb0d7c3472b99b4fe2846caf81739fe29b1be9a", features = ["local-auth"] }
 anyhow = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
