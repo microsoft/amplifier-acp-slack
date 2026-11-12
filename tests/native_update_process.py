@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Actual disposable connector stop/swap/restart/rollback; no Slack or model activity."""
-import argparse,hashlib,importlib.util,json,os,shutil,subprocess,tempfile,time,uuid
+import argparse,hashlib,importlib.util,json,os,shutil,subprocess,tempfile,time,traceback,uuid
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 for name,path in [('launcher',ROOT/'tests/native_launch.py'),('worker',ROOT/'scripts/native_update.py')]:
@@ -8,7 +8,7 @@ for name,path in [('launcher',ROOT/'tests/native_launch.py'),('worker',ROOT/'scr
 
 def run(package,result):
  checks=[]
- with tempfile.TemporaryDirectory(prefix='Slack update fixture ') as temp:
+ with tempfile.TemporaryDirectory(prefix='Slack update café 子 ') as temp:
   root=Path(temp);bundle=root/'download';bundle.mkdir();launcher.extract(package,bundle)
   binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file());home=root/'installation';log=open(root/'server.log','ab')
   proc=subprocess.Popen([str(binary),'--home',str(home),'--no-browser'],stdin=subprocess.DEVNULL,stdout=log,stderr=log)
@@ -49,7 +49,13 @@ def run(package,result):
       if len(start_calls)==1:raise OSError('injected candidate start failure')
       return real_start()
      current.start=fail_start
-    current.execute();out=worker.read(folder/'plan.json');assert out['state']==('rolled_back' if fail else 'succeeded'),out
+    real_rollback=current.rollback;rollback_errors=[]
+    def traced_rollback(reason):
+     try:return real_rollback(reason)
+     except Exception:
+      rollback_errors.append(traceback.format_exc());raise
+    current.rollback=traced_rollback
+    current.execute();out=worker.read(folder/'plan.json');assert out['state']==('rolled_back' if fail else 'succeeded'),{'plan':out,'rollback_errors':rollback_errors}
     checks.append('actual failed start restores prior binary/runtime' if fail=='start' else 'actual failed verification restores prior binary/runtime' if fail else 'actual idle stop, binary/runtime swap and verified restart')
     assert (home/'adapter.json').read_bytes()==config_bytes
     assert worker.digest(home/'secrets/local-password')==secret_before and worker.digest(home/'secrets/control-token')==private_before

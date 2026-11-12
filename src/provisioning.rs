@@ -37,7 +37,7 @@ pub async fn helper(home: &Path, action: &str, body: Value) -> anyhow::Result<Va
         std::path::PathBuf::from("python3")
     };
     let mut command = Command::new(program);
-    command.args(["-I", "-B"]);
+    command.args(["-I", "-B", "-X", "utf8"]);
     command
         .arg(&script)
         .arg(home)

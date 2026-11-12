@@ -121,7 +121,7 @@ class SetupTests(unittest.TestCase):
         project.mkdir()
         command=s.hook_command(project,'manifest')
         self.assertIn(s.sys.executable,command)
-        self.assertIn('-I',command);self.assertIn('-B',command)
+        self.assertIn('-I',command);self.assertIn('-B',command);self.assertIn('-X',command);self.assertIn('utf8',command)
         prepared=s.prepare_project(self.folder,{},'',{'team_id':'TONE'})
         compile((prepared/'hooks.py').read_text(),'hooks.py','exec')
         self.assertNotIn('python3 hooks.py',(prepared/'.slack/hooks.json').read_text())

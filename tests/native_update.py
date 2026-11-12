@@ -42,6 +42,12 @@ class NativeUpdateTests(unittest.TestCase):
   with patch.object(worker,'api',return_value={'idle':False}),patch.object(worker,'stop') as stop:
    worker.apply();stop.assert_not_called()
   self.assertEqual(worker.job['state'],'deferred')
+ def test_rollback_reconciles_the_known_candidate_before_its_api_is_ready(self):
+  from types import SimpleNamespace
+  worker=self.worker();backup=self.folder/'backup';backup.mkdir();(backup/'binary').write_bytes(b'previous');worker.job['previous_sha256']=u.digest(backup/'binary');worker.started_process=SimpleNamespace(poll=lambda:None)
+  with patch.object(worker,'stop',side_effect=[ConnectionRefusedError(),None]) as stop,patch.object(worker,'replace'),patch.object(worker,'start'),patch.object(worker,'health'):
+   worker.rollback('fixture_failed_health');self.assertEqual(stop.call_count,2)
+  self.assertEqual(worker.job['state'],'rolled_back')
  def test_identical_release_has_no_cutover(self):
   worker=self.worker();worker.job.update(up_to_date=True,binary_sha256=u.digest(self.binary))
   with patch.object(worker,'stop') as stop:

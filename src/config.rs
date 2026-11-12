@@ -512,12 +512,12 @@ pub fn private_dir(path: &Path) -> Result<()> {
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     amplifier_native_platform::private_write(path, bytes)
 }
-pub fn check_private(path: &Path) -> Result<()> {
+pub fn check_private(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         ensure!(
-            std::fs::metadata(path)?.permissions().mode() & 0o077 == 0,
+            std::fs::metadata(_path)?.permissions().mode() & 0o077 == 0,
             "Credential file permissions must be private (600)"
         );
     }

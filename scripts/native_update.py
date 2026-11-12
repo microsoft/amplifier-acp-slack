@@ -195,7 +195,18 @@ class Worker:
         self.save('rolling_back',reason=reason);self.gate()
         try:self.stop()
         except (OSError,RuntimeError):
-            # Never replace while another installation process owns the service lock.
+            # Our candidate may own the lock before its API is listening. Reconcile
+            # that same known child briefly; never terminate or replace an unknown process.
+            child=getattr(self,'started_process',None)
+            deadline=time.monotonic()+10
+            while child is not None and child.poll() is None and time.monotonic()<deadline:
+                try:
+                    self.stop();break
+                except (OSError,RuntimeError):
+                    try:
+                        with locked(self.home/'service.lock',False):break
+                    except OSError:time.sleep(.1)
+            # A missing API is not proof of a stopped service.
             with locked(self.home/'service.lock',False):pass
         backup=self.folder/'backup'
         if digest(backup/'binary')!=self.job['previous_sha256']:raise RuntimeError('rollback_digest_mismatch')

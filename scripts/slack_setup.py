@@ -168,7 +168,7 @@ def prepare_project(folder, manifest, app_id, auth):
 
 
 def hook_command(project, action):
-    args = [sys.executable, '-I', '-B', str(project / 'hooks.py'), action]
+    args = [sys.executable, '-I', '-B', '-X', 'utf8', str(project / 'hooks.py'), action]
     return subprocess.list2cmdline(args) if os.name == 'nt' else shlex.join(args)
 
 

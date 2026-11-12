@@ -285,7 +285,7 @@ fn queue(home: &Path, input: Command) -> Result<Value> {
     });
     let mut child = std::process::Command::new(python);
     child
-        .args(["-I", "-B"])
+        .args(["-I", "-B", "-X", "utf8"])
         .arg(folder.join("worker.py"))
         .arg(home)
         .arg(&id)
