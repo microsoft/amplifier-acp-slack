@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -16,6 +17,76 @@ import urllib.error
 import xml.etree.ElementTree as ET
 import zipfile
 import uuid
+
+def startup_registration(home,label,env):
+    """Read this fresh fixture's actual registration, refusing different owners."""
+    assert label=='acp-slack-adapter-'+str(uuid.UUID(label.removeprefix('acp-slack-adapter-')))
+    if os.name=='nt':
+        query=r"""$ErrorActionPreference='Stop'
+function OwnerSid([string] $name) {
+ if ([string]::IsNullOrWhiteSpace($name)) { throw 'Task owner missing' }
+ if ($name.StartsWith('S-1-')) { return $name }
+ return ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$s=New-Object -ComObject Schedule.Service; $s.Connect()
+try { $t=$s.GetFolder('\').GetTask($env:SLACK_FIXTURE_TASK) }
+catch {
+ $e=$_.Exception; while ($e.InnerException) { $e=$e.InnerException }
+ if ($e.HResult -eq -2147024894) { @{present=$false}|ConvertTo-Json -Compress; exit 0 }
+ throw
+}
+$d=$t.Definition
+$owners=@(); foreach ($trigger in $d.Triggers) { if ($trigger.Type -ne 9) { throw 'Unexpected trigger' }; $owners += OwnerSid $trigger.UserId }
+@{present=$true;xml=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t.Xml));sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;principal_sid=(OwnerSid $d.Principal.UserId);trigger_sids=@($owners)}|ConvertTo-Json -Compress
+"""
+        powershell=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
+        value=json.loads(subprocess.check_output([str(powershell),'-NoProfile','-NonInteractive','-Command',query],env={**env,'SLACK_FIXTURE_TASK':label},timeout=30).decode('utf-8'))
+        if value=={'present':False}:return None
+        assert value['present'] is True and value['principal_sid']==value['sid'] and value['trigger_sids']==[value['sid']]
+        observed=__import__('base64').b64decode(value['xml']).decode('utf-8')
+        task=ET.fromstring(observed);ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+        principals=task.findall('./t:Principals/t:Principal',ns);assert len(principals)==1
+        assert principals[0].findtext('t:LogonType',namespaces=ns)=='InteractiveToken'
+        assert principals[0].findtext('t:RunLevel',namespaces=ns) in (None,'LeastPrivilege')
+        actions=task.findall('./t:Actions/*',ns);assert len(actions)==1 and actions[0].tag=='{'+ns['t']+'}Exec'
+        commands=actions[0].findall('t:Command',ns);arguments=actions[0].findall('t:Arguments',ns)
+        assert len(commands)==len(arguments)==1
+        assert os.path.samefile(commands[0].text,home/'bin/acp-slack-adapter.exe')
+        invocation=arguments[0].text
+        assert invocation.startswith('--home "') and invocation.endswith('" serve')
+        assert os.path.samefile(invocation[len('--home "'):-len('" serve')],home)
+        return observed
+    path=Path.home()/'Library/LaunchAgents'/(label+'.plist')
+    try:entry=path.lstat()
+    except FileNotFoundError:return None
+    assert stat.S_ISREG(entry.st_mode) and entry.st_uid==os.getuid()
+    observed=path.read_bytes()
+    value=plistlib.loads(observed)
+    assert value['Label']==label
+    args=value['ProgramArguments'];assert len(args)==4 and args[1]=='--home' and args[3]=='serve'
+    assert os.path.samefile(args[0],home/'bin/acp-slack-adapter') and os.path.samefile(args[2],home)
+    assert value['RunAtLoad'] is True
+    return observed
+
+def cleanup_fixture_startup(home,label,env):
+    # Re-read ownership immediately before fallback deletion; never trust an old
+    # snapshot or treat a failed inspection as an absent task.
+    if startup_registration(home,label,env) is None:return
+    if os.name=='nt':
+        subprocess.run([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Delete','/TN',label,'/F'],capture_output=True,check=True,timeout=30)
+    else:
+        (Path.home()/'Library/LaunchAgents'/(label+'.plist')).unlink()
+    assert startup_registration(home,label,env) is None,'Fixture startup registration remains'
+
+def verify_startup_removal(remove,read,cleanup):
+    try:
+        remove()
+        assert read() is None,'Startup API reported removal but the registration remains'
+    except Exception as error:
+        try:cleanup()
+        except Exception as cleanup_error:error.add_note('Fixture cleanup also failed: '+repr(cleanup_error))
+        raise
 
 def superseded_launch(binary,home,env):
     """A process carrying the prior launch nonce reaches main after recovery."""
@@ -110,57 +181,28 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             if verify_startup:
                 if os.name!='nt' and __import__('sys').platform!='darwin':raise AssertionError('Startup fixture is limited to native Windows/Mac CI')
                 startup_headers={'Cookie':cookie,'X-CSRF-Token':session['csrf']};label='acp-slack-adapter-'+config['id']
+                startup_error=None
+                def startup_request(enabled):
+                    r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':enabled}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert json.load(response)['configured'] is enabled
                 try:
-                    # API uses PUT; the fixture preserves the exact caller method.
-                    r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':True}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
-                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert json.load(response)['configured']
-                    if os.name=='nt':
-                        # Query native Task Scheduler without changing PowerShell
-                        # script policy. Exported owners can be names or SIDs.
-                        query = r"""$ErrorActionPreference='Stop'
-function OwnerSid([string] $name) {
- if ([string]::IsNullOrWhiteSpace($name)) { throw 'Task owner missing' }
- if ($name.StartsWith('S-1-')) { return $name }
- return ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier]).Value
-}
-$s=New-Object -ComObject Schedule.Service; $s.Connect()
-$t=$s.GetFolder('\').GetTask($env:SLACK_FIXTURE_TASK); $d=$t.Definition
-$owners=@(); foreach ($trigger in $d.Triggers) { if ($trigger.Type -ne 9) { throw 'Unexpected trigger' }; $owners += OwnerSid $trigger.UserId }
-[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-@{xml=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t.Xml));sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;principal_sid=(OwnerSid $d.Principal.UserId);trigger_sids=@($owners)}|ConvertTo-Json -Compress
-"""
-                        powershell=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
-                        value=json.loads(subprocess.check_output([str(powershell),'-NoProfile','-NonInteractive','-Command',query],env={**env,'SLACK_FIXTURE_TASK':label},timeout=30).decode('utf-8'))
-                        assert value['principal_sid']==value['sid'] and value['trigger_sids']==[value['sid']]
-                        observed=__import__('base64').b64decode(value['xml']).decode('utf-8')
-                        task=ET.fromstring(observed);ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
-                        principals=task.findall('./t:Principals/t:Principal',ns);assert len(principals)==1
-                        assert principals[0].findtext('t:LogonType',namespaces=ns)=='InteractiveToken'
-                        assert principals[0].findtext('t:RunLevel',namespaces=ns) in (None,'LeastPrivilege')
-                        commands=task.findall('./t:Actions/t:Exec/t:Command',ns);arguments=task.findall('./t:Actions/t:Exec/t:Arguments',ns)
-                        assert len(commands)==len(arguments)==1
-                        assert os.path.samefile(commands[0].text,home/'bin/acp-slack-adapter.exe')
-                        invocation=arguments[0].text
-                        assert invocation.startswith('--home "') and invocation.endswith('" serve')
-                        # The service uses a canonical home; Windows may expand
-                        # an 8.3 input spelling and add the extended-path prefix.
-                        assert os.path.samefile(invocation[len('--home "'):-len('" serve')],home)
-                    else:
-                        observed=(Path.home()/'Library/LaunchAgents'/(label+'.plist')).read_text(encoding='utf-8');assert str(home) in observed and 'acp-slack-adapter' in observed
-                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert json.load(response)['configured']
+                    startup_request(True)
+                    observed=startup_registration(home,label,env);assert observed is not None
+                    startup_request(True)
+                    assert startup_registration(home,label,env)==observed,'Idempotent enable changed the native registration'
                     checks.append('actual owner-only startup registration, native readback and idempotent enable preserve installation')
+                except BaseException as error:
+                    startup_error=error
+                    raise
                 finally:
-                    r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':False}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
                     try:
-                        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert not json.load(response)['configured']
-                    except urllib.error.HTTPError as error:
-                        # Only this fresh fixture task is eligible for cleanup.
-                        # Retain the product refusal instead of weakening its guard.
-                        detail=error.read().decode('utf-8',errors='replace')
-                        if os.name=='nt':subprocess.run([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Delete','/TN',label,'/F'],capture_output=True,check=False)
-                        raise AssertionError('Startup removal refused: '+detail) from error
+                        verify_startup_removal(lambda:startup_request(False),lambda:startup_registration(home,label,env),lambda:cleanup_fixture_startup(home,label,env))
+                    except Exception as removal_error:
+                        if startup_error is None:raise
+                        startup_error.add_note('Startup removal also failed: '+repr(removal_error))
+                        for note in getattr(removal_error,'__notes__',[]):startup_error.add_note(note)
                 assert (home/'adapter.json').read_bytes()==config_bytes and hashlib.sha256((home/'secrets/local-password').read_bytes()).hexdigest()==password_hash
-                checks.append('startup removal preserves installation and account')
+                checks.append('independent native absence confirms startup removal preserves installation and account')
 
             if verify_setup_tool:
                 code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
