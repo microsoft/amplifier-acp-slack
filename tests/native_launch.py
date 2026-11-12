@@ -42,21 +42,21 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
         def start():
             log=open(root/'server.log','ab');p=subprocess.Popen([str(binary),'--home',str(home),'--no-browser'],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
             for _ in range(400):
-                if p.poll() is not None:raise AssertionError('Native app exited during startup: '+(root/'server.log').read_text(errors='replace')[-1000:])
+                if p.poll() is not None:raise AssertionError('Native app exited during startup: '+(root/'server.log').read_text(encoding='utf-8',errors='replace')[-1000:])
                 try:
-                    endpoint=json.loads((home/'endpoints.json').read_text());base=endpoint['base_url'];status,_,_=request(base,'/api/v1/auth/session')
+                    endpoint=json.loads((home/'endpoints.json').read_text(encoding='utf-8'));base=endpoint['base_url'];status,_,_=request(base,'/api/v1/auth/session')
                     if status==200:return p,base,log
                 except (OSError,ValueError):pass
                 time.sleep(.1)
             p.terminate();p.wait();log.close();raise AssertionError('Native app did not become ready')
         p,base,log=start()
         try:
-            config=json.loads((home/'adapter.json').read_text());assert config['server']['auth_mode']=='local_password' and config['server']['web_transport']=='local_http'
+            config=json.loads((home/'adapter.json').read_text(encoding='utf-8'));assert config['server']['auth_mode']=='local_password' and config['server']['web_transport']=='local_http'
             assert not config['enabled'] and not config['setup_complete'] and config['acp']['command']=='';checks.append('fresh native no-agent installation')
             status,_,session=request(base,'/api/v1/auth/session');assert status==200 and session['first_account_needed']
             status,_,_=request(base,'/api/v1/config');assert status==401
             status,_,_=request(base,'/api/v1/auth/session',headers={'Host':'evil.test','Origin':'http://evil.test'});assert status==403;checks.append('unauthenticated and cross-origin refused')
-            cap=json.loads((home/'secrets/first-account').read_text())['token'];password='Disposable native password café 子'
+            cap=json.loads((home/'secrets/first-account').read_text(encoding='utf-8'))['token'];password='Disposable native password café 子'
             if browser:
                 fixture=root/'browser-input.json';fixture.write_text(json.dumps({'base':base,'cap':cap,'password':password}))
                 subprocess.run([shutil.which('node'),str(Path(__file__).with_name('native-browser.mjs')),str(fixture)],check=True,timeout=90)
@@ -79,10 +79,11 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                     r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':True}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
                     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=30) as response:assert json.load(response)['configured']
                     if os.name=='nt':
-                        observed=subprocess.check_output([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Query','/TN',label,'/XML'],text=True)
+                        xml=subprocess.check_output([str(Path(os.environ['SystemRoot'])/'System32/schtasks.exe'),'/Query','/TN',label,'/XML'])
+                        observed=xml.decode('utf-16') if xml.startswith(b'\xff\xfe') else xml.decode('utf-16-le') if xml.startswith(b'<\x00') else xml.decode('utf-8')
                         assert 'acp-slack-adapter.exe' in observed and str(home) in observed
                     else:
-                        observed=(Path.home()/'Library/LaunchAgents'/(label+'.plist')).read_text();assert str(home) in observed and 'acp-slack-adapter' in observed
+                        observed=(Path.home()/'Library/LaunchAgents'/(label+'.plist')).read_text(encoding='utf-8');assert str(home) in observed and 'acp-slack-adapter' in observed
                     checks.append('actual current-user startup registration points to the preserved installation')
                 finally:
                     r=urllib.request.Request(base+'/api/v1/desktop/startup',data=json.dumps({'enabled':False}).encode(),method='PUT',headers={'Content-Type':'application/json',**startup_headers})
