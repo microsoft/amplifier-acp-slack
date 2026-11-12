@@ -12,8 +12,57 @@ def database(path):
 for name,path in [('launcher',ROOT/'tests/native_launch.py'),('worker',ROOT/'scripts/native_update.py')]:
  spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);globals()[name]=module
 
+class ActualWorker:
+ """Hold the OS process identity of this plan's actual packaged interpreter."""
+ def __init__(self,folder,identifier):
+  self.folder=folder.resolve();self.identifier=identifier;self.handle=None;self.pid=None;self.settled=False
+  self.executable=self.folder/'worker-runtime/python'/('python.exe' if os.name=='nt' else 'bin/python3')
+ def capture(self):
+  if os.name!='nt':return
+  import ctypes as c
+  from ctypes import wintypes as w
+  self.kernel=c.WinDLL('kernel32',use_last_error=True)
+  self.kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];self.kernel.OpenProcess.restype=w.HANDLE
+  self.kernel.QueryFullProcessImageNameW.argtypes=[w.HANDLE,w.DWORD,w.LPWSTR,c.POINTER(w.DWORD)]
+  self.kernel.WaitForSingleObject.argtypes=[w.HANDLE,w.DWORD];self.kernel.CloseHandle.argtypes=[w.HANDLE]
+  # Inspect executable identities directly; console/CIM text may normalize the
+  # runner's short Unicode temp path differently from the process image path.
+  psapi=c.WinDLL('psapi',use_last_error=True)
+  psapi.EnumProcesses.argtypes=[c.POINTER(w.DWORD),w.DWORD,c.POINTER(w.DWORD)]
+  ids=(w.DWORD*8192)();used=w.DWORD()
+  assert psapi.EnumProcesses(ids,c.sizeof(ids),c.byref(used))
+  assert used.value<c.sizeof(ids),'Process enumeration exceeded fixture bound'
+  expected=os.path.normcase(str(self.executable.resolve()))
+  for pid in ids[:used.value//c.sizeof(w.DWORD)]:
+   handle=self.kernel.OpenProcess(0x100000|0x1000,False,pid)
+   if not handle:continue
+   buf=c.create_unicode_buffer(32768);size=w.DWORD(32768)
+   matches=False
+   try:
+    if self.kernel.QueryFullProcessImageNameW(handle,0,buf,c.byref(size)):
+     matches=os.path.normcase(str(Path(buf.value).resolve()))==expected
+    if matches:
+     assert self.handle is None,'Multiple processes use this exact plan interpreter'
+     self.handle=handle;self.pid=pid
+   finally:
+    if not matches:self.kernel.CloseHandle(handle)
+  assert self.handle,'Exact per-plan interpreter was not observed'
+ def wait(self,deadline):
+  if self.settled:return
+  if self.handle:
+   assert self.kernel.WaitForSingleObject(self.handle,max(0,int((deadline-time.monotonic())*1000)))==0,'Known update worker did not exit'
+   self.kernel.CloseHandle(self.handle);self.handle=None;self.settled=True
+  else:
+   # The ordinary API reports this same worker lock. Unix replacement allows
+   # concurrent reads; acquire it only to establish that its operation returned.
+   while time.monotonic()<deadline:
+    try:
+     with worker.locked(self.folder.parent/'worker.lock',False):self.settled=True;return
+    except (BlockingIOError,PermissionError):time.sleep(.1)
+   raise AssertionError('Update worker still owns its operation')
+
 def run(package,result):
- checks=[]
+ checks=[];observations=[];actual_worker=None;worker_deadline=None
  with tempfile.TemporaryDirectory(prefix='Slack update café 子 ') as temp:
   root=Path(temp);bundle=root/'download';bundle.mkdir();launcher.extract(package,bundle)
   binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file());home=root/'installation';log=open(root/'server.log','ab')
@@ -72,12 +121,24 @@ def run(package,result):
      request_id=str(uuid.uuid4())
      try:current.api('desktop/updates',{'action':'apply','request_id':request_id,'plan_id':identifier})
      except (TimeoutError,ConnectionError):pass  # Reconcile the same durable request; never redispatch.
-     deadline=time.monotonic()+240
-     while time.monotonic()<deadline:
-      out=worker.read(folder/'plan.json')
-      if out['state'] in {'succeeded','rolled_back','failed','deferred','recovery_required'}:break
+     worker_deadline=time.monotonic()+240
+     actual_worker=ActualWorker(folder,identifier)
+     while time.monotonic()<worker_deadline:
+      try:
+       observed=current.api('desktop/updates');out=observed.get('current')
+       if out is not None:
+        assert out['id']==identifier
+        sample={'state':out['state'],'worker_active':out.get('worker_active')}
+        if not observations or observations[-1]!=sample:observations.append(sample)
+        if os.name=='nt' and out.get('worker_active') is True and actual_worker.pid is None:actual_worker.capture()
+        if out['state'] in {'succeeded','rolled_back','failed','deferred','recovery_required'} and out.get('worker_active') is False:break
+      except (OSError,ConnectionError):pass  # Saved server is stopped/restarted by this exact update.
       time.sleep(.2)
      else:raise AssertionError('The installed native worker did not settle')
+     if os.name=='nt':assert actual_worker.pid is not None,'Did not bind the actual private update worker'
+     actual_worker.wait(worker_deadline)
+     print('Observed real update API phases: '+json.dumps(observations))
+     if result:result.with_suffix('.phases.json').write_text(json.dumps(observations,indent=2)+'\n')
      assert worker.read(home/'native-updates'/('request-'+request_id+'.json'))['id']==identifier
      assert (folder/'worker.py').read_bytes()==(ROOT/'scripts/native_update.py').read_bytes(),'Package worker differs from the fault-injection fixture'
     else:
@@ -95,6 +156,7 @@ def run(package,result):
    before=worker.digest(original_binary);current.stop=lambda:(_ for _ in ()).throw(RuntimeError('injected unknown stop'))
    current.execute();assert worker.read(folder/'plan.json')['state']=='recovery_required';assert worker.digest(original_binary)==before;assert current.api('status')['id']==identity_before;checks.append('unknown stop never replaces a running service or rewinds state')
   finally:
+   if actual_worker is not None:actual_worker.wait(worker_deadline)
    if current:
     current=worker.Worker(home,current.id);current.save('rolling_back')
     try:current.stop()
