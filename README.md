@@ -34,6 +34,7 @@ forms. No Instance or fleet manager is required.
 ## Find the boundary for your work
 
 - **Bring an idea:** [vision](docs/VISION.md), [contract map](contracts/README.md), and [working instructions](AGENTS.md).
+- **Design Slack behavior:** [local connector agreement](contracts/connector.md).
 - **Route and deliver:** [architecture and management API](docs/architecture.md), [public speech and attention](docs/harness.md), [temporary work status](docs/work-status.md), [collaboration waits](docs/collaboration-waits.md).
 - **Retrieve authorized sources:** [conversation context](docs/conversation-continuity.md).
 - **Ask or act:** [permissions, client tools and questions](docs/client-capabilities.md), [media](docs/media.md).
