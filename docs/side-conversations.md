@@ -11,6 +11,9 @@ in that thread with `reply_broadcast: false`. A separate root avoids automatical
 subscribing the person who wrote the original request to every coordination reply.
 Slack still owns notifications for participants, mentions, followed threads and
 personal preferences; the connector does not promise silence for every viewer.
+The opening message asks peers to mention the initiating agent when a meaningful
+result or blocker is ready, so ordinary mention-based participation can handle
+the handoff. Routine exchanges need no mention.
 
 The agent brings meaningful progress, decisions, results or a blocker needing
 human input back to the recorded original channel or thread, with a link to the

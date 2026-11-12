@@ -152,6 +152,7 @@ async def main():
             results = [p for p in posts if p["markdown_text"].startswith("RESULT ")]
             assert len(roots) == len(work_posts) == len(peer) == len(results) == 1, posts
             assert not roots[0].get("thread_ts")
+            assert "mention <@Ualpha> in this thread" in roots[0]["markdown_text"]
             assert roots[0]["metadata"] == {"event_type": "acp_coordination_thread", "event_payload": {"version": 1, "id": roots[0]["client_msg_id"]}}
             assert work_posts[0].get("thread_ts") == peer[0].get("thread_ts") == root_ts
             assert results[0].get("thread_ts", "") == original.get("thread_ts", "")
@@ -180,7 +181,7 @@ async def main():
                 with socket.socket() as reservation:
                     reservation.bind(("127.0.0.1", 0))
                     port = reservation.getsockname()[1]
-                config = {"schema": 1, "id": str(uuid.uuid4()), "label": name, "revision": 1, "enabled": True, "setup_complete": True, "participation": "ambient" if name == "alpha" else "mentions", "acp": {"command": sys.executable, "args": [str(ROOT / "tests/huddles_acp_fixture.py"), str(work), name], "cwd": str(work), "timeout_seconds": 120, "client": {"approvals_required": False}}, "slack": {"team_id": "Ttest", "app_id": "A" + name, "bot_user_id": "U" + name, "bot_id": "B" + name, "channels": [], "allow_dms": True, "api_base": f"http://127.0.0.1:{fixture.port}/api/", "loopback_test": True}, "context": {"enabled": True, "owner_slack_user_id": "UHUMAN"}, "attention": {"settle_ms": 10, "minimum_reply_interval_seconds": 0, "max_replies_per_context_per_hour": 100, "max_replies_per_agent_per_hour": 100, "max_decisions_per_agent_per_hour": 100, "max_bot_replies_without_human": 20}, "server": {"bind": "127.0.0.1", "port": port, "owner": getpass.getuser(), "pam_service": "acp-slack-adapter", "public_url": f"https://127.0.0.1:{port}", "embed_origins": []}}
+                config = {"schema": 1, "id": str(uuid.uuid4()), "label": name, "revision": 1, "enabled": True, "setup_complete": True, "participation": "mentions", "acp": {"command": sys.executable, "args": [str(ROOT / "tests/huddles_acp_fixture.py"), str(work), name], "cwd": str(work), "timeout_seconds": 120, "client": {"approvals_required": False}}, "slack": {"team_id": "Ttest", "app_id": "A" + name, "bot_user_id": "U" + name, "bot_id": "B" + name, "channels": [], "allow_dms": True, "api_base": f"http://127.0.0.1:{fixture.port}/api/", "loopback_test": True}, "context": {"enabled": True, "owner_slack_user_id": "UHUMAN"}, "attention": {"settle_ms": 10, "minimum_reply_interval_seconds": 0, "max_replies_per_context_per_hour": 100, "max_replies_per_agent_per_hour": 100, "max_decisions_per_agent_per_hour": 100, "max_bot_replies_without_human": 20}, "server": {"bind": "127.0.0.1", "port": port, "owner": getpass.getuser(), "pam_service": "acp-slack-adapter", "public_url": f"https://127.0.0.1:{port}", "embed_origins": []}}
                 private_json(home / "adapter.json", config)
                 private_json(home / "secrets/slack.json", {"app_token": "test-" + name + "-app", "bot_token": "test-" + name})
                 await start(name)

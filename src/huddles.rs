@@ -394,7 +394,8 @@ pub async fn call(
                     )
                 });
             let text = format!(
-                "Coordination thread: {purpose}\n{mentions}\n{origin}\nRoutine coordination stays here; meaningful results go back to the original conversation. Anyone in this channel can inspect or join."
+                "Coordination thread: {purpose}\n{mentions}\n{origin}\nRoutine coordination stays here. When a meaningful result or blocker is ready, mention <@{}> in this thread so I can bring it back to the original conversation. Anyone in this channel can inspect or join.",
+                c.slack.bot_user_id
             );
             let binding = Binding {
                 adapter_id: c.id.clone(),
