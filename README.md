@@ -38,7 +38,7 @@ for prerequisites, credential renewal and external workspace approval.
 
 The packaged browser interface is a development and administration surface, not
 the intended product experience. Its controls also have CLI and management API
-forms. No Instance or fleet manager is required.
+forms. No Constellation Instance host or fleet manager is required.
 
 ## Find the boundary for your work
 
@@ -51,6 +51,9 @@ forms. No Instance or fleet manager is required.
 - **Check a change:** [validation](docs/validation.md). Inspect current code and advertised capabilities for the outcome at hand; a fixture pass is not live Slack or model-quality proof.
 
 ## Contributing
+
+Invited collaborators: follow [Join the work](https://github.com/microsoft/amplifier-constellation#join-the-work)
+within your agreed access and scope. The notice below covers general public intake.
 
 > [!NOTE]
 > This project is not currently accepting external contributions, but we're actively working toward opening this up. We value community input and look forward to collaborating in the future. For now, feel free to fork and experiment!
