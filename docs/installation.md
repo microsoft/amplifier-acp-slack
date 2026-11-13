@@ -1,8 +1,13 @@
 # Install and operate a Slack connection
 
-## Install one connection
+For a Windows, Mac or Linux download, follow [native installation](native-installation.md).
+It includes the connector's private Python runtime; Git, system Python and build
+tools are not prerequisites. The source installation below is a separate path
+for developers and server administrators.
 
-The installer supports Linux service hosts. Windows, Mac, Linux, iOS
+## Install one connection from source
+
+This source installer supports Linux service hosts. Windows, Mac, Linux, iOS
 and Android can use the browser interface and Slack clients. The browser is independent of the service host operating system.
 
 Install Git, then clone the public source:
@@ -53,9 +58,11 @@ over an HTTP management listener.
 
 Workspace app approval policies still apply. An administrator may need to approve
 installation. Each connector keeps its own authorization and renewal state; no
-shared Constellation service is involved. The first authorization downloads a
-checksum-verified Slack CLI into this installation. Python 3 and access to GitHub
-and Slack are required. The installed agent remains a standard ACP endpoint.
+shared Constellation service is involved. Guided authorization downloads a
+checksum-verified Slack CLI into this installation when needed; it needs access
+to GitHub and Slack on either installation path. Source installations need
+Python 3; native downloads use their included interpreter. The installed agent
+remains a standard ACP endpoint.
 
 **Advanced: use existing app credentials** retains the manual manifest/token path.
 Existing connections keep their apps, credentials, and conversations. They can
