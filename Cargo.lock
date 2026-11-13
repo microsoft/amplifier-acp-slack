@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acp-slack-adapter"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "amplifier-acp-connection",
  "amplifier-native-platform",
