@@ -4,7 +4,7 @@ The Slack adapter accepts the ordinary
 [`@agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp)
 entry point. Configure its command, arguments and working directory as for any
 other ACP agent. Codex authentication and tool policy belong to that endpoint.
-Agent Instance and its optional profile/management APIs are not required.
+Constellation Instance and its optional profile/management APIs are not required.
 
 The adapter negotiates capabilities. It retries an initialization failure once,
 before creating a session or sending any work; a failed prompt is never retried

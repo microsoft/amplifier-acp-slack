@@ -62,7 +62,7 @@ session setup/load supplies a short-lived HTTP MCP descriptor. The adapter expos
 `slack_context_list`, `slack_context_read`, `slack_context_search` and
 `slack_context_orientation` at
 `/context/mcp`. These tools cannot post messages or change Slack configuration.
-Generic ACP agents can use them without adopting Agent Instance's management API.
+Generic ACP agents can use them without adopting Constellation Instance's management API.
 
 For cross-experience retrieval, the optional `agent-instance.context/1` provider
 uses `/context/v1/query`, authenticated with a dedicated token carrying `context`
@@ -88,7 +88,7 @@ the same distinction rather than assuming its old tools are still usable.
 
 The optional ACP metadata `io.github.bkrabach.conversation` carries a provider ID
 and temporary audience grant. It never includes Slack credentials or an adapter
-administrator token. Agent Instance validates that grant before exposing its own
+administrator token. Constellation Instance validates that grant before exposing its own
 cross-provider context tools. The agent adds those tools independently of which
 native ACP client is attached, including Toad.
 
@@ -117,7 +117,7 @@ membership policy. `authorize` reports the effective `scope`.
 - Slack metadata/membership is checked on retrieval. Unavailable permission
   evidence denies access. Grants are random, stored hashed, expire after thirty
   minutes and become invalid when the configuration revision changes.
-- Agent Instance binds resumed context to its recorded audience. A legacy session
+- Constellation Instance binds resumed context to its recorded audience. A legacy session
   with no audience record is rebuilt from the authorized Slack projection. A
   private owner session cannot be reused as a group session.
 

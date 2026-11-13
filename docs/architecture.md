@@ -7,8 +7,8 @@ or model runtime. ACP is the work boundary. Management is a separate optional
 interface belonging to the connector itself.
 
 The optional `init --agent-home` import is an operator convenience: it resolves a
-standard stdio command. Runtime code has no dependency on Agent Instance. A remote
-stdio endpoint can be launched through a deliberately configured SSH command;
+standard stdio command. Connector code has no dependency on the Constellation
+Instance host. A remote stdio endpoint can be launched through a deliberately configured SSH command;
 `acp.cwd` is an absolute directory on the agent's host, not the connector's host.
 Native network transports can be added as separate transport implementations as
 ACP standardizes them. Its management HTTP API is not ACP.

@@ -2,11 +2,16 @@
 
 Give an independently configured agent a Slack presence: invite it into a channel,
 work with it in a thread, or use a direct conversation. Slack remains the source
-of its conversations; the chosen ACP endpoint supplies the agent.
+of its conversations; the chosen ACP endpoint supplies the agent. This is the ecosystem’s
+[Connection](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/connection.md)
+into the platform’s own conversations and experience, independent of the agent’s
+internal architecture.
 
 Part of [Amplifier Constellation](https://github.com/microsoft/amplifier-constellation).
 The [vision](docs/VISION.md) explains the value and design space. The
 [contract map](contracts/README.md) locates shared promises and Slack-owned boundaries.
+
+The supplied connector path:
 
 ```text
 Slack app ← Socket Mode → this connector ← standard ACP stdio → your agent

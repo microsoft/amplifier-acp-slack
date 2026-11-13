@@ -2,7 +2,9 @@
 
 For Slack installation owners, ACP endpoints and clients using this connector.
 The promise: an independent agent can participate through Slack while respecting
-Slack's source, audience and delivery boundaries.
+Slack's source, audience and delivery boundaries. It implements the umbrella
+[Connection](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/connection.md)
+role; the contract below adds Slack-specific obligations.
 
 **Example:** A reply to a project thread remains in that thread after a person
 switches views. If Slack accepted a message but its response was lost, the
@@ -13,10 +15,11 @@ another copy.
 
 1. **Keep the Slack installation independent.** It owns the Slack app association,
    credential renewal, conversation projection, inbox/outbox and session references.
-   The ACP endpoint owns agent identity, provider authentication and execution
-   history. Importing an agent command is setup convenience, not a dependency on
-   Instance or a fleet service. [Setup](../docs/onboarding.md) owns workspace
-   authorization and renewal details.
+   The ACP endpoint owns agent identity and its internal execution, including
+   provider authentication and history where applicable. Importing an agent command
+   is setup convenience, not a dependency on the supplied Constellation Instance
+   host or a fleet service. [Setup](../docs/onboarding.md) owns workspace authorization
+   and renewal details.
 2. **Route by the actual Slack source.** Workspace, channel and thread identify a
    conversation context. Main-channel discussion and individual threads remain
    distinct; one context has at most one active turn while separate contexts may
@@ -50,6 +53,8 @@ access; compare Slack and authenticated management decisions. Verify actual
 thread, audience and posted-message identity. [Validation](../docs/validation.md)
 distinguishes disposable fixtures from real Slack authorization and delivery.
 
-**Left open:** Product layout, agent implementation and collaboration strategy.
+**Left open:** Product layout, agent internals and collaboration strategy.
+The current one-active-turn-per-Slack-context routing is a connector choice,
+not a limit on workers or sessions inside the agent.
 Supported optional capabilities are negotiated with the endpoint. The connector's
 admin UI is one client of its controls.
