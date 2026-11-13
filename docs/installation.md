@@ -24,7 +24,7 @@ a new private folder, and starts an unconfigured user service. It prints the URL
 and opens it when a local desktop is available. Existing folders are never silently
 overwritten. Python 3, systemd, and GitHub access are bootstrap requirements.
 
-For an agent already installed with Agent Instance, the optional convenience flag
+For an agent already installed with Constellation Instance, the optional convenience flag
 prefills its ordinary ACP entrypoint and working directory:
 
 ```sh

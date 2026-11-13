@@ -3,16 +3,26 @@
 Start with the [vision](../docs/VISION.md) and the local
 [Slack participation and delivery agreement](connector.md).
 
-The umbrella owns cross-component promises. Use its current agreements directly:
+This repository implements the umbrella's [Connection](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/connection.md)
+role. Slack supplies the [Experience](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/experience.md) and owns
+its [Conversations](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/conversation.md). The connected
+[Agent Instance](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/agent-instance.md) keeps its internals open;
+capabilities it can invoke follow the [Tool](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/tool.md) boundary
+where supported. These roles describe interfaces, not five required processes.
+
+Shared promises have one home in the umbrella:
 
 | Your change concerns… | Shared home |
 | --- | --- |
-| Component responsibility and reuse | [Composition](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/composition.md) |
-| Human attention, coordination and truthful return | [Interaction](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/interaction.md) |
+| Identity, audience, ownership and reuse | [Composition](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/composition.md) |
+| Attention, coordination and result return | [Interaction](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/interaction.md) |
 | Assigning, delegating or stopping work | [Work authority](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-authority.md) |
-| New input, interruption and recovery | [Work continuity](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md) |
-| Setup, updates and saved connections | [Installations](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/installations.md) |
-| ACP, SDKs and engine compatibility | [Engine compatibility](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/engine-compatibility.md) |
+| Input, interruption and recovery | [Work continuity](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md) |
+
+For this supplied connector, also apply the scoped [installation](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/installations.md)
+and [protocol compatibility](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/engine-compatibility.md) agreements.
+Optional shared attention follows [ACP hosting](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/profiles/acp-hosting.md)
+when negotiated. These implementation choices do not define every agent's internals.
 
 ## Exact Slack interfaces
 

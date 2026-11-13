@@ -1,8 +1,8 @@
 # ACP permissions and local client tools
 
 Client-side capabilities do not depend on an agent brand,
-Agent Instance, persona files, or an agent management API. The default remains
-text chat with no connector filesystem or terminal access and no automatic
+the Constellation Instance host, persona files, or an agent management API.
+The default remains text chat with no connector filesystem or terminal access and no automatic
 permission grants.
 
 ## One approval setting
