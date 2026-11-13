@@ -55,7 +55,7 @@ impl Peer {
         }
     }
     /// Session setup is part of the same user-initiated turn. ACP permits
-    /// callbacks while new/load is in flight, before the prompt is sent.
+    /// callbacks while new/load/resume is in flight, before the prompt is sent.
     async fn session_request(
         &mut self,
         method: &str,
@@ -234,7 +234,7 @@ impl Peer {
     }
     async fn reject(&mut self, v: &Value) -> Result<()> {
         // Initialization and operator probes have no user turn/session binding.
-        // User-initiated session/new and session/load use session_request instead.
+        // User-initiated session/new, load and resume use session_request instead.
         if v["method"] == "session/request_permission" {
             self.write(
                 json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"cancelled"}}}),
@@ -512,6 +512,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let endpoint = endpoint_key(c);
     let (mut client, init) = Client::connect(c, home).await?;
     let can_load = init["agentCapabilities"]["loadSession"] == true;
+    let can_resume = init["agentCapabilities"]["sessionCapabilities"]["resume"].is_object();
     let mut session_params = json!({"cwd":c.acp.cwd,"mcpServers":[]});
     if c.context.enabled {
         let grant = crate::context::issue_grant(c, home, input)?;
@@ -533,19 +534,29 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let prior = store.session(ctx, &endpoint)?;
     let mut loaded = false;
     let mut tools = None;
-    let sid = if let Some(old) = prior.filter(|_| can_load) {
+    let sid = if let Some(old) = prior.filter(|_| can_load || can_resume) {
         let mut load_params = session_params.clone();
         load_params["sessionId"] = json!(old);
+        let method = if can_load {
+            "session/load"
+        } else {
+            "session/resume"
+        };
         let restore = client
             .peer
-            .authenticated_session("session/load", load_params, c, home, input, &mut tools)
+            .authenticated_session(method, load_params, c, home, input, &mut tools)
             .await;
         if let Err(ref error) = restore
             && crate::acp_auth::authentication_required(error)
         {
             return Err(crate::acp_auth::AuthenticationRequired.into());
         }
-        if restore.is_ok() {
+        if !can_load {
+            // A failed resume does not authorize replacing the saved conversation.
+            restore?;
+            loaded = true;
+            old
+        } else if restore.is_ok() {
             loaded = true;
             old
         } else {
@@ -578,7 +589,13 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             .to_owned()
     };
     ensure!(sid.len() <= 1024, "Invalid ACP session id");
-    store.bind_session(ctx, &endpoint, &sid, can_load, &input["conversation"])?;
+    store.bind_session(
+        ctx,
+        &endpoint,
+        &sid,
+        can_load || can_resume,
+        &input["conversation"],
+    )?;
     let host_attention = crate::attention::supported(&init) && crate::attention::applies(c, input);
     let mut attention_offer = None;
     let mut prior_delivery = json!([]);

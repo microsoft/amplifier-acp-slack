@@ -21,7 +21,10 @@ One context has at most one active turn; separate contexts can work concurrently
 
 For each turn, the connector launches the configured ACP client command, initializes
 the endpoint, loads the recorded session when `agentCapabilities.loadSession` is
-advertised, or creates a session otherwise. It sends a bounded current Slack view
+advertised, or resumes it when only `sessionCapabilities.resume` is advertised.
+A failed resume preserves the saved binding and returns the failure without
+creating a replacement session or sending a prompt. If neither capability is
+advertised, or no binding exists yet, it creates a session. It sends a bounded current Slack view
 for that context. The endpoint supplies its own identity and instructions. Native
 session state remains with that endpoint; the connector stores its opaque ID and
 whether it can be resumed. The current driver records `session_replaced` and

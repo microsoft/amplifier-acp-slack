@@ -58,19 +58,25 @@ for line in sys.stdin:
                 failure.unlink()
             send({"id": request["id"], "error": {"code": -32603, "message": "Fixture startup failure"}})
             continue
-        result(request, {"protocolVersion": 1, "agentCapabilities": {"loadSession": os.getenv("FIXTURE_NO_LOAD") != "1"},
+        capabilities = {"loadSession": os.getenv("FIXTURE_NO_LOAD") != "1"}
+        if os.getenv("FIXTURE_RESUME") == "1":
+            capabilities["sessionCapabilities"] = {"resume": {}}
+        elif os.getenv("FIXTURE_RESUME") == "boolean":
+            capabilities["sessionCapabilities"] = {"resume": True}
+        result(request, {"protocolVersion": 1, "agentCapabilities": capabilities,
                          "agentInfo": {"name": "independent-python-fixture", "version": "1.0"}})
     elif method == "session/new":
         sid = str(uuid.uuid4())
         session_path(sid).write_text(json.dumps({"turns": 0}))
         log("session_new", session_id=sid, cwd=params["cwd"])
         result(request, {"sessionId": sid})
-    elif method == "session/load":
+    elif method in ("session/load", "session/resume"):
         sid = params["sessionId"]
-        if session_path(sid).exists():
-            log("session_load", session_id=sid, cwd=params["cwd"])
+        if session_path(sid).exists() and not (ROOT / (method.split("/")[1] + "-failure")).exists():
+            log("session_load" if method == "session/load" else "session_resume", session_id=sid, cwd=params["cwd"])
             result(request, {})
         else:
+            log(method.replace("/", "_") + "_failed", session_id=sid)
             send({"id": request["id"], "error": {"code": -32602, "message": "Unknown session"}})
     elif method == "session/prompt":
         sid = params["sessionId"]
