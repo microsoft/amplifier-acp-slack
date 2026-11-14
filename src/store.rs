@@ -62,6 +62,7 @@ impl Store {
         }
         for (table, column, definition) in [
             ("jobs", "available", "INTEGER NOT NULL DEFAULT 0"),
+            ("jobs", "source_delivery", "TEXT"),
             ("outbox", "attempted", "INTEGER NOT NULL DEFAULT 0"),
             ("outbox", "connector_notice", "INTEGER NOT NULL DEFAULT 0"),
             ("contexts", "human_version", "INTEGER NOT NULL DEFAULT 0"),

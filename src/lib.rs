@@ -50,3 +50,5 @@ pub mod public_speech;
 pub mod connection;
 
 pub mod native_update;
+
+pub mod submissions;
