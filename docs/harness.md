@@ -55,3 +55,32 @@ prove completion or automatically suppress another reply. An ordinary ACP agent
 without this capability retains the existing input path.
 
 See the [work continuity agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md).
+
+## Inspect an original submission
+
+`POST /api/v1/submissions/inspect` uses the existing management `observe` scope.
+Supply `{"sources":[{"team":"T…","channel":"C…","thread":"","ts":"…","revision":"…","sender":"U…"}]}`
+with 1–16 exact Slack references. It searches retained jobs, including settled
+records outside the recent prompt projection. Current configured team/channel
+access and every supplied source field must match. Missing or mismatched records
+return `unknown` without text. Each attempt separates processing, actual outbox
+publication (including uncertain/multipart sends), and any last observed Instance
+receipt. Inspection is local and read-only; it never prompts, resends or creates work.
+
+When an endpoint advertises the existing Instance source-delivery profile with
+`ordinaryPrompts` and `workReferences`, actual response prompts carry the original
+source revision/time and stable job input ID. The existing Conversation grant
+establishes the actor and audience. Quiet participation checks and scheduled work
+continuations do not redeliver the original source. The connector retains a
+bounded receipt snapshot on its existing job after a terminal response; a lost
+transport remains unknown. Multiple work references are preserved, including
+`proposed` records that are not accepted work. Snapshots expose their observation
+time and do not claim current work state. A retained `receipt_query` supplies
+the exact existing host method and source/session arguments for authorized
+inspection, never replay. Old jobs without a snapshot stay unknown;
+unadvertised endpoints stay ordinary ACP and report unsupported linkage.
+
+The profile's authoritative shape and retention limits belong to
+[Instance's harness interface](https://github.com/microsoft/amplifier-constellation-instance/blob/main/docs/harness.md).
+A terminal response, a published Slack message and completed work remain separate
+under the umbrella [work-continuity agreement](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md).
