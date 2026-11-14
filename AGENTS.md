@@ -1,5 +1,7 @@
 # Working on the Slack connector
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
 Use [Converge](https://github.com/microsoft/amplifier-converge) and the umbrella
 [shared agreements](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/README.md).
 Read [this vision](docs/VISION.md) and the [local boundary](contracts/connector.md)
