@@ -169,13 +169,13 @@ for line in sys.stdin:
  r=json.loads(line);m=r.get('method');p=r.get('params',{});i=r.get('id')
  if m=='initialize':
   result={'protocolVersion':1,'agentCapabilities':{}}
-  if mode!='plain':result['_meta']={'io.github.bkrabach.agent-instance':{'inputContinuity':{'sourceDelivery':{'version':1,'metadata':'com.microsoft.amplifier.source-delivery','ordinaryPrompts':True,'workReferences':True,'receiptsMethod':'_amplifier/source_receipts'}}}}
+  if mode!='plain':result['_meta']={'io.github.bkrabach.agent-instance':{'inputContinuity':{'sourceDelivery':{'version':1,'metadata':'com.microsoft.amplifier.source-delivery','ordinaryPrompts':True,'promptRetry':'inspectOnly','workReferences':True,'receiptsMethod':'_amplifier/source_receipts'}}}}
  elif m=='session/new':result={'sessionId':'source-session'}
  elif m=='session/prompt':
   metadata=p.get('_meta',{}).get('com.microsoft.amplifier.source-delivery')
   assert (metadata is not None)==(mode!='plain')
   if metadata:assert metadata['inputId'] and metadata['sources'][0]['revision']=='1'
-  with (root/'prompts').open('a') as f:f.write('1\n')
+  with (root/'prompts').open('ab') as f:f.write(b'1\n')
   if mode=='lost':sys.exit(0)
   out({'method':'session/update','params':{'sessionId':'source-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Done inspecting.'}}}})
   result={'stopReason':'end_turn'}
@@ -238,4 +238,16 @@ for line in sys.stdin:
             "1\n"
         );
     }
+}
+
+#[test]
+fn source_profile_requires_inspect_only_retry_semantics() {
+    let mut init = json!({"_meta":{"io.github.bkrabach.agent-instance":{"inputContinuity":{"sourceDelivery":{"version":1,"metadata":"com.microsoft.amplifier.source-delivery","ordinaryPrompts":true,"workReferences":true,"receiptsMethod":"_amplifier/source_receipts"}}}}});
+    assert!(!acp_slack_adapter::submissions::profile(&init));
+    init["_meta"]["io.github.bkrabach.agent-instance"]["inputContinuity"]["sourceDelivery"]["promptRetry"] =
+        json!("inspectOnly");
+    assert!(acp_slack_adapter::submissions::profile(&init));
+    init["_meta"]["io.github.bkrabach.agent-instance"]["inputContinuity"]["sourceDelivery"]["promptRetry"] =
+        json!("retry");
+    assert!(!acp_slack_adapter::submissions::profile(&init));
 }

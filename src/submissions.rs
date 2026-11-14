@@ -94,6 +94,7 @@ pub fn profile(init: &Value) -> bool {
     p["version"] == 1
         && p["metadata"] == META
         && p["ordinaryPrompts"] == true
+        && p["promptRetry"] == "inspectOnly"
         && p["receiptsMethod"] == METHOD
         && p["workReferences"] == true
 }
@@ -101,6 +102,7 @@ pub fn profile(init: &Value) -> bool {
 /// scheduled continuations are not new deliveries of the original human message.
 pub fn prepare(
     store: &Store,
+    c: &Config,
     init: &Value,
     input: &Value,
     sid: &str,
@@ -125,11 +127,12 @@ pub fn prepare(
     let m: Message = serde_json::from_value(input["trigger"].clone())?;
     let occurred = crate::attention::occurred_at(input)?;
     let metadata = json!({"version":1,"inputId":job,"sources":[{"id":m.ts,"revision":m.revision,"occurredAt":occurred}]});
-    store.db.execute("UPDATE jobs SET source_delivery=?1 WHERE id=?2",params![json!({"state":"unknown","session_id":sid,"endpoint":endpoint,"input_id":job,"receipt_query":{"method":METHOD,"params":{"sessionId":sid,"sources":metadata["sources"]}},"work":[],"coverage":"not_observed","observed_at":now_ms()}).to_string(),job])?;
+    store.db.execute("UPDATE jobs SET source_delivery=?1 WHERE id=?2",params![json!({"state":"unknown","session_id":sid,"endpoint":endpoint,"input_id":job,"audience_binding":if c.context.enabled {"configured_grant"}else{"unavailable"},"receipt_query":{"method":METHOD,"params":{"sessionId":sid,"sources":metadata["sources"]}},"work":[],"coverage":"not_observed","observed_at":now_ms()}).to_string(),job])?;
     Ok(Some(metadata))
 }
 pub fn record(
     store: &Store,
+    c: &Config,
     job: &str,
     metadata: &Value,
     sid: &str,
@@ -148,9 +151,9 @@ pub fn record(
             })
         });
     let value = if let Some(r) = receipt {
-        json!({"state":"observed","session_id":sid,"endpoint":endpoint,"input_id":job,"receipt_query":{"method":METHOD,"params":{"sessionId":sid,"sources":metadata["sources"]}},"receipt":r,"work":r["work"],"coverage":result.unwrap()["coverage"],"observed_at":now_ms(),"current_state":"not_refreshed"})
+        json!({"state":"observed","session_id":sid,"endpoint":endpoint,"input_id":job,"audience_binding":if c.context.enabled {"configured_grant"}else{"unavailable"},"receipt_query":{"method":METHOD,"params":{"sessionId":sid,"sources":metadata["sources"]}},"receipt":r,"work":r["work"],"coverage":result.unwrap()["coverage"],"observed_at":now_ms(),"current_state":"not_refreshed"})
     } else {
-        json!({"state":"unknown","session_id":sid,"endpoint":endpoint,"input_id":job,"receipt_query":{"method":METHOD,"params":{"sessionId":sid,"sources":metadata["sources"]}},"work":[],"coverage":"missing_or_unavailable","observed_at":now_ms()})
+        json!({"state":"unknown","session_id":sid,"endpoint":endpoint,"input_id":job,"audience_binding":if c.context.enabled {"configured_grant"}else{"unavailable"},"receipt_query":{"method":METHOD,"params":{"sessionId":sid,"sources":metadata["sources"]}},"work":[],"coverage":"missing_or_unavailable","observed_at":now_ms()})
     };
     store.db.execute(
         "UPDATE jobs SET source_delivery=?1 WHERE id=?2",

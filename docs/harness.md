@@ -68,9 +68,10 @@ publication (including uncertain/multipart sends), and any last observed Instanc
 receipt. Inspection is local and read-only; it never prompts, resends or creates work.
 
 When an endpoint advertises the existing Instance source-delivery profile with
-`ordinaryPrompts` and `workReferences`, actual response prompts carry the original
+`ordinaryPrompts`, `promptRetry: inspectOnly` and `workReferences`, actual response prompts carry the original
 source revision/time and stable job input ID. The existing Conversation grant
-establishes the actor and audience. Quiet participation checks and scheduled work
+establishes the actor and audience when enabled; context-off snapshots explicitly
+report `audience_binding: unavailable`. Quiet participation checks and scheduled work
 continuations do not redeliver the original source. The connector retains a
 bounded receipt snapshot on its existing job after a terminal response; a lost
 transport remains unknown. Multiple work references are preserved, including

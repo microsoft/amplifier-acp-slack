@@ -732,7 +732,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut source_metadata = if deciding {
         None
     } else {
-        crate::submissions::prepare(&store, &init, input, &sid, &endpoint)?
+        crate::submissions::prepare(&store, c, &init, input, &sid, &endpoint)?
     };
     if let Some(metadata) = &source_metadata {
         params["_meta"][crate::submissions::META] = metadata.clone();
@@ -908,6 +908,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 let result = observed.ok().and_then(Result::ok);
                 crate::submissions::record(
                     &store,
+                    c,
                     input["job_id"].as_str().unwrap_or(""),
                     metadata,
                     &sid,
@@ -1043,7 +1044,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 media_omitted = false;
                 let mut params = json!({"sessionId":sid,"prompt":response_blocks});
                 source_metadata =
-                    crate::submissions::prepare(&store, &init, input, &sid, &endpoint)?;
+                    crate::submissions::prepare(&store, c, &init, input, &sid, &endpoint)?;
                 if let Some(metadata) = &source_metadata {
                     params["_meta"][crate::submissions::META] = metadata.clone();
                 }
