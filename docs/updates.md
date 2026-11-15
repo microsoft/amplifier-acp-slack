@@ -135,3 +135,55 @@ credentials, a running web service, or a previous `connected` audit entry alone
 do not establish recovery. The check requires a fresh Socket Mode connection
 for the current runtime/configuration as well as an ACP handshake and session.
 It does not send a prompt or post a Slack message.
+
+### Existing Constellation container services
+
+Version 0.17.5 adds an owner-local path for the existing Linux container recipe.
+It retains the original service, `50-container.conf`, container image, launcher,
+Codex or other ACP backend, and disabled in-app update policy. It does not give
+an agent Docker or host service access, require an Agent Instance, or install a
+shared service. Other custom drop-ins are still refused.
+
+Run the published connector binary **on the host**, as the installation's OS
+owner. The binary includes its updater; a source checkout is unnecessary. Use the
+existing container manifest and a newly generated UUID for the plan:
+
+```sh
+acp-slack-adapter --home /path/to/installation host-update plan \
+  --container-manifest /path/to/container-state/manifest.json --plan-id PLAN_UUID
+acp-slack-adapter --home /path/to/installation host-update status \
+  --container-manifest /path/to/container-state/manifest.json --plan-id PLAN_UUID
+```
+
+Wait for `ready` and review the same source, CI artifact and binary hashes described
+above. Then use `host-update apply` with the same arguments. `host-update rollback`
+restores the previous binary of that plan while retaining the current database.
+The fixed source is still this repository's successful `main` build; the command
+accepts no executable, download URL or alternate service target.
+
+The packaged code is extracted under the owner's
+`~/.local/share/acp-slack-host-updates/<installation-id>/` directory, outside the
+container mounts. Plans, current status, admission and worker locks reuse the
+installation's existing `updates/` records. Those controls and `bin/` must remain
+read-only inside the container. Policy bytes, revision and owner are checked;
+leave both in-app policy switches disabled.
+
+A repeated plan or apply command reports its already accepted outcome. If a
+worker's dispatch reply was lost, inspect that same plan first. `host-update
+recover` resumes only an interrupted, inactive worker; an uncertain critical
+cutover recovers the previous binary. It does not repeat agent work or Slack
+messages. An uncertain outbox delivery defers the update unchanged; reconcile
+that delivery before explicitly applying that same plan again.
+
+The host checks the effective service and exact known launcher, container
+identity, image, mounts and generation. It maps the connector's container PID to
+its actual host process and executable, verifies the old processes have exited,
+and requires fresh authenticated connection health. A conflicting service or
+container change is a refusal, not permission to replace the deployment.
+`check --target all` remains the separate connection qualification described above.
+
+`tests/host_updates.py` covers local admission and interrupted-control behavior.
+The opt-in `tests/host_update_process.py` uses disposable real Docker and systemd
+services, actual older/current binaries, and loopback Slack/ACP substitutes. Its
+artifact acquisition fixture is separate from the fixed GitHub selection tests;
+it does not establish real Slack account or model behavior.
