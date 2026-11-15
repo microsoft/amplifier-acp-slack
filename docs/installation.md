@@ -84,7 +84,8 @@ acp-slack-adapter --home /path/to/connection api POST views --body-file view.jso
 ```
 
 `api METHOD PATH --body-file FILE` exposes the same operations as the UI, including
-its display state. Credential values belong in private input files or password
+its display state. `PATH` is relative to `/api/v1`: `status`, not `api/v1/status`.
+Credential values belong in private input files or password
 fields, never command arguments. `secret NAME --file FILE` writes a named ACP
 environment secret; `acp.secret_env` maps environment variables to those names.
 
