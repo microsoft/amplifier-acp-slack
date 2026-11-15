@@ -1,54 +1,36 @@
-# ACP Slack Adapter
+# Slack Connector for Amplifier
 
-Give an independently configured agent a Slack presence: invite it into a channel,
-work with it in a thread, or use a direct conversation. Slack remains the source
-of its conversations; the chosen ACP endpoint supplies the agent. This is the ecosystem’s
-[Connection](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/connection.md)
-into the platform’s own conversations and experience, independent of the agent’s
-internal architecture.
+Give an existing agent a Slack presence. Invite it into a channel, work with it in
+a thread, or send it a direct message. Slack holds the conversations; your chosen
+ACP-compatible endpoint supplies the agent.
 
 Part of [Amplifier Constellation](https://github.com/microsoft/amplifier-constellation).
-The [vision](docs/VISION.md) explains the value and design space. The
-[contract map](contracts/README.md) locates shared promises and Slack-owned boundaries.
 
-The supplied connector path:
+## Get started
 
-```text
-Slack app ← Socket Mode → this connector ← standard ACP stdio → your agent
-                                ↑
-                    installation management API
-```
+1. Install and authorize the agent you want to connect.
+2. Download the matching [Slack Connector release](https://github.com/microsoft/amplifier-acp-slack/releases)
+   for Windows, macOS or Linux, and extract the complete package.
+3. Open the app and choose a local connector password in the browser.
+4. Follow the setup screens to connect your agent and authorize your Slack workspace.
+5. Invite the Slack app into the channel where you want to work with it.
 
-## Start here
+No system Python or developer toolchain is required. Slack authorization may need
+workspace administrator approval. The native preview is unsigned and unnotarized;
+verify its checksum and use your operating system's normal review flow.
 
-Download a [native Slack Connector release](https://github.com/microsoft/amplifier-acp-slack/releases) for Windows, Mac or Linux, extract the complete download, and open the app. Choose a local connector password, then connect an already installed and authorized ACP agent and your Slack workspace. No developer toolchain or system Python is required. See [native installation and recovery](docs/native-installation.md) for platform details.
+The connector manages its own installation, credentials and updates. A
+Constellation Instance host or fleet manager is not required. Its local browser
+interface provides setup and administration; daily conversations happen in Slack.
 
-For an existing Linux server installation:
+## Help and integration
 
-```sh
-git clone https://github.com/microsoft/amplifier-acp-slack.git
-cd amplifier-acp-slack
-./install.sh --label "My agent"
-```
-
-The Linux installer creates a private connector installation and prints its
-management URL. The agent must already be installed and authenticated. Follow
-[installation](docs/installation.md) and [Slack authorization](docs/onboarding.md)
-for prerequisites, credential renewal and external workspace approval.
-
-The packaged browser interface is a development and administration surface, not
-the intended product experience. Its controls also have CLI and management API
-forms. No Constellation Instance host or fleet manager is required.
-
-## Find the boundary for your work
-
-- **Bring an idea:** [vision](docs/VISION.md), [contract map](contracts/README.md), and [working instructions](AGENTS.md).
-- **Design Slack behavior:** [local connector agreement](contracts/connector.md).
-- **Route and deliver:** [architecture and management API](docs/architecture.md), [public speech and attention](docs/harness.md), [side conversations](docs/side-conversations.md), [temporary work status](docs/work-status.md), [collaboration waits](docs/collaboration-waits.md).
-- **Retrieve authorized sources:** [conversation context](docs/conversation-continuity.md).
-- **Ask or act:** [permissions, client tools and questions](docs/client-capabilities.md), [media](docs/media.md).
-- **Operate an installation:** [saved connections](docs/saved-connections.md), [updates](docs/updates.md), [agent images](docs/agent-images.md).
-- **Check a change:** [validation](docs/validation.md). Inspect current code and advertised capabilities for the outcome at hand; a fixture pass is not live Slack or model-quality proof.
+- [Native installation, updates and recovery](docs/native-installation.md)
+- [Slack authorization and credential renewal](docs/onboarding.md)
+- [Existing Linux and source installations](docs/installation.md)
+- [Saved agent connections](docs/saved-connections.md) and [agent images](docs/agent-images.md)
+- [Management API and architecture](docs/architecture.md)
+- [Contributor entry](AGENTS.md)
 
 ## Contributing
 
