@@ -225,7 +225,7 @@ pub async fn local_api(
 ) -> Result<Value> {
     ensure!(
         !path.contains("..") && !path.contains("://") && !path.starts_with('/'),
-        "Use a relative API path"
+        "Use an API path relative to /api/v1, such as \"status\""
     );
     let config = Config::load(home)?;
     let token_path = home.join("secrets/control-token");
@@ -269,15 +269,43 @@ pub async fn local_api(
     }
     let response = request.send().await?;
     let status = response.status();
-    let value: Value = response.json().await?;
-    ensure!(
-        status.is_success(),
-        "{}",
-        value["error"]
-            .as_str()
-            .unwrap_or("Management operation failed")
-    );
-    Ok(value)
+    api_result(method, path, status, &response.bytes().await?)
+}
+/// The value a management API call returned, or an error naming what the
+/// service answered. An unknown route answers with an empty body, and a proxy
+/// may answer with HTML; decoding that as JSON first reported a syntax error
+/// in place of the HTTP status.
+fn api_result(
+    method: &str,
+    path: &str,
+    status: axum::http::StatusCode,
+    body: &[u8],
+) -> Result<Value> {
+    let value = serde_json::from_slice::<Value>(body).ok();
+    if status.is_success() {
+        return value.with_context(|| {
+            format!("{method} {path}: the connector answered HTTP {status}, but not with JSON")
+        });
+    }
+    if let Some(message) = value.as_ref().and_then(|v| v["error"].as_str()) {
+        anyhow::bail!("{message}");
+    }
+    if value.is_some() {
+        anyhow::bail!("Management operation failed (HTTP {status})");
+    }
+    if status == axum::http::StatusCode::NOT_FOUND {
+        // The most likely slip is repeating the prefix this command already adds.
+        let relative = path
+            .strip_prefix("api/v1/")
+            .or_else(|| path.strip_prefix("v1/"))
+            .filter(|rest| !rest.is_empty());
+        anyhow::bail!(
+            "{method} {path}: the connector has no such management API path (HTTP {status}). \
+             Paths are relative to /api/v1, for example \"status\" or \"tokens\"{}",
+            relative.map_or(".".to_owned(), |rest| format!("; try \"{rest}\"."))
+        );
+    }
+    anyhow::bail!("{method} {path}: the connector answered HTTP {status} without a JSON body")
 }
 async fn proved_local_api(
     config: &Config,
@@ -348,15 +376,7 @@ async fn proved_local_api(
         .await
         .map_err(|_| anyhow::anyhow!("Invalid local API response"))?
         .to_bytes();
-    let value: Value = serde_json::from_slice(&bytes)?;
-    ensure!(
-        status.is_success(),
-        "{}",
-        value["error"]
-            .as_str()
-            .unwrap_or("Management operation failed")
-    );
-    Ok(value)
+    api_result(method, path, status, &bytes)
 }
 
 /// Bundled setup dependencies belong to this installation, never the system PATH.
@@ -450,4 +470,67 @@ fn copy_runtime_contents(
     );
     platform::private_write(&target_resources.join("native-bundle.json"), bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod api_result_tests {
+    use super::api_result;
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    fn error(path: &str, status: StatusCode, body: &[u8]) -> String {
+        api_result("GET", path, status, body)
+            .unwrap_err()
+            .to_string()
+    }
+    #[test]
+    fn a_wrong_path_reports_its_status_and_how_paths_are_written() {
+        // An unknown route answers 404 with an empty body.
+        let repeated = error("api/v1/status", StatusCode::NOT_FOUND, b"");
+        assert!(repeated.contains("HTTP 404 Not Found"), "{repeated}");
+        assert!(repeated.contains("relative to /api/v1"), "{repeated}");
+        assert!(repeated.contains("try \"status\""), "{repeated}");
+        assert!(!repeated.contains("EOF"), "{repeated}");
+        let unknown = error("nothing-here", StatusCode::NOT_FOUND, b"");
+        assert!(unknown.contains("HTTP 404 Not Found"), "{unknown}");
+        assert!(unknown.contains("\"status\" or \"tokens\"."), "{unknown}");
+        assert!(!unknown.contains("try"), "{unknown}");
+    }
+    #[test]
+    fn other_bodies_that_are_not_json_report_the_status() {
+        let proxy = error(
+            "status",
+            StatusCode::BAD_GATEWAY,
+            b"<html>Bad Gateway</html>",
+        );
+        assert_eq!(
+            proxy,
+            "GET status: the connector answered HTTP 502 Bad Gateway without a JSON body"
+        );
+        let page = error("status", StatusCode::OK, b"<html></html>");
+        assert_eq!(
+            page,
+            "GET status: the connector answered HTTP 200 OK, but not with JSON"
+        );
+    }
+    #[test]
+    fn answers_from_the_service_itself_are_unchanged() {
+        assert_eq!(
+            api_result("GET", "status", StatusCode::OK, br#"{"enabled":true}"#).unwrap(),
+            json!({"enabled":true})
+        );
+        // A real route's 404 keeps its own explanation; the path was right.
+        assert_eq!(
+            error(
+                "views/absent",
+                StatusCode::NOT_FOUND,
+                br#"{"error":"Missing view"}"#
+            ),
+            "Missing view"
+        );
+        assert_eq!(
+            error("status", StatusCode::INTERNAL_SERVER_ERROR, b"{}"),
+            "Management operation failed (HTTP 500 Internal Server Error)"
+        );
+    }
 }
