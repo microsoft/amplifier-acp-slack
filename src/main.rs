@@ -44,6 +44,15 @@ enum Action {
         #[arg(long)]
         plan_id: Option<String>,
     },
+    /// Owner-local update control for an existing isolated container installation.
+    HostUpdate {
+        #[arg(default_value = "status")]
+        action: String,
+        #[arg(long)]
+        container_manifest: PathBuf,
+        #[arg(long)]
+        plan_id: String,
+    },
     /// Fixed installation-owned connection protocol; bounded JSON from stdin.
     Connection {
         action: String,
@@ -210,6 +219,16 @@ async fn run(cli: Cli) -> Result<()> {
                 )?;
             }
         }
+        Action::HostUpdate {
+            action,
+            container_manifest,
+            plan_id,
+        } => print(acp_slack_adapter::updates::host_command(
+            &home,
+            &container_manifest,
+            &action,
+            &plan_id,
+        )?)?,
         Action::Serve => acp_slack_adapter::server::serve(home).await?,
         Action::Connection { action } => {
             use std::io::Read;

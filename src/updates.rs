@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
 const SCRIPT: &str = include_str!("../scripts/update.py");
+const HOST_SCRIPT: &str = include_str!("../scripts/host_update.py");
 const REPOSITORY: &str = "microsoft/amplifier-acp-slack";
 const ACTIVE: &[&str] = &[
     "queued",
@@ -114,6 +115,115 @@ pub fn status(home: &Path) -> Result<Value> {
         json!({"schema":"slack-connector.updates/1","repository":REPOSITORY,"source":"main","workflow":"check.yml","supported":supported(),"platform":"linux-systemd","enabled":p.enabled,"agent_enabled":p.agent_enabled,"policy_revision":p.revision,"owner_linked":!c.context.owner_slack_user_id.is_empty(),"current":active(home),"configuration_and_sessions":"preserved; only the connector executable is replaced","prerequisites":["installer-created Linux user service","GitHub CLI authenticated for Actions artifacts"]}),
     )
 }
+fn host_code_mount_overlap(control: &Path, source: &Path) -> bool {
+    control.starts_with(source) || source.starts_with(control)
+}
+
+/// An OS-owner CLI, deliberately absent from the HTTP and ACP command surfaces.
+/// Existing container policy stays disabled; the host script validates the exact
+/// service, namespace, read-only mounts and owner before accepting an operation.
+pub fn host_command(home: &Path, manifest: &Path, action: &str, id: &str) -> Result<Value> {
+    ensure!(supported(), "Linux host update tooling is unavailable");
+    ensure!(
+        ["plan", "status", "apply", "rollback", "recover"].contains(&action),
+        "Choose plan, status, apply, rollback or recover"
+    );
+    ensure!(valid_id(id), "Use one canonical UUID for the update plan");
+    ensure!(
+        manifest.is_absolute(),
+        "Use the existing absolute container manifest path"
+    );
+    let mut hash = Sha256::new();
+    hash.update(HOST_SCRIPT.as_bytes());
+    hash.update(SCRIPT.as_bytes());
+    let manifest_value: Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+    let container = manifest_value["container"]
+        .as_str()
+        .filter(|v| {
+            !v.is_empty()
+                && v.as_bytes()[0].is_ascii_alphanumeric()
+                && v.len() <= 63
+                && v.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .ok_or_else(|| anyhow::anyhow!("Invalid existing container identity"))?;
+    let config = Config::load(home)?;
+    let identity = uuid::Uuid::parse_str(&config.id)?;
+    let owner_home = std::path::PathBuf::from(
+        std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("Host owner home is unavailable"))?,
+    )
+    .canonicalize()?;
+    let control = owner_home
+        .join(".local/share/acp-slack-host-updates")
+        .join(identity.to_string());
+    // Validate the host code location BEFORE writing or executing Python. The
+    // application journal can be mounted read-only; executable host code is not.
+    let inspected = std::process::Command::new("/usr/bin/docker")
+        .args(["inspect", container])
+        .output()?;
+    ensure!(
+        inspected.status.success(),
+        "Existing container is unavailable"
+    );
+    let values: Value = serde_json::from_slice(&inspected.stdout)?;
+    let mounts = values[0]["Mounts"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Container mounts are unavailable"))?;
+    for mount in mounts {
+        let source = std::path::PathBuf::from(
+            mount["Source"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Container mount source is unavailable"))?,
+        )
+        .canonicalize()?;
+        ensure!(
+            !host_code_mount_overlap(&control, &source),
+            "Host update code must stay outside container mounts"
+        );
+    }
+    for ancestor in control.ancestors() {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "Host control directory cannot use symbolic links"
+            );
+        }
+    }
+    private_dir(&control)?;
+    let folder = control.join(format!("worker-{:x}", hash.finalize()));
+    private_dir(&folder)?;
+    for (name, content) in [("host_update.py", HOST_SCRIPT), ("update.py", SCRIPT)] {
+        let file = folder.join(name);
+        if !file.exists() {
+            private_write(&file, content.as_bytes())?;
+        }
+        ensure!(
+            std::fs::read(&file)? == content.as_bytes(),
+            "Host update code changed"
+        );
+    }
+    let output = std::process::Command::new("/usr/bin/python3")
+        .arg("-I")
+        .arg("-B")
+        .arg(folder.join("host_update.py"))
+        .arg("--home")
+        .arg(home)
+        .arg("--container-manifest")
+        .arg(manifest)
+        .arg("--plan-id")
+        .arg(id)
+        .arg("--action")
+        .arg(action)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Host update refused or requires recovery; inspect the existing plan and service"
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 fn launch(home: &Path, id: &str) -> Result<()> {
     ensure!(supported(), "Linux systemd update tooling is unavailable");
     let root = home.join("updates");
@@ -349,6 +459,24 @@ pub async fn action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_code_rejects_ancestor_and_descendant_mount_sources() {
+        let control = std::path::Path::new("/owner/host-control/id");
+        assert!(super::host_code_mount_overlap(
+            control,
+            std::path::Path::new("/owner")
+        ));
+        assert!(super::host_code_mount_overlap(control, control));
+        assert!(super::host_code_mount_overlap(
+            control,
+            &control.join("worker/hash.py")
+        ));
+        assert!(!super::host_code_mount_overlap(
+            control,
+            std::path::Path::new("/owner/host-control/other")
+        ));
+    }
+
     use super::*;
     #[cfg(unix)]
     #[test]

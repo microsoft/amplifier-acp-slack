@@ -87,20 +87,28 @@ def current_socket_healthy(home, status, started_at, revision):
         return False
     return json.loads(observed[1]).get('state') == 'connected'
 
+def pending_counts(home):
+    with sqlite3.connect('file:'+str(home/'state.sqlite3')+'?mode=ro',uri=True,timeout=5) as db:
+        values=db.execute("SELECT (SELECT COUNT(*) FROM jobs WHERE status='running'),(SELECT COUNT(*) FROM outbox WHERE status IN ('ready','sending')),(SELECT COUNT(*) FROM outbox WHERE status='uncertain')").fetchone()
+        return dict(zip(('running_turns','pending_replies','uncertain_deliveries'),values))
+
 class Controller:
-    def __init__(self, home, identifier):
+    def __init__(self, home, identifier, service_binding=None):
         self.home = home.resolve(); self.identifier = str(uuid.UUID(identifier))
         self.root = self.home/'updates'; self.folder = self.root/'plans'/self.identifier
         self.file = self.folder/'plan.json'; self.job = read(self.file)
         if self.job['id'] != self.identifier: raise RuntimeError('invalid_plan')
         self.config = read(self.home/'adapter.json')
-        self.unit = service(self.home, self.config)
+        self.service_binding = service_binding
+        self.unit = service_binding.unit if service_binding else service(self.home, self.config)
         write(self.root/'registered-service.json',{'adapter_id':self.config['id'],'service':self.unit})
         self.binary = self.home/'bin/acp-slack-adapter'
     def save(self, state=None, **values):
         if state: self.job['state'] = state
         self.job.update(values, updated_at=int(time.time()*1000)); write(self.file, self.job)
     def require_policy(self):
+        if self.service_binding:
+            return self.service_binding.require_policy(self.job)
         value=policy(self.home, read(self.home/'adapter.json'), self.job.get('actor_kind') == 'agent')
         if value['revision']!=self.job['policy_revision']:raise RuntimeError('update_policy_changed')
         if self.job.get('actor_kind')=='agent' and value['owner_slack_user_id']!=self.job['authorized_owner']:raise RuntimeError('update_owner_changed')
@@ -149,11 +157,12 @@ class Controller:
     def gate(self, critical=False):
         write(self.root/'drain.json',{'plan_id':self.identifier,'expires_at':int(time.time()*1000)+(120000 if critical else 15000)})
     def pending_counts(self):
-        with sqlite3.connect('file:'+str(self.home/'state.sqlite3')+'?mode=ro',uri=True,timeout=5) as db:
-            values=db.execute("SELECT (SELECT COUNT(*) FROM jobs WHERE status='running'),(SELECT COUNT(*) FROM outbox WHERE status IN ('ready','sending')),(SELECT COUNT(*) FROM outbox WHERE status='uncertain')").fetchone()
-            return dict(zip(('running_turns','pending_replies','uncertain_deliveries'),values))
+        return pending_counts(self.home)
     def pending(self):return sum(self.pending_counts().values())
-    def control(self, action): run('/usr/bin/systemctl','--user',action,self.unit,timeout=45)
+    def control(self, action):
+        if self.service_binding:
+            return self.service_binding.control(action, self)
+        run('/usr/bin/systemctl','--user',action,self.unit,timeout=45)
     def health(self, expected):
         deadline=time.monotonic()+45
         while time.monotonic()<deadline:
@@ -167,15 +176,21 @@ class Controller:
                 token=(self.home/'secrets/control-token').read_text().strip()
                 request=urllib.request.Request(base+'/api/v1/status',headers={'Authorization':'Bearer '+token})
                 with urllib.request.urlopen(request,context=ctx,timeout=3) as response: status=json.load(response)
-                if status['id']!=self.config['id'] or endpoints['pid']!=int(run('/usr/bin/systemctl','--user','show',self.unit,'-p','MainPID','--value')): raise RuntimeError('wrong_service')
+                if status['id']!=self.config['id']:raise RuntimeError('wrong_service')
+                if self.service_binding:
+                    self.service_binding.verify_running(expected, endpoints, self.job)
+                elif endpoints['pid']!=int(run('/usr/bin/systemctl','--user','show',self.unit,'-p','MainPID','--value')):
+                    raise RuntimeError('wrong_service')
                 cfg=read(self.home/'adapter.json')
                 if cfg['enabled'] and not current_socket_healthy(self.home,status,endpoints['started_at'],cfg['revision']): raise RuntimeError('connection_not_ready')
                 return
             except Exception: time.sleep(.5)
         raise RuntimeError('health_check_failed')
     def replace(self, source):
+        if self.service_binding:self.service_binding.assert_stopped(self.job)
         temporary=self.binary.with_suffix('.update-next');shutil.copyfile(source,temporary);temporary.chmod(0o755)
         with temporary.open('rb') as f: os.fsync(f.fileno())
+        if self.service_binding:self.service_binding.assert_stopped(self.job)
         temporary.replace(self.binary)
         fd=os.open(self.binary.parent,os.O_RDONLY)
         try:os.fsync(fd)
