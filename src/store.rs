@@ -761,6 +761,19 @@ impl Store {
         self.db.execute("UPDATE outbox SET status='sent',slack_ts=?1,note='Confirmed by Slack event' WHERE id=?2 AND status IN ('sending','uncertain') AND media='[]'",params![ts,id])?;
         Ok(())
     }
+    /// Whether Slack listed any channel for this agent at its last verified
+    /// connection. Slack delivers channel messages only where the app is a
+    /// member and the app cannot join by itself, so `false` means a person
+    /// still has to invite it; direct messages need no invitation.
+    pub fn set_in_channel(&self, member: bool) -> Result<()> {
+        self.db.execute("INSERT INTO settings(key,value) VALUES('in_channel',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[if member {"1"} else {"0"}])?;
+        Ok(())
+    }
+    /// A channel event proves membership before the next connection lists it.
+    pub fn saw_channel_event(&self) -> Result<()> {
+        self.db.execute("INSERT INTO settings(key,value) VALUES('in_channel','1') ON CONFLICT(key) DO UPDATE SET value='1' WHERE value<>'1'",[])?;
+        Ok(())
+    }
     pub fn status(&self) -> Result<Value> {
         let mut jobs = self
             .db
@@ -790,8 +803,17 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        // Null until a connection has listed this agent's conversations.
+        let in_channel: Option<bool> = self
+            .db
+            .query_row(
+                "SELECT value='1' FROM settings WHERE key='in_channel'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
         Ok(
-            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"public_speech":speech_counts,"steering":crate::steering::status(self)?,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
+            json!({"contexts":contexts,"jobs":job_counts,"outbox":counts,"public_speech":speech_counts,"steering":crate::steering::status(self)?,"in_channel":in_channel,"slack_connection":connection.and_then(|(kind,data)|match kind.as_str() {
                 "connection" => serde_json::from_str::<Value>(&data).ok(),
                 "process_started" => Some(json!({"state":"connecting"})),
                 "process_stopped" => Some(json!({"state":"stopped"})),
