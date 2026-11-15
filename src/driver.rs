@@ -729,6 +729,14 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     if let Some(offer) = &attention_offer {
         params["_meta"] = json!({crate::attention::META:offer});
     }
+    let mut source_metadata = if deciding {
+        None
+    } else {
+        crate::submissions::prepare(&store, c, &init, input, &sid, &endpoint)?
+    };
+    if let Some(metadata) = &source_metadata {
+        params["_meta"][crate::submissions::META] = metadata.clone();
+    }
     let mut id = client.peer.send_request("session/prompt", params)?;
     let mut output = String::new();
     let mut media = Vec::new();
@@ -888,6 +896,26 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 terminal = Some(v);
                 continue;
             }
+            if let Some(metadata) = &source_metadata {
+                let observed = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.peer.request(
+                        crate::submissions::METHOD,
+                        json!({"sessionId":sid,"sources":metadata["sources"]}),
+                    ),
+                )
+                .await;
+                let result = observed.ok().and_then(Result::ok);
+                crate::submissions::record(
+                    &store,
+                    c,
+                    input["job_id"].as_str().unwrap_or(""),
+                    metadata,
+                    &sid,
+                    &endpoint,
+                    result.as_ref(),
+                )?;
+            }
             for receipt in v["result"]["_meta"][crate::steering::RECEIPTS]["inputReceipts"]
                 .as_array()
                 .into_iter()
@@ -1014,10 +1042,13 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 answer = crate::answer::Answer::default();
                 media.clear();
                 media_omitted = false;
-                id = client.peer.send_request(
-                    "session/prompt",
-                    json!({"sessionId":sid,"prompt":response_blocks}),
-                )?;
+                let mut params = json!({"sessionId":sid,"prompt":response_blocks});
+                source_metadata =
+                    crate::submissions::prepare(&store, c, &init, input, &sid, &endpoint)?;
+                if let Some(metadata) = &source_metadata {
+                    params["_meta"][crate::submissions::META] = metadata.clone();
+                }
+                id = client.peer.send_request("session/prompt", params)?;
                 continue;
             }
             let huddle_delivery =
