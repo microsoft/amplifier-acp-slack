@@ -94,6 +94,27 @@ changing the Slack identity or ACP endpoint requires another installation so an
 unrelated agent cannot inherit its transcripts accidentally. Upgrading an agent
 behind an unchanged entrypoint remains independent of this connector.
 
+## Staying up
+
+The service installed from source uses `Restart=always`. It comes back five
+seconds after anything other than the service manager ends it: a crash, memory
+pressure, or a signal from another program. A stop through the service manager
+(`systemctl --user stop`) stays stopped, and so does the updater’s own stop,
+because systemd does not restart a unit it stopped itself. Pausing a connection
+keeps the process running and is unaffected.
+
+`Restart=on-failure` is not enough here. The connector handles a termination
+signal and exits with status 0, which systemd counts as a clean exit. For the
+same reason `RestartForceExitStatus=SIGTERM` does not cover this service: it
+matches a process the signal killed, not one that handled it and exited.
+
+An installation made by an earlier installer keeps `Restart=on-failure` until
+its unit is changed. Edit that line in
+`~/.config/systemd/user/acp-slack-adapter-<connection id>.service`, then run
+`systemctl --user daemon-reload`, which does not restart the connection. Change
+the unit file itself: the [updater](updates.md) declines a service that has
+drop-in overrides.
+
 ## Process boundary
 
 Separate installation folders and processes under one OS account do not isolate

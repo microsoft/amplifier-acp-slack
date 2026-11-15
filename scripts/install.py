@@ -78,13 +78,7 @@ def main():
     unit = 'acp-slack-adapter-'+config['id']+'.service'
     units = Path.home()/'.config/systemd/user'
     units.mkdir(parents=True,exist_ok=True)
-    service = '\n'.join([
-        '[Unit]','Description=Standalone Slack to ACP adapter','After=network-online.target','',
-        '[Service]','Type=simple',
-        'ExecStart='+quoted(install_home/'bin/acp-slack-adapter')+' serve --home '+quoted(install_home),
-        'WorkingDirectory='+str(install_home).replace('%','%%'),'Restart=on-failure','RestartSec=5',
-        'UMask=0077','KillMode=control-group','TimeoutStopSec=15','',
-        '[Install]','WantedBy=default.target',''])
+    service = service_unit(install_home)
     (units/unit).write_text(service)
     (install_home/'adapter.service').write_text(service)
     run('systemctl','--user','daemon-reload')
@@ -108,6 +102,24 @@ def main():
     print('Home: '+str(install_home))
     if not a.no_open and (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')) and shutil.which('xdg-open'):
         subprocess.Popen(['xdg-open',preferred],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+
+def service_unit(install_home):
+    """The systemd user service for one installation.
+
+    Restart=always brings the connection back after anything except the service
+    manager ends it: a crash, memory pressure, or a signal from another program.
+    The connector handles a termination signal and exits with status 0, a clean
+    exit that Restart=on-failure leaves stopped. systemd never restarts a unit it
+    stopped itself, so `systemctl --user stop` and an update's stop stay stopped.
+    """
+    return '\n'.join([
+        '[Unit]','Description=Standalone Slack to ACP adapter','After=network-online.target','',
+        '[Service]','Type=simple',
+        'ExecStart='+quoted(install_home/'bin/acp-slack-adapter')+' serve --home '+quoted(install_home),
+        'WorkingDirectory='+str(install_home).replace('%','%%'),'Restart=always','RestartSec=5',
+        'UMask=0077','KillMode=control-group','TimeoutStopSec=15','',
+        '[Install]','WantedBy=default.target',''])
 
 
 if __name__ == '__main__':
