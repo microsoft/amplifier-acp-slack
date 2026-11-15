@@ -63,3 +63,25 @@ instructions to open Slackbot.
 The approval and challenge code appear only after the person sends the command
 in Slack. The connector labels that step explicitly and keeps the manual copy
 fallback available. See Slack’s [CLI authorization flow](https://docs.slack.dev/tools/slack-cli/guides/authorizing-the-slack-cli/).
+
+### After connecting: invite the agent into a channel
+
+A newly connected agent is a member of no channel. Slack delivers channel
+messages only where the agent’s app is a member, and the app has no permission
+to join a channel by itself. Until a person adds it, the agent hears direct
+messages only, and nothing in Slack says why a channel stays quiet.
+
+To bring it into a channel, open that channel in Slack and send
+`/invite @<agent name>`. Direct messages need no invitation: they work as soon
+as the connection is ready, unless **Allow direct messages** is turned off.
+
+The connected page states this next step under **Open in Slack**. It says
+**Not in any channel yet** when Slack listed no channel for the agent at its
+last connection and no channel message has arrived since. `status` reports the
+same observation as `state.in_channel`: `false`, `true`, or `null` before the
+first listing. The connector takes it from the `users.conversations` call it
+already makes to recover missed messages after each connection, and from any
+later channel message. It adds no Slack permission and no polling, so an
+invitation shows on the page when the first message from that channel arrives
+or at the next reconnection, and leaving the last channel shows at the next
+reconnection. This was checked with fixtures, not against a real Slack workspace.

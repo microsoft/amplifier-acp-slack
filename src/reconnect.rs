@@ -58,6 +58,13 @@ pub async fn recover(
             "Conversation recovery page limit reached; checkpoint retained"
         );
     }
+    // The same listing says whether anyone has invited this agent into a
+    // channel yet. Recorded before history recovery so a later failure keeps it.
+    s.lock().unwrap().set_in_channel(
+        rooms
+            .iter()
+            .any(|room| room["is_im"] != true && room["is_mpim"] != true),
+    )?;
     let mut recovered = 0;
     for room in rooms {
         let Some(channel) = room["id"].as_str() else {
