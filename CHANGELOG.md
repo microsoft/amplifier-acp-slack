@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.17.4
+
+Inspect exact original Slack submissions and retained Instance work references without resending input. Existing sessions, work and delivery evidence are preserved. See [release notes](docs/releases/0.17.4.md).
+
 ## 0.17.1
 
 Native downloads include a private setup runtime and a first-account browser flow for Windows, Mac and Linux. Independent native installations can check published bundles and restore their previous executable without rewinding credentials or conversation state. Existing Linux PAM/HTTPS and enrolled update ownership remain unchanged. See [native installation](docs/native-installation.md).

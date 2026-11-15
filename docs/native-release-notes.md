@@ -1,4 +1,4 @@
-Slack 0.17.3 keeps a continuing conversation with ACP endpoints that advertise session resume without session loading. Follow-up turns reuse the saved session. If resume fails, the connector preserves that binding and reports the failure before creating a replacement or sending a prompt. Existing session-loading behavior and permission controls remain unchanged.
+Slack 0.17.4 lets authorized clients inspect the outcome of an exact original Slack submission, including retained delivery evidence and last observed work references from compatible Agent Instances. Lookup reuses existing records and does not resend the input. Optional source/work support is negotiated; unsupported or unknown outcomes remain explicit.
 
 Native Slack Connector downloads include the connector and its own private setup runtime. Open the app, choose a local connector password, and use the existing Slack authorization and agent connection screens. No developer toolchain, system Python or WSL is required.
 
