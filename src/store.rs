@@ -565,7 +565,11 @@ impl Store {
                 } else {
                     format!("{summary} Reference: {}", &job.id[..job.id.len().min(8)])
                 };
-                self.db.execute(
+                // One transaction: a reader that sees the failed status also sees
+                // the activity row that explains it. The status message is worded
+                // from that row once and keeps that wording.
+                let tx = self.db.unchecked_transaction()?;
+                tx.execute(
                     "UPDATE jobs SET status='failed',updated=?1,note=?3 WHERE id=?2",
                     params![now_ms(), job.id, note],
                 )?;
@@ -577,6 +581,7 @@ impl Store {
                     },
                     json!({"job":job.id,"context":job.context,"source_message":job.trigger.ts,"source_revision":job.trigger.revision,"stage":stage,"category":category,"delivery":delivery,"reason":note}),
                 )?;
+                tx.commit()?;
                 crate::steering::retire_awareness(self, &job.id)?;
                 crate::steering::coverage(self, &job.id, "turn_failed", None)?;
                 return Ok(());
@@ -588,8 +593,10 @@ impl Store {
             |r| r.get(0),
         )?;
         if version > job.version {
-            self.db.execute("UPDATE jobs SET status='superseded',updated=?1,note='Conversation changed during this turn; contribution withheld' WHERE id=?2",params![now_ms(),job.id])?;
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute("UPDATE jobs SET status='superseded',updated=?1,note='Conversation changed during this turn; contribution withheld' WHERE id=?2",params![now_ms(),job.id])?;
             self.audit("stale_contribution_withheld", json!({"job":job.id}))?;
+            tx.commit()?;
             crate::steering::retire_awareness(self, &job.id)?;
             crate::steering::coverage(self, &job.id, "source_changed", None)?;
             if let Some(current) = self.message(&job.trigger.channel, &job.trigger.ts)?
