@@ -28,6 +28,12 @@ async def main():
             if process and process.returncode is None:process.terminate();await asyncio.wait_for(process.wait(),10)
             await until(lambda:'alpha' not in f.sockets,'connector stopped')
         def posts(ch):return [p for p in f.posts if p['channel']==ch]
+        async def failure(channel):
+            # The connector commits a job's failed status and its driver_failed activity
+            # row separately, so the status can be visible before the row is.
+            found=lambda:rows(home,"SELECT a.data FROM audit a JOIN jobs j ON j.id=json_extract(a.data,'$.job') WHERE a.kind='driver_failed' AND json_extract(j.trigger,'$.channel')=?",(channel,))
+            await until(lambda:bool(found()),'failure recorded in activity')
+            return json.loads(found()[-1][0])
         try:
             await start();await f.send('Dbackground','Run and check the result, quietly until done.')
             await until(lambda:bool(rows(home,"SELECT 1 FROM followups f JOIN jobs j ON j.id=f.parent WHERE j.status='pass'")),'quiet scheduled result check')
@@ -57,12 +63,10 @@ async def main():
                     await until(lambda:not rows(home,"SELECT 1 FROM response_indicators i JOIN jobs j ON j.id=i.job_id WHERE json_extract(j.trigger,'$.channel')=? AND i.state!='finished'",(channel,)),'quiet indicator cleanup')
                     assert not any(i['channel']==channel and 'couldn’t confirm' in i.get('text','') for i in f.indicator_updates)
                 else:
-                    failure=rows(home,"SELECT a.data FROM audit a JOIN jobs j ON j.id=json_extract(a.data,'$.job') WHERE a.kind='driver_failed' AND json_extract(j.trigger,'$.channel')=?",(channel,))
-                    assert json.loads(failure[-1][0])['delivery']=='unknown'
+                    assert (await failure(channel))['delivery']=='unknown'
             await f.send('Dempty','Please answer this direct request.')
             await until(lambda:bool(rows(home,"SELECT 1 FROM jobs WHERE status='failed' AND json_extract(trigger,'$.channel')='Dempty'")),'missing direct answer remains a failure')
-            failure=rows(home,"SELECT a.data FROM audit a JOIN jobs j ON j.id=json_extract(a.data,'$.job') WHERE a.kind='driver_failed' AND json_extract(j.trigger,'$.channel')='Dempty'")
-            assert json.loads(failure[-1][0])['category']=='invalid_answer'
+            assert (await failure('Dempty'))['category']=='invalid_answer'
             assert not posts('Dempty') and (work/'Dempty-prompts').read_text()=='1'
             print('PASS quiet accepted checks finish without filler or false failure; unresolved tools/transport and unanswered direct requests stay distinct',flush=True)
             for channel in ['Cpeer','Cpeerdeleted']:
