@@ -2,6 +2,7 @@
 """Exercise the real local service, TLS, CLI and management APIs without Slack/model work."""
 import argparse
 import getpass
+import importlib.util
 import json
 import pathlib
 import socket
@@ -19,6 +20,10 @@ parser.add_argument("--binary", type=pathlib.Path, default=pathlib.Path(__file__
 args = parser.parse_args()
 binary = str(args.binary.resolve())
 checks = 0
+# The source installer's own argument builder, so its flags and `init` stay in step.
+spec = importlib.util.spec_from_file_location("installer", pathlib.Path(__file__).resolve().parents[1] / "scripts/install.py")
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
 
 def check(condition, label):
     global checks
@@ -30,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
     def cli(*cmd):
         completed = subprocess.run([binary, "--home", str(home), *cmd], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return json.loads(completed.stdout)
-    cli("init", "--label", "Management verification", "--owner", getpass.getuser())
+    created = cli("init", "--label", "Management verification", "--owner", getpass.getuser(), *installer.workspace_arguments("T0EXAMPLE1", "Example Workspace"))
     process = subprocess.Popen([binary, "--home", str(home), "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 20
@@ -100,6 +105,24 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         check(setup["authorization"] == "missing" and setup["next_action"] == "authorize" and not setup["connection_ready"], "Fresh setup exposes one next action")
         check(api("POST", "/api/v1/setup/slack", {"action":"token"})[0] == 400, "Internal token operation is never exposed")
         check(api("POST", "/api/v1/setup/slack", {"action":"confirm","challenge":"code"})[0] == 400, "Expired authorization gives actionable error")
+        # A workspace declared at installation is shown everywhere, but it is not a connection.
+        declared = {"team_id": "T0EXAMPLE1", "name": "Example Workspace"}
+        check(created["intended_workspace"] == declared and status["slack_workspace"] == declared and status["setup_complete"] is False, "Installer arguments declare the workspace through init and status")
+        check(setup["intended_workspace"] == declared and setup["authorized_workspace"] is None and setup["workspace_mismatch"] is False, "Setup reports the intended workspace apart from any approval")
+        config = api("GET", "/api/v1/config")[1]
+        config["slack"].update(team_id="example-workspace", workspace_name="Other Workspace")
+        check(api("PUT", "/api/v1/config", {"expected_revision": config["revision"], "config": config})[0] == 400, "A workspace name or address is refused as its ID")
+        config["slack"]["team_id"] = "T0OTHER0001"
+        check(api("PUT", "/api/v1/config", {"expected_revision": config["revision"] - 1, "config": config})[0] == 409, "Declaring a workspace is revision-checked")
+        check(api("PUT", "/api/v1/config", {"expected_revision": config["revision"], "config": config})[0] == 200, "The workspace can be declared later through the config API")
+        setup = api("GET", "/api/v1/setup/slack")[1]
+        check(setup["intended_workspace"] == {"team_id": "T0OTHER0001", "name": "Other Workspace"} and setup["next_action"] == "authorize" and not setup["connection_ready"], "A declared workspace does not look connected")
+        check(api("POST", "/api/v1/lifecycle", {"action": "start"})[0] == 400, "A declared workspace cannot start without its Slack app")
+        refused = api("POST", "/api/v1/setup/slack", {"action": "connect", "team_id": "T0EXAMPLE1"})
+        check(refused[0] == 400 and "Other Workspace (T0OTHER0001)" in refused[1]["error"], "Connect creates nothing in a workspace other than the declared one")
+        check(api("POST", "/api/v1/setup/slack", {"action": "discard"}, issued["token"])[0] == 403, "Observer cannot discard a Slack approval")
+        discarded = api("POST", "/api/v1/setup/slack", {"action": "discard"})
+        check(discarded[0] == 200 and discarded[1]["authorized"] is False and discarded[1]["next_action"] == "authorize", "Discarding when nothing was approved changes nothing")
         with urllib.request.urlopen(base + "/", context=context) as response:
             check(b"<title>Management verification: Slack Connector</title>" in response.read(), "Pre-login tab identifies connection")
 

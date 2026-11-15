@@ -15,8 +15,8 @@ Playwright module and `CHROMIUM_EXECUTABLE` to a compatible browser, then run
 screenshot directory (the default is `/tmp/acp-slack-adapter-ui`). These are test
 dependencies only; the application has no browser package dependency.
 
-The fixture uses a local server with a URL prefix. It exercises setup, credential
-handling, actual Socket Mode connection status, independent conversation contexts,
+The fixture uses a local server with a URL prefix. It exercises setup, declared
+and confirmed Slack workspaces, credential handling, actual Socket Mode connection status, independent conversation contexts,
 meaningful activity, scoped access tokens, view commands and acknowledgements,
 embedding, and the mobile layout. It never connects to Slack or a real ACP agent.
 It also verifies that lost cookies and failures loading configuration or a display

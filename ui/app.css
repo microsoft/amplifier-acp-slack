@@ -34,3 +34,5 @@
 .authorization-fallback{margin-top:16px;color:var(--muted)}.authorization-fallback summary{cursor:pointer}.authorization-fallback pre{margin-top:10px;user-select:all}.connect-authorization form h2{margin-bottom:16px}
 
 .authorization-steps{padding-left:24px;margin:20px 0;font-size:15px;line-height:1.7}.authorization-steps li+li{margin-top:10px}.authorization-steps strong{color:var(--ink)}
+
+.connect-authorization>.workspace-target{font-size:13px;color:var(--ink);background:#f5f7f2;border:1px solid #e5ebe1;border-radius:8px;padding:10px 14px;max-width:560px}.connection-copy .connection-workspace{font-size:13px;color:var(--muted);margin:-8px 0 20px}.connection-workspace strong{color:var(--ink)}

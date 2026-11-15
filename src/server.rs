@@ -27,7 +27,8 @@ pub(crate) fn named_page(html: &str, name: &str, service: &str) -> String {
 use crate::{
     auth,
     config::{
-        AuthMode, Config, Secrets, WebTransport, private_dir, private_write, valid_secret_name,
+        AuthMode, Config, Secrets, WORKSPACE_ID_HELP, WebTransport, private_dir, private_write,
+        valid_secret_name, valid_workspace_id,
     },
     driver,
     error::{ApiError, ApiResult},
@@ -280,6 +281,14 @@ pub fn replace_config(
             return Err(ApiError::conflict(json!({"revision":old.revision})));
         }
         immutable_identity(state, &old, &config)?;
+        // Declaring a workspace before setup: reject a name or address given as its ID.
+        if config.slack.team_id != old.slack.team_id
+            && !config.slack.team_id.is_empty()
+            && config.slack.app_id.is_empty()
+            && !valid_workspace_id(&config.slack.team_id)
+        {
+            return Err(ApiError::bad(WORKSPACE_ID_HELP));
+        }
         if config.enabled
             && !old.enabled
             && crate::connection::gated(&state.home)
@@ -340,8 +349,11 @@ pub fn status_value(state: &AppState) -> ApiResult<Value> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null);
+    // Declared before setup, connected after it; `setup_complete` tells them apart.
+    let slack_workspace = (!c.slack.team_id.is_empty())
+        .then(|| json!({"team_id":c.slack.team_id,"name":c.slack.workspace_name}));
     Ok(
-        json!({"saved_connections":saved_connections,"connection_paused":crate::connection::gated(&state.home),"id":c.id,"label":c.label,"version":env!("CARGO_PKG_VERSION"),"enabled":c.enabled,"setup_complete":c.setup_complete,"config_revision":c.revision,"runtime":runtime,"credentials":{"slack":c.secrets(&state.home).is_ok()},"state":observations,"connections":runtime["connections"].as_array().cloned().unwrap_or_default(),"addresses":addresses,"restart_required":addresses.get("effective_server").is_some_and(|s|*s!=json!(c.server)),"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"pending_permissions":Store::open(&state.home)?.db.query_row("SELECT COUNT(*) FROM permissions WHERE status='pending'",[],|r|r.get::<_,i64>(0))?,"uptime_ms":now_ms()-state.started_at}),
+        json!({"saved_connections":saved_connections,"connection_paused":crate::connection::gated(&state.home),"id":c.id,"label":c.label,"slack_workspace":slack_workspace,"version":env!("CARGO_PKG_VERSION"),"enabled":c.enabled,"setup_complete":c.setup_complete,"config_revision":c.revision,"runtime":runtime,"credentials":{"slack":c.secrets(&state.home).is_ok()},"state":observations,"connections":runtime["connections"].as_array().cloned().unwrap_or_default(),"addresses":addresses,"restart_required":addresses.get("effective_server").is_some_and(|s|*s!=json!(c.server)),"portrait":crate::identity::status(&state.home),"media":state.get_record("checks","media")?,"client_capabilities":crate::client_tools::advertised(&c),"pending_permissions":Store::open(&state.home)?.db.query_row("SELECT COUNT(*) FROM permissions WHERE status='pending'",[],|r|r.get::<_,i64>(0))?,"uptime_ms":now_ms()-state.started_at}),
     )
 }
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -490,7 +502,19 @@ pub(crate) async fn credentials(
         c.slack.app_id = body.app_id;
     }
     let identity=slack::verify_credentials(&c,s.clone()).await.map_err(|_|ApiError::bad("Slack could not verify these credentials. Check the tokens, app ID, installation, and Socket Mode setting"))?;
-    c.slack.team_id = identity["team_id"].as_str().unwrap_or("").into();
+    let team = identity["team_id"].as_str().unwrap_or("");
+    if !c.slack.team_id.is_empty() && team != c.slack.team_id {
+        // A declared or already connected workspace is never replaced by pasted tokens.
+        let found = match identity["team_name"].as_str() {
+            Some(name) if !name.is_empty() => format!("{name} ({team})"),
+            _ => team.to_owned(),
+        };
+        return Err(ApiError::bad(format!(
+            "These credentials belong to {found}, but this connection is for {}. Nothing was saved. Use the app installed in that workspace.",
+            c.slack.workspace_label()
+        )));
+    }
+    c.slack.team_id = team.into();
     c.slack.bot_user_id = identity["bot_user_id"]
         .as_str()
         .or_else(|| identity["user_id"].as_str())
@@ -917,7 +941,7 @@ pub fn openapi_value() -> Value {
         "SecretWrite":{"type":"object","required":["value"],"properties":{"value":{"type":"string","writeOnly":true}}},
         "Lifecycle":{"type":"object","required":["action"],"properties":{"action":{"enum":["start","stop"]}}},
         "Credentials":{"type":"object","required":["app_token","bot_token"],"properties":{"app_token":{"type":"string","writeOnly":true},"bot_token":{"type":"string","writeOnly":true},"app_id":{"type":"string"},"expected_revision":{"type":"integer"}}},
-        "SlackSetup":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["authorize","confirm","connect"]},"challenge":{"type":"string","maxLength":256,"writeOnly":true}}},
+        "SlackSetup":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["authorize","confirm","connect","discard"]},"challenge":{"type":"string","maxLength":256,"writeOnly":true},"team_id":{"type":"string","maxLength":32,"description":"Optional with connect: the approved workspace the caller saw. The app is created only there."}},"description":"Guided Slack setup. GET reports intended_workspace (declared in slack.team_id, or connected) and authorized_workspace (the saved Slack approval) separately. confirm creates the app only when the approval matches a declared workspace; otherwise next_action is connect. discard removes an approval that no app was created with."},
         "UpdateCommand":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["plan","apply","rollback"]},"plan_id":{"type":["string","null"],"format":"uuid"}}},
         "UpdatePolicy":{"type":"object","additionalProperties":false,"required":["expected_revision","enabled","agent_enabled"],"properties":{"expected_revision":{"type":"integer","minimum":0},"enabled":{"type":"boolean"},"agent_enabled":{"type":"boolean"}}},
         "Check":{"type":"object","properties":{"target":{"enum":["all","acp","slack"]}}},
@@ -1457,6 +1481,105 @@ mod tests {
                 .0["ok"],
             false,
             "Failed runtime with stale connected audit is not healthy"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test]
+    async fn pasted_credentials_cannot_move_a_declared_connection_to_another_workspace() {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+        let (_temp, state) = fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // One app whose fictional tokens were issued in two workspaces.
+        let mock = Router::new()
+            .route(
+                "/auth.test",
+                post(|headers: HeaderMap| async move {
+                    let (team, name) = if headers[header::AUTHORIZATION] == "Bearer test-other" {
+                        ("T0OTHER0001", "Other Workspace")
+                    } else {
+                        ("T0EXAMPLE1", "Example Workspace")
+                    };
+                    Json(json!({"ok":true,"team_id":team,"team":name,"user_id":"U1","bot_id":"B1"}))
+                }),
+            )
+            .route(
+                "/bots.info",
+                get(|| async { Json(json!({"ok":true,"bot":{"id":"B1","app_id":"A1"}})) }),
+            )
+            .route(
+                "/apps.connections.open",
+                post(move || async move {
+                    Json(json!({"ok":true,"url":format!("ws://{address}/socket")}))
+                }),
+            )
+            .route(
+                "/socket",
+                get(|ws: WebSocketUpgrade| async {
+                    ws.on_upgrade(|mut socket| async move {
+                        let hello = r#"{"type":"hello","connection_info":{"app_id":"A1"}}"#;
+                        let _ = socket.send(Message::Text(hello.into())).await;
+                    })
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+        {
+            let mut c = state.config.write().unwrap();
+            c.slack.loopback_test = true;
+            c.slack.api_base = format!("http://{address}/");
+            c.slack.team_id = "T0EXAMPLE1".into();
+            c.slack.workspace_name = "Example Workspace".into();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!(
+                "Bearer {}",
+                std::fs::read_to_string(state.home.join("secrets/control-token")).unwrap()
+            )
+            .parse()
+            .unwrap(),
+        );
+        let revision = state.instance_config().revision;
+        let pasted = |bot_token: &str| {
+            Json(SlackCredentials {
+                app_token: "test-app".into(),
+                bot_token: bot_token.into(),
+                app_id: String::new(),
+                expected_revision: None,
+            })
+        };
+        let ApiError(status, message, _) =
+            credentials(State(state.clone()), headers.clone(), pasted("test-other"))
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("Other Workspace (T0OTHER0001)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Example Workspace (T0EXAMPLE1)"),
+            "{message}"
+        );
+        assert!(!state.home.join("secrets/slack.json").exists());
+        assert_eq!(state.instance_config().revision, revision);
+        assert!(state.instance_config().slack.app_id.is_empty());
+        assert!(state.instance_config().validate_ready().is_err());
+
+        let Json(saved) = credentials(State(state.clone()), headers, pasted("test-bot"))
+            .await
+            .unwrap();
+        assert_eq!(saved["identity"]["team_id"], "T0EXAMPLE1");
+        let c = state.instance_config();
+        assert_eq!(c.slack.app_id, "A1");
+        assert_eq!(c.slack.workspace_label(), "Example Workspace (T0EXAMPLE1)");
+        assert_eq!(
+            status_value(&state).unwrap()["slack_workspace"],
+            json!({"team_id":"T0EXAMPLE1","name":"Example Workspace"})
         );
         task.abort();
         let _ = task.await;

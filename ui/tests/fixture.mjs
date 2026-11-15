@@ -16,7 +16,7 @@ const viewBodies=[];
 let beforeViewCommand=null;
 let config={schema:1,id:"fixture-connector",label:"Helper in Slack",revision:1,enabled:false,setup_complete:false,participation:"mentions",context:{enabled:false,owner_slack_user_id:""},media:{incoming:false,outgoing:false,max_files:4,max_file_bytes:2097152},acp:{command:"/installed/agent-instance",args:["acp","--home","/installed/helper"],env:{},secret_env:{},cwd:"/installed/helper/workspace",timeout_seconds:180,client:{read_text_file:false,write_text_file:false,terminal:false,workspace_roots:[],approvals_required:true,approval_users:[],permission_timeout_seconds:180,max_file_bytes:1048576,terminal_output_bytes:262144,terminal_timeout_seconds:120}},slack:{team_id:"",app_id:"",bot_user_id:"",bot_id:"",channels:[],allow_dms:true,api_base:"https://slack.com/api/",loopback_test:false},attention:{settle_ms:1500,max_replies_per_agent_per_hour:30,max_replies_per_context_per_hour:12,max_bot_replies_without_human:2,bot_exchange_cooldown_seconds:0,max_decisions_per_agent_per_hour:120,minimum_reply_interval_seconds:6},server:{bind:"0.0.0.0",port:41337,owner:"fixture-owner",pam_service:"login",public_url:null,embed_origins:[]}};
 let savedConnections=null,connectionPaused=false;
-let permissions=[],mediaChecked=null,fileScopes=false,portrait={},guidedAuthorized=false,guidedExpired=false,guidedDeploys=0,guidedWorkspace="test-workspace",guidedTeam="T_WORKSHOP";
+let permissions=[],mediaChecked=null,fileScopes=false,portrait={},guidedAuthorized=false,guidedExpired=false,guidedDeploys=0,guidedWorkspace="test-workspace",guidedTeam="T_WORKSHOP",guidedPending=false,guidedRefusal="",guidedDiscards=0,guidedConnects=[];
 const mediaResult=()=>({verified:true,checked_at:Date.now(),ready:fileScopes,granted_scopes:fileScopes?["files:read","files:write"]:[],missing_scopes:fileScopes?[]:["files:read","files:write"],settings_url:"https://api.slack.com/apps/A_FIXTURE/oauth",note:fileScopes?"Slack file permissions are installed.":"Add the missing Bot Token Scopes and reinstall this existing app."});
 const events=[{id:5,time:Date.now(),kind:"decision",data:{decision:"pass",reason:"The humans are already working through the question."}},{id:4,time:Date.now(),kind:"delivery",data:{status:"sent",note:""}},{id:3,time:Date.now(),kind:"delivery",data:{status:"uncertain",note:"Inspect Slack before resending."}},{id:2,time:Date.now(),kind:"connection",data:{state:"connected"}},{id:1,time:Date.now(),kind:"view.ack",data:{}}];
 const conversations=[{id:"context-one",channel:"C_FIRST",thread:"",session_id:"session-one",resumable:true,updated_at:Date.now(),turns:3,last_outcome:"pass"},{id:"context-two",channel:"C_SECOND",thread:"1234.1",session_id:"session-two",resumable:true,updated_at:Date.now(),turns:2,last_outcome:"speak"}];
@@ -39,10 +39,19 @@ const server=http.createServer(async(req,res)=>{
   if(endpoint==="auth/logout"){loggedIn=false;return send({ok:true});}
   if(endpoint==="config"){if(failConfig)return send({error:"Temporary configuration outage"},503);if(req.method==="PUT"){if(data.expected_revision!==config.revision)return send({error:"Configuration changed"},409);config={...data.config,revision:config.revision+1};configWrites++;}return send(config);}
   if(endpoint==="setup/slack"){
-    if(data.action==="authorize")return send({command:"/slackauthticket private-ticket"});
-    if(data.action==="confirm"){assert.equal(data.challenge,"private-challenge");guidedAuthorized=true;guidedExpired=false;if(!config.setup_complete){credentials=true;config.setup_complete=true;config.enabled=true;config.revision++;}}
-    if(data.action==="connect"){guidedDeploys++;assert(guidedAuthorized);credentials=true;config.setup_complete=true;config.enabled=true;config.revision++;}
-    return send({authorized:guidedAuthorized,authorization:guidedExpired?"needs_attention":guidedAuthorized?"managed":"missing",team_id:guidedTeam,workspace:guidedWorkspace,setup_complete:config.setup_complete,next_action:config.setup_complete?"done":guidedAuthorized&&!guidedExpired?"connect":"authorize",connection_reused:config.setup_complete});
+    if(data.action==="authorize"){guidedPending=true;return send({command:"/slackauthticket private-ticket"});}
+    if(data.action==="confirm"){
+      assert.equal(data.challenge,"private-challenge");
+      // Slack consumed the ticket: a refused workspace creates nothing and ends this attempt.
+      if(guidedRefusal){guidedPending=false;return send({error:guidedRefusal},400);}
+      guidedAuthorized=true;guidedExpired=false;guidedPending=false;
+      // One step only for a declared workspace; an undeclared one waits for its owner's confirmation.
+      if(!config.setup_complete&&config.slack.team_id){credentials=true;config.slack.app_id=config.slack.app_id||"A_GUIDED";config.setup_complete=true;config.enabled=true;config.revision++;}
+    }
+    if(data.action==="discard"){assert(!config.setup_complete&&!config.slack.app_id);guidedDiscards++;guidedAuthorized=false;}
+    if(data.action==="connect"){guidedDeploys++;guidedConnects.push(data.team_id);assert(guidedAuthorized);credentials=true;config.slack={...config.slack,team_id:config.slack.team_id||guidedTeam,app_id:config.slack.app_id||"A_GUIDED"};config.setup_complete=true;config.enabled=true;config.revision++;}
+    const mismatch=!config.setup_complete&&guidedAuthorized&&!!guidedTeam&&!!config.slack.team_id&&guidedTeam!==config.slack.team_id;
+    return send({authorized:guidedAuthorized,authorization:guidedExpired?"needs_attention":guidedAuthorized?"managed":"missing",authorization_pending:guidedPending,team_id:guidedTeam,workspace:guidedWorkspace,intended_workspace:config.slack.team_id?{team_id:config.slack.team_id,name:config.slack.workspace_name||""}:null,authorized_workspace:guidedAuthorized&&guidedTeam?{team_id:guidedTeam,domain:guidedWorkspace}:null,workspace_mismatch:mismatch,setup_complete:config.setup_complete,next_action:config.setup_complete?"done":guidedAuthorized&&!guidedExpired&&!mismatch?"connect":"authorize",connection_reused:config.setup_complete});
   }
   if(endpoint==="status")return send(status());
   if(endpoint==="media/readiness"){mediaChecked=mediaResult();return send(mediaChecked);}
@@ -88,6 +97,7 @@ try{
   failConfig=false;failView=true;await page.locator('[data-action="auth.resume"]').click();await page.waitForFunction(()=>document.querySelector('[data-control="auth.opening"]')?.textContent.includes("Temporary display outage"));await waitIdle();ok("Display initialization failure offers a working retry without another password");
   failView=false;assert(await page.evaluate(()=>window.slackConnector.actions().includes("auth.resume")));await page.evaluate(()=>window.slackConnector.act("auth.resume"));await page.locator('[data-control="setup.connect-screen"]').waitFor();
   assert(await page.locator('[data-action="slack.setup.authorize"]').isVisible());
+  assert((await page.locator('[data-control="slack.setup.target"]').innerText()).includes("The workspace where you approve the setup command becomes its workspace"));
   assert.equal(await page.locator('[data-control="credentials.app_token"]').count(),0);
   assert.equal(await page.title(), "Helper in Slack: Slack Connector");
   await page.evaluate(()=>window.slackConnector.act("setup.manual"));
@@ -268,7 +278,7 @@ try{
   assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://teamwork.slack.com/messages/@slackbot");
   for(const workspace of ["", "T1234567890", "test.slack.com.evil.invalid", "https://evil.invalid/"]){
     guidedWorkspace=workspace;await page.evaluate(()=>window.slackConnector.act("refresh"));
-    assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://app.slack.com/client/T_WORKSHOP");
+    assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://slack.com/app_redirect?team=T_WORKSHOP&channel=USLACKBOT");
   }
   const savedTeam=config.slack.team_id;guidedWorkspace="";guidedTeam="";config.slack.team_id="";
   await page.evaluate(()=>window.slackConnector.act("refresh"));
@@ -308,6 +318,64 @@ try{
   assert(!config.enabled);
   assert((await page.locator('.banner[role="status"]').innerText()).includes("authorization saved"));
   ok("Guided authorization of a managed saved connection does not claim message delivery started");
+  // Each connection is for one workspace. Fictional identifiers; nothing reaches Slack.
+  const resetGuided=slack=>{savedConnections=null;connectionPaused=false;credentials=false;guidedAuthorized=false;guidedExpired=false;guidedPending=false;guidedRefusal="";guidedTeam="";guidedWorkspace="";config.setup_complete=false;config.enabled=false;config.slack={...config.slack,app_id:"",bot_user_id:"",bot_id:"",...slack};config.revision++;};
+  const openSetup=async()=>{await page.evaluate(()=>window.slackConnector.act("refresh"));await page.evaluate(()=>window.slackConnector.command([{type:"set_filter",key:"manual_setup",value:false},{type:"set_filter",key:"slack_manual_copy",value:false},{type:"navigate",route:"setup"}]));await page.evaluate(()=>{window.openedSlack=[];window.open=(...args)=>window.openedSlack.push(args);});};
+  const target=()=>page.locator('[data-control="slack.setup.target"]').innerText();
+  const approve=async()=>{await page.locator('[data-control="slack.setup.challenge"]').fill("private-challenge");await page.locator('[data-control="slack.setup.confirm"]').click();};
+  const agent=portrait.agent_name||config.label,direct="https://slack.com/app_redirect?team=T0EXAMPLE1&channel=USLACKBOT";
+  resetGuided({team_id:"T0EXAMPLE1",workspace_name:"Example Workspace"});await openSetup();
+  assert.equal(await target(),"This connection is for Example Workspace (T0EXAMPLE1).");
+  await page.locator('[data-action="slack.setup.authorize"]').click();await waitIdle();
+  assert.equal(await target(),"This connection is for Example Workspace (T0EXAMPLE1). Approve the command in that workspace’s Slackbot; an approval from any other workspace is refused.");
+  assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),direct);
+  assert.equal(await page.locator('[data-control="slack.setup.workspace-home"]').getAttribute("href"),"https://app.slack.com/client/T0EXAMPLE1");
+  await page.locator('[data-action="slack.setup.copy-open"]').click();await waitIdle();
+  assert.deepEqual(await page.evaluate(()=>window.openedSlack),[[direct,"_blank","noopener,noreferrer"]]);
+  ok("A declared workspace is named beside the Connect button and the setup command, and its Slackbot opens directly with no command in the address");
+  guidedRefusal="Slack approved access to other-workspace (T0OTHER0001), but this connection is for Example Workspace (T0EXAMPLE1). Nothing was created, and saved Slack access is unchanged. Connect to Slack again, then run the new setup command in Slackbot in Example Workspace (T0EXAMPLE1).";
+  let deploys=guidedDeploys,revision=config.revision;
+  await approve();await page.locator('.banner.error').waitFor();await waitIdle();
+  const refusal=await page.locator('.banner.error').innerText();
+  assert(refusal.includes("other-workspace (T0OTHER0001)")&&refusal.includes("Example Workspace (T0EXAMPLE1)")&&refusal.includes("Nothing was created"));
+  assert.equal(await page.locator('[data-control="slack.setup.challenge"]').count(),0,"A used setup command is not offered again");
+  assert.equal(await target(),"This connection is for Example Workspace (T0EXAMPLE1).");
+  assert.equal(guidedDeploys,deploys);assert.equal(config.revision,revision);assert(!config.setup_complete&&!credentials&&!guidedAuthorized);
+  ok("An approval from another workspace creates nothing, names both workspaces, and retires the used command");
+  guidedRefusal="";guidedTeam="T0EXAMPLE1";guidedWorkspace="example-workspace";
+  await page.locator('[data-action="slack.setup.authorize"]').click();await waitIdle();await approve();
+  await page.locator('[data-control="nav.dashboard"][aria-current="page"]').waitFor();await waitIdle();
+  assert(config.setup_complete&&config.enabled);assert.equal(guidedDeploys,deploys,"A matching declared workspace keeps one-step setup");
+  assert.equal(await page.locator('[data-control="connection.workspace"]').innerText(),"Connected to Example Workspace");
+  await page.screenshot({path:path.join(artifacts,"connected-workspace.png"),fullPage:true});
+  ok("A matching approval for the declared workspace still finishes in one step, and the connected page names the workspace");
+  resetGuided({team_id:"T0EXAMPLE1",workspace_name:"Example Workspace"});guidedAuthorized=true;guidedTeam="T0OTHER0001";guidedWorkspace="other-workspace";await openSetup();
+  assert((await page.locator('[data-control="setup.connect-screen"]').innerText()).includes("The Slack approval saved here is for other-workspace.slack.com (T0OTHER0001), not this connection’s workspace."));
+  assert.equal(await page.locator('[data-action="slack.setup.connect"]').count(),0);assert(await page.locator('[data-action="slack.setup.authorize"]').isVisible());
+  ok("A saved approval for another workspace is never offered for creating the declared connection’s app");
+  resetGuided({team_id:"",workspace_name:""});await openSetup();
+  assert((await target()).includes("The workspace where you approve the setup command becomes its workspace."));
+  await page.locator('[data-action="slack.setup.authorize"]').click();await waitIdle();
+  assert((await target()).includes("You’ll confirm it before the agent’s app is created."));
+  assert.equal(await page.locator('[data-control="slack.setup.workspace"]').getAttribute("href"),"https://app.slack.com/");
+  assert.equal(await page.locator('[data-control="slack.setup.workspace-home"]').count(),0);
+  guidedTeam="T0OTHER0001";guidedWorkspace="other-workspace";deploys=guidedDeploys;
+  await approve();await page.locator('[data-control="slack.setup.approved"]').waitFor();await waitIdle();
+  assert.equal(await page.locator('[data-control="slack.setup.approved"]').innerText(),`Slack approved access to other-workspace.slack.com (T0OTHER0001). Create ${agent} there?`);
+  assert.equal(guidedDeploys,deploys);assert(!config.setup_complete&&!config.slack.team_id&&!credentials);
+  await page.screenshot({path:path.join(artifacts,"slack-workspace-confirm.png"),fullPage:true});
+  ok("Without a declared workspace, approval alone creates nothing: the page names the approved workspace and asks first");
+  await page.locator('[data-action="slack.setup.discard"]').click();await waitIdle();
+  assert.equal(guidedDiscards,1);assert.equal(guidedDeploys,deploys);assert(await page.locator('[data-control="slack.setup.challenge"]').isVisible());
+  guidedTeam="T0EXAMPLE1";guidedWorkspace="example-workspace";
+  await approve();await page.locator('[data-control="slack.setup.approved"]').waitFor();await waitIdle();
+  assert.equal(await page.locator('[data-control="slack.setup.approved"]').innerText(),`Slack approved access to example-workspace.slack.com (T0EXAMPLE1). Create ${agent} there?`);
+  await page.locator('[data-action="slack.setup.connect"]').click();
+  await page.locator('[data-control="nav.dashboard"][aria-current="page"]').waitFor();await waitIdle();
+  assert.equal(guidedDeploys,deploys+1);assert.equal(guidedConnects.at(-1),"T0EXAMPLE1");assert.equal(config.slack.team_id,"T0EXAMPLE1");
+  assert.equal(await page.locator('[data-control="connection.workspace"]').innerText(),"Connected to example-workspace.slack.com");
+  assert(!JSON.stringify(viewBodies).includes("private-ticket"));assert(!JSON.stringify(viewBodies).includes("private-challenge"));
+  ok("The approval can be discarded for another workspace; the app is created only in the workspace its owner confirmed");
   assert.deepEqual(errors,[]);assert(!JSON.stringify(viewBodies).includes("test-password"));assert(!JSON.stringify(viewBodies).includes("one-time-management-secret"));assert(!JSON.stringify(viewBodies).includes("private-agent-value"));ok("No browser errors or secrets in semantic view traffic");
   process.stdout.write(`${passed} browser checks passed. Screenshots: ${artifacts}\n`);
 }finally{await browser.close();await new Promise(r=>server.close(r));}
