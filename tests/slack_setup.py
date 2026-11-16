@@ -11,6 +11,23 @@ spec = importlib.util.spec_from_file_location('setup', Path(__file__).resolve().
 s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
 
+# The source installer declares the intended workspace with these `init` arguments.
+installer_spec = importlib.util.spec_from_file_location('installer', Path(__file__).resolve().parents[1]/'scripts/install.py')
+installer = importlib.util.module_from_spec(installer_spec)
+installer_spec.loader.exec_module(installer)
+
+class InstallerWorkspaceTests(unittest.TestCase):
+    def test_declared_workspace_becomes_init_arguments(self):
+        self.assertEqual(installer.workspace_arguments(None,None),[])
+        self.assertEqual(installer.workspace_arguments('T0EXAMPLE1',None),['--workspace-id','T0EXAMPLE1'])
+        self.assertEqual(installer.workspace_arguments('T0EXAMPLE1',' Example Workspace '),['--workspace-id','T0EXAMPLE1','--workspace-name=Example Workspace'])
+        self.assertEqual(installer.workspace_arguments('E0EXAMPLE1','-leading dash')[-1],'--workspace-name=-leading dash')
+
+    def test_a_name_or_address_is_refused_before_anything_is_installed(self):
+        for mistaken in ['Example Workspace','example-workspace','t0example1','https://app.slack.com/client/T0EXAMPLE1','T']:
+            with self.assertRaises(ValueError,msg=mistaken):installer.workspace_arguments(mistaken,None)
+        with self.assertRaises(ValueError):installer.workspace_arguments(None,'Example Workspace')
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -62,6 +79,93 @@ class SetupTests(unittest.TestCase):
         s.execute(self.home,'authorize',{})
         with self.assertRaises(s.SetupError):s.execute(self.home,'confirm',{'challenge':'code','team_id':'TONE'})
         self.assertEqual(previous,(self.folder/'auth/credentials.json').read_bytes())
+
+    def test_declared_workspace_refusal_names_both_and_retires_the_used_ticket(self):
+        self.team='T0OTHER0001'
+        s.execute(self.home,'authorize',{})
+        with self.assertRaises(s.SetupError) as refused:
+            s.execute(self.home,'confirm',{'challenge':'code','team_id':'T0EXAMPLE1','team_name':'Example Workspace'})
+        message=str(refused.exception)
+        for expected in ['test (T0OTHER0001)','Example Workspace (T0EXAMPLE1)','Nothing was created','Slackbot in Example Workspace (T0EXAMPLE1)']:
+            self.assertIn(expected,message)
+        self.assertNotIn('private',message)
+        # Slack consumed the ticket with that approval: nothing is kept, and the next attempt gets a new command.
+        for name in ['pending.json','pending-auth/credentials.json','auth/credentials.json','project']:
+            self.assertFalse((self.folder/name).exists(),name)
+        status=s.execute(self.home,'status',{})
+        self.assertFalse(status['authorized']);self.assertFalse(status['authorization_pending'])
+        s.execute(self.home,'authorize',{})
+        self.assertEqual(self.calls.count(('auth','login','--no-prompt')),2)
+        self.team='T0EXAMPLE1'
+        result=s.execute(self.home,'confirm',{'challenge':'code','team_id':'T0EXAMPLE1','team_name':'Example Workspace'})
+        self.assertEqual((result['authorized'],result['team_id'],result['workspace']),(True,'T0EXAMPLE1','test'))
+
+    def test_saved_approval_for_another_workspace_never_creates_the_app(self):
+        self.auth()
+        with self.assertRaises(s.SetupError) as refused:
+            s.execute(self.home,'connect',{'manifest':{},'team_id':'T0EXAMPLE1','team_name':'Example Workspace'})
+        self.assertIn('test (TONE)',str(refused.exception));self.assertIn('Example Workspace (T0EXAMPLE1)',str(refused.exception))
+        with self.assertRaises(s.SetupError) as unnamed:
+            s.execute(self.home,'connect',{'manifest':{},'team_id':'T0EXAMPLE1'})
+        self.assertIn('this connection is for T0EXAMPLE1.',str(unnamed.exception))
+        self.assertEqual([c for c in self.calls if c[0]=='deploy'],[])
+        self.assertFalse((self.folder/'project').exists())
+
+    def test_discard_drops_an_unused_approval_so_another_workspace_can_be_authorized(self):
+        self.auth()
+        s.write(self.folder/'authorization-health.json',{'state':'needs_attention','message':'Reconnect Slack.'})
+        result=s.execute(self.home,'discard',{})
+        self.assertEqual((result['authorized'],result['authorization']),(False,'missing'))
+        self.assertNotIn('team_id',result)
+        self.assertFalse((self.folder/'auth/credentials.json').exists())
+        self.assertEqual(s.execute(self.home,'discard',{})['authorized'],False)
+        self.team='TTWO'
+        self.assertEqual(self.auth()['team_id'],'TTWO')
+        self.assertEqual(s.execute(self.home,'connect',{'manifest':{},'team_id':'TTWO'})['app_id'],'ANEW')
+
+    def test_discard_keeps_access_once_the_app_exists(self):
+        self.auth()
+        s.execute(self.home,'connect',{'manifest':{}})
+        saved=(self.folder/'auth/credentials.json').read_bytes()
+        with self.assertRaises(s.SetupError):s.execute(self.home,'discard',{})
+        self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        self.assertTrue(s.execute(self.home,'status',{})['authorized'])
+
+    def test_discard_keeps_access_after_deploy_loses_ack_before_app_record(self):
+        self.auth()
+        saved=(self.folder/'auth/credentials.json').read_bytes()
+        def lost_ack(folder,*args,cwd=None,auth_dir=None):
+            if args[0]=='deploy':
+                self.calls.append(args)
+                self.created+=1  # Simulated remote effect before any local app record.
+                raise s.subprocess.TimeoutExpired('fixture deploy',120)
+            return self.cli(folder,*args,cwd=cwd,auth_dir=auth_dir)
+        with patch.object(s,'cli',lost_ack):
+            with self.assertRaises(s.subprocess.TimeoutExpired):
+                s.execute(self.home,'connect',{'manifest':{},'team_id':self.team})
+        self.assertFalse((self.folder/'project/.slack/apps.json').exists())
+        self.assertFalse((self.folder/'issued.json').exists())
+        manifest=(self.folder/'project/manifest.json').read_bytes()
+        calls=list(self.calls)
+        with self.assertRaises(s.SetupError):s.execute(self.home,'discard',{})
+        self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        self.assertEqual(manifest,(self.folder/'project/manifest.json').read_bytes())
+        self.assertTrue(s.execute(self.home,'status',{})['authorized'])
+        self.assertEqual(self.calls,calls)  # No reconciliation request or automatic retry.
+        self.assertEqual(self.created,1)
+
+    def test_discard_keeps_legacy_prepared_project_without_claiming_no_deploy(self):
+        self.auth()
+        saved=(self.folder/'auth/credentials.json').read_bytes()
+        # An older helper leaves no durable attempt marker. Its existing project
+        # cannot establish whether an external deploy did or did not happen.
+        project=s.prepare_project(self.folder,{},'',{'team_id':self.team})
+        self.assertFalse((project/'.slack/apps.json').exists())
+        calls=list(self.calls)
+        with self.assertRaises(s.SetupError):s.execute(self.home,'discard',{})
+        self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        self.assertEqual(self.calls,calls)
+        self.assertEqual(self.created,0)
 
     def test_reopening_authorization_preserves_pending_code(self):
         first=s.execute(self.home,'authorize',{})

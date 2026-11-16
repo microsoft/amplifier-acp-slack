@@ -24,6 +24,26 @@ a new private folder, and starts an unconfigured user service. It prints the URL
 and opens it when a local desktop is available. Existing folders are never silently
 overwritten. Python 3, systemd, and GitHub access are bootstrap requirements.
 
+### Declare the Slack workspace
+
+Each connection belongs to one Slack workspace. Declare it at installation,
+especially when one agent gets a connection in more than one workspace:
+
+```sh
+./install.sh --label "My agent" \
+  --workspace-id T0EXAMPLE1 --workspace-name "Example Workspace"
+```
+
+The workspace ID is the `T…` value after `/client/` in the workspace’s browser
+address, such as `https://app.slack.com/client/T0EXAMPLE1/…`. Setup enforces the
+ID; the optional name is for people. `acp-slack-adapter init` accepts the same
+two options. Declaring a workspace connects nothing: the connection stays
+unconfigured and paused until Slack setup finishes.
+
+Without these options the installation is not tied to a workspace. Setup then
+shows the workspace Slack approved and asks before creating the agent’s app.
+[Declare it later](#operate-without-the-browser) through the configuration API.
+
 For an agent already installed with Constellation Instance, the optional convenience flag
 prefills its ordinary ACP entrypoint and working directory:
 
@@ -47,14 +67,20 @@ over an HTTP management listener.
 
 ## Connect Slack
 
-1. Open the printed URL and sign in. The installed agent is already selected.
+1. Open the printed URL and sign in. The installed agent is already selected. The
+   page names the workspace this connection is for, or says none has been chosen.
 2. Choose **Connect to Slack**, then **Copy command & open Slack**. In Slackbot,
    paste into the message box and press Enter. Choose **Confirm**, then bring the
    confirmation code back to this page. When the workspace is known, the connector
    opens its Slackbot conversation directly; otherwise choose the workspace first.
-3. The connector creates the agent’s app, obtains its message credentials, checks
-   the ACP connection, and starts listening. Image updates use the same authorization.
-4. Invite the agent into a channel or open its direct messages.
+3. For a declared workspace, the connector creates the agent’s app there, obtains
+   its message credentials, checks the ACP connection, and starts listening. An
+   approval from any other workspace is refused: nothing is created, and the page
+   names both workspaces. With no declared workspace, the page names the approved
+   one and waits for **Create and connect**; **Use a different workspace** discards
+   that approval instead. Image updates use the same authorization.
+4. Invite the agent into a channel or open its direct messages. The connection
+   page shows the workspace it is connected to.
 
 Workspace app approval policies still apply. An administrator may need to approve
 installation. Each connector keeps its own authorization and renewal state; no
@@ -90,7 +116,16 @@ fields, never command arguments. `secret NAME --file FILE` writes a named ACP
 environment secret; `acp.secret_env` maps environment variables to those names.
 
 Use `config set --file FILE` for online revision-checked updates. `--offline` is
-available only while the service is stopped. Once a connection has been used,
+available only while the service is stopped. Until the agent’s app exists, this
+is also how a workspace is declared or corrected after installation: save
+`config get`, set these two fields under `slack`, and apply the file.
+
+```json
+"slack": { "team_id": "T0EXAMPLE1", "workspace_name": "Example Workspace" }
+```
+
+`workspace_name` is optional and may be changed at any time. `status` reports the
+declared or connected workspace as `slack_workspace`. Once a connection has been used,
 changing the Slack identity or ACP endpoint requires another installation so an
 unrelated agent cannot inherit its transcripts accidentally. Upgrading an agent
 behind an unchanged entrypoint remains independent of this connector.

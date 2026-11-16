@@ -152,6 +152,17 @@ def summary(folder):
     return ready
 
 
+def named(label, team_id):
+    return f'{label} ({team_id})' if label and label != team_id else team_id
+
+
+def wrong_workspace(auth, body, outcome):
+    approved = named(auth.get('team_domain'), auth['team_id'])
+    intended = named(body.get('team_name'), body['team_id'])
+    return (f'Slack approved access to {approved}, but this connection is for {intended}. {outcome} '
+            f'Connect to Slack again, then run the new setup command in Slackbot in {intended}.')
+
+
 def prepare_project(folder, manifest, app_id, auth):
     project = folder / 'project'
     (project / '.slack').mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -229,12 +240,24 @@ def execute(home, action, body):
             cli(folder, 'auth', 'login', '--ticket', pending['ticket'], '--challenge', challenge, auth_dir=staging)
             auth = authorization(folder, staging)
             if body.get('team_id') and auth['team_id'] != body['team_id']:
+                # Slack consumed the ticket for this approval. Drop both, so the next
+                # attempt gets a fresh command; previously saved access is untouched.
                 (staging / 'credentials.json').unlink(missing_ok=True)
-                raise SetupError('Authorize the workspace this connection already belongs to. Its previous access is preserved.')
+                (folder / 'pending.json').unlink(missing_ok=True)
+                raise SetupError(wrong_workspace(auth, body, 'Nothing was created, and saved Slack access is unchanged.'))
             write(folder / 'auth/credentials.json', {auth['team_id']: auth})
             (folder / 'authorization-health.json').unlink(missing_ok=True)
             (staging / 'credentials.json').unlink(missing_ok=True)
             (folder / 'pending.json').unlink(missing_ok=True)
+            return summary(folder)
+        if action == 'discard':
+            # Project preparation precedes external deploy. A missing apps.json
+            # cannot prove that deploy had no effect: its reply may have been lost.
+            # Keep access even for older attempts that have no explicit marker.
+            if (folder / 'project').exists():
+                raise SetupError('Slack app setup was already prepared or attempted, so saved Slack access was kept. Check that setup before switching workspaces.')
+            for name in ('auth/credentials.json', 'pending-auth/credentials.json', 'authorization-health.json'):
+                (folder / name).unlink(missing_ok=True)
             return summary(folder)
         if action == 'token':
             cli(folder, 'auth', 'list')  # CLI owns rotation; never duplicate its refresh token.
@@ -247,7 +270,7 @@ def execute(home, action, body):
             cli(folder, 'auth', 'list')
             auth = authorization(folder)
             if body.get('team_id') and body['team_id'] != auth['team_id']:
-                raise SetupError('This connection belongs to another workspace. Authorize its original workspace.')
+                raise SetupError(wrong_workspace(auth, body, 'Nothing was created.'))
             (folder / 'authorization-health.json').unlink(missing_ok=True)
             project = prepare_project(folder, body['manifest'], body.get('app_id'), auth)
             (folder / 'issued.json').unlink(missing_ok=True)

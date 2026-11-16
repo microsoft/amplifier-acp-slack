@@ -35,6 +35,13 @@ enum Action {
         port: u16,
         #[arg(long)]
         agent_home: Option<PathBuf>,
+        /// Slack workspace (team) ID this connection is for, such as T0EXAMPLE1.
+        /// An approval from any other workspace is refused during setup.
+        #[arg(long)]
+        workspace_id: Option<String>,
+        /// Human-readable name of that workspace, shown on the setup page.
+        #[arg(long, requires = "workspace_id")]
+        workspace_name: Option<String>,
     },
     Serve,
     /// Inspect, prepare or queue a verified update of this connector only.
@@ -147,6 +154,8 @@ async fn run(cli: Cli) -> Result<()> {
             bind,
             port,
             agent_home,
+            workspace_id,
+            workspace_name,
         } => {
             ensure!(
                 !home.join("adapter.json").exists(),
@@ -164,6 +173,17 @@ async fn run(cli: Cli) -> Result<()> {
             );
             c.server.bind = bind;
             c.server.port = port;
+            // Declaring the workspace does not connect it: the app, bot identity
+            // and credentials are still missing until Slack setup finishes.
+            if let Some(id) = workspace_id {
+                ensure!(
+                    config::valid_workspace_id(&id),
+                    "{}",
+                    config::WORKSPACE_ID_HELP
+                );
+                c.slack.team_id = id;
+                c.slack.workspace_name = workspace_name.unwrap_or_default().trim().to_owned();
+            }
             // Optional convenience import. The resulting command is ordinary
             // ACP stdio; no Agent Instance API is required during operation.
             if let Some(agent) = agent_home {
@@ -201,8 +221,10 @@ async fn run(cli: Cli) -> Result<()> {
                     &json!({"version":env!("CARGO_PKG_VERSION"),"installed_at":acp_slack_adapter::model::now_ms(),"os":std::env::consts::OS,"arch":std::env::consts::ARCH}),
                 )?,
             )?;
+            let workspace = (!c.slack.team_id.is_empty())
+                .then(|| json!({"team_id":c.slack.team_id,"name":c.slack.workspace_name}));
             print(
-                json!({"id":c.id,"home":home,"configured_acp":!c.acp.command.is_empty(),"next":"Start the service, then open its setup URL"}),
+                json!({"id":c.id,"home":home,"configured_acp":!c.acp.command.is_empty(),"intended_workspace":workspace,"next":"Start the service, then open its setup URL"}),
             )?;
         }
         Action::Update { action, plan_id } => {

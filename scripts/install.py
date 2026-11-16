@@ -5,6 +5,7 @@ import json
 import os
 import platform
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -21,11 +22,25 @@ def quoted(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
 
 
+def workspace_arguments(workspace_id, workspace_name):
+    """`init` arguments that declare the Slack workspace this connection is for."""
+    name = (workspace_name or '').strip()
+    if name and not workspace_id:
+        raise ValueError('--workspace-name describes a workspace; add its --workspace-id.')
+    if not workspace_id:
+        return []
+    if not re.fullmatch(r'[TE][A-Z0-9]{2,31}', workspace_id):
+        raise ValueError('Use the Slack workspace ID, such as T0EXAMPLE1. Open the workspace in a browser: the ID follows /client/ in its address.')
+    return ['--workspace-id', workspace_id] + (['--workspace-name=' + name] if name else [])
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--home', type=Path)
     p.add_argument('--label', default='Slack connection')
     p.add_argument('--agent-home', type=Path, help='Optional convenience: use an existing Agent Instance ACP entrypoint')
+    p.add_argument('--workspace-id', help='Slack workspace (team) ID this connection is for, such as T0EXAMPLE1. Approvals from any other workspace are refused.')
+    p.add_argument('--workspace-name', help='Human-readable name of that workspace, shown on the setup page')
     p.add_argument('--bind', default='0.0.0.0')
     p.add_argument('--port', type=int, default=0)
     p.add_argument('--public-url', help='Already configured HTTPS proxy address, such as Tailscale Serve')
@@ -34,6 +49,11 @@ def main():
     a = p.parse_args()
     if platform.system() != 'Linux':
         p.error('The first service installer supports Linux. Other platforms can use its web interface.')
+    # Checked before the build, so a mistyped workspace costs seconds, not a compile.
+    try:
+        workspace = workspace_arguments(a.workspace_id, a.workspace_name)
+    except ValueError as error:
+        p.error(str(error))
     owner = subprocess.check_output(['id', '-un'], text=True).strip()
     if owner == 'root':
         p.error('Run as the account that will own this connection, not as root.')
@@ -68,7 +88,7 @@ def main():
     args = [binary,'init','--home',install_home,'--label',a.label,'--owner',owner,'--bind',a.bind,'--port',str(a.port)]
     if a.agent_home:
         args += ['--agent-home',a.agent_home.expanduser().absolute()]
-    run(*args)
+    run(*args, *workspace)
     config_path = install_home/'adapter.json'
     config = json.loads(config_path.read_text())
     if a.public_url:
@@ -96,6 +116,11 @@ def main():
     preferred = a.public_url or (candidates[0] if candidates else info['base_url'])
     print('\nYour Slack connection is installed. Open '+preferred)
     print('Sign in as '+owner+'. Connection setup stays paused until you finish.')
+    if workspace:
+        name = config['slack'].get('workspace_name')
+        print('Slack workspace: '+(name+' ('+a.workspace_id+')' if name else a.workspace_id)+'. Setup refuses an approval from any other workspace.')
+    else:
+        print('No Slack workspace was declared (--workspace-id). Setup asks you to confirm the approved workspace before creating the agent’s app.')
     if not a.public_url:
         print('Direct LAN HTTPS uses this installation’s local certificate. A trusted HTTPS proxy can be configured separately.')
     print('All available addresses: '+', '.join(info['urls']))

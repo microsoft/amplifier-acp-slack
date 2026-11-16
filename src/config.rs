@@ -107,7 +107,14 @@ fn timeout() -> u64 {
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SlackConfig {
+    /// Slack workspace (team) ID. Before setup it declares the workspace this
+    /// connection is for, and an approval from any other workspace is refused.
+    /// After setup it is the connected workspace.
     pub team_id: String,
+    /// Optional human-readable name of that workspace, shown beside its ID.
+    /// Written only when set, so earlier configuration files stay unchanged.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub workspace_name: String,
     pub app_id: String,
     pub bot_user_id: String,
     pub bot_id: String,
@@ -120,6 +127,7 @@ impl Default for SlackConfig {
     fn default() -> Self {
         Self {
             team_id: String::new(),
+            workspace_name: String::new(),
             app_id: String::new(),
             bot_user_id: String::new(),
             bot_id: String::new(),
@@ -127,6 +135,16 @@ impl Default for SlackConfig {
             allow_dms: true,
             api_base: "https://slack.com/api/".into(),
             loopback_test: false,
+        }
+    }
+}
+impl SlackConfig {
+    /// The declared or connected workspace as people read it: "Name (T…)" or the ID.
+    pub fn workspace_label(&self) -> String {
+        if self.workspace_name.is_empty() {
+            self.team_id.clone()
+        } else {
+            format!("{} ({})", self.workspace_name, self.team_id)
         }
     }
 }
@@ -362,6 +380,15 @@ impl Config {
             );
         }
         ensure!(
+            self.slack.workspace_name.len() <= 200
+                && !self.slack.workspace_name.chars().any(char::is_control),
+            "A workspace name is plain text of at most 200 characters"
+        );
+        ensure!(
+            self.slack.workspace_name.is_empty() || !self.slack.team_id.is_empty(),
+            "A workspace name needs the workspace ID it describes"
+        );
+        ensure!(
             self.slack.channels.len() <= 500
                 && self
                     .slack
@@ -482,6 +509,14 @@ impl Config {
             || text.contains(&format!("<@{}>", self.slack.bot_user_id))
     }
 }
+/// Slack workspace IDs start with T; an Enterprise Grid organization's starts with E.
+pub fn valid_workspace_id(s: &str) -> bool {
+    (3..=32).contains(&s.len())
+        && s.starts_with(['T', 'E'])
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+pub const WORKSPACE_ID_HELP: &str = "Use the Slack workspace ID, such as T0EXAMPLE1. Open the workspace in a browser: the ID follows /client/ in its address";
 pub fn valid_secret_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
