@@ -72,8 +72,11 @@ async def main():
             passed('Filesystem line ranges, cross-root and symlink rejection; terminal isolation, output, release and concurrent wait/kill')
             _,post=await permission('Dapproval')
             buttons=[b['elements'][0] for b in post['blocks'] if b.get('type')=='actions']
-            assert [b['text']['text'] for b in buttons]==['Allow once','Deny once','Always allow','Always reject','Cancel request']
-            assert 'remembered by the agent, not Slack' in json.dumps(post)
+            assert [b['text']['text'] for b in buttons]==['Allow this request','Deny','Always allow this','Always deny this','Cancel request']
+            assert 'Always also applies to future matching requests' in json.dumps(post)
+            assert 'not the permission duration' in json.dumps(post)
+            assert 'Explicitly approved' not in json.dumps(post) and str(workspace) not in json.dumps(post)
+            assert all(len(b['text']['text'])<=30 for b in buttons)
             for override in ({'user':{'id':'UOTHER'}},{'container':{'channel_id':'Dother','message_ts':post['ts']}},{'container':{'channel_id':post['channel'],'message_ts':'wrong-message'}},{'team':{'id':'Tother'}},{'api_app_id':'Aother'}):
                 await fixture.action(post,2,**override)
                 assert count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='pending'",(post['client_msg_id'],))==1
@@ -198,7 +201,7 @@ async def main():
             assert second_row[1]-second_row[0]==remaining
             assert 0 < remaining < 2500
             label='less than a second' if remaining<1000 else ('1 second' if remaining<2000 else f'{remaining//1000} seconds')
-            assert f'About {label} remains' in json.dumps(second),second
+            assert f'Respond within about {label}.' in json.dumps(second),second
             await until(lambda:any(p.get('channel')=='Dsuccessive' for p in fixture.posts),'successive permissions finish')
             output=next(p['markdown_text'] for p in fixture.posts if p.get('channel')=='Dsuccessive')
             outcomes=json.loads(output.removeprefix('successive permissions '))
