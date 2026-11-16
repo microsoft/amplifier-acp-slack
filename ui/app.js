@@ -177,6 +177,14 @@
     if(m?.verified&&!m.ready&&(app.config.media?.incoming||app.config.media?.outgoing))problems.push(`<p>Slack needs permission to share attachments. ${button("Open settings","connection.repair",{small:true})}</p>`);
     return problems.length?`<section class="card connection-problems" role="status">${problems.join("")}</section>`:"";
   }
+  // Slack delivers channel messages only where the agent's app is a member, and
+  // the app cannot join by itself. status.state.in_channel is false only when
+  // Slack listed no channel at the last connection and none has been heard since.
+  function channelInvite(label){
+    const command=`<code>/invite @${esc(label)}</code>`,direct=app.config.slack.allow_dms?"Direct messages work without an invitation.":"Direct messages are turned off in Settings.";
+    if(app.status?.state?.in_channel===false)return `<section class="card" data-control="connection.channels" role="status"><h2>Not in any channel yet</h2><p>${esc(label)} hears a channel only after someone adds it there; Slack does not let it join by itself. In Slack, open the channel and send ${command}.</p><p class="field-help">${direct}</p></section>`;
+    return `<p class="connection-tip" data-control="connection.channels">To bring ${esc(label)} into a channel, open that channel in Slack and send ${command}. It hears only the channels it has been added to. ${direct}</p>`;
+  }
   function connectionHome(){
     if(!app.config.setup_complete)return setup();
     const socket=socketState(),healthy=socket==="connected";
@@ -186,6 +194,7 @@
       ${app.slackTicket?guidedSlack():""}
       <section class="card connection-card hero" data-control="connection.summary"><div class="connection-avatar" aria-hidden="true">${esc(label.slice(0,1))}</div><div class="connection-copy"><div class="eyebrow">${esc(label)}</div><h1>${healthy?"Ready in Slack.":(app.status?.connection_paused||!app.status?.enabled)?"Connection paused.":runtimeState()==="failed"?"Let’s reconnect.":"Connecting to Slack…"}</h1><p>${healthy?"Message your agent, or invite it into a channel.":app.status?.connection_paused?"Open Manage saved connections to check or resume this connection. Your conversations are saved.":!app.status?.enabled?"Start the connection whenever you’re ready.":app.status?.runtime?.reason||"Reconnecting automatically. Your conversations are saved."}</p>${workspace?`<p class="connection-workspace" data-control="connection.workspace">${healthy?"Connected to":"This connection is for"} <strong>${esc(workspace)}</strong></p>`:""}<div class="actions">${healthy?`<a class="button primary" href="${esc(agentSlackUrl())}" target="_blank" rel="noreferrer" data-control="slack.agent.open">Open in Slack ${icon("arrow")}</a>`:lifecycleButton()}${settings?button("Done","navigate",{quiet:true,attrs:'data-route="dashboard"'}):button("Settings","navigate",{quiet:true,attrs:'data-route="configuration"'})}</div></div></section>
       ${connectionProblems()}
+      ${healthy&&!settings?channelInvite(label):""}
       ${settings?`<section class="card preferences-card"><h2>Preferences</h2>${participation()}<section class="subsection">${configCheck("Ask before actions","acp.client.approvals_required","Turn off to let the agent carry out permitted actions without asking.")}</section><div class="form-footer">${lifecycleButton()}<div class="actions">${button("Save preferences","config.save",{primary:true})}</div></div></section>${advanced()}`:""}
       ${app.status?.restart_required?banner("Restart the connector to apply its new service address.","warning"):""}
     </div>`;

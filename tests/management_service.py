@@ -83,6 +83,10 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         check(api("GET", "/api/v1/auth/session", credential=None)[1]["authenticated"] is False, "Sign-in state available")
         status = cli("status")
         check(status["label"] == "Management verification" and status["enabled"] is False, "CLI talks to real TLS API")
+        # The api command adds /api/v1 itself. Repeating it reaches no route; say so, with the status.
+        wrong = subprocess.run([binary, "--home", str(home), "api", "GET", "api/v1/status"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check(wrong.returncode != 0 and "HTTP 404" in wrong.stderr and "relative to /api/v1" in wrong.stderr and 'try "status"' in wrong.stderr and "EOF" not in wrong.stderr, "A wrong API path reports its HTTP status and the relative form")
+        check(cli("api", "GET", "status")["label"] == "Management verification", "The relative API path answers")
         code, config, _ = api("GET", "/api/v1/config")
         config["server"]["embed_origins"] = ["https://fleet.example"]
         saved = api("PUT", "/api/v1/config", {"expected_revision": config["revision"], "config": config})

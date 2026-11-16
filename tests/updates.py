@@ -216,6 +216,32 @@ class ServiceRecognition(unittest.TestCase):
                 for command in ['ExecStart=/bin/sh -c anything','ExecStart='+str(home/'bin/acp-slack-adapter')+' serve --home /other','ExecStart='+str(home/'bin/acp-slack-adapter')+' serve --home '+str(home)+' --extra']:
                     fragment.write_text(command+'\n')
                     with self.assertRaisesRegex(RuntimeError,'unrecognized_service_command'):u.service(home,config)
+    def test_installed_service_returns_after_any_exit_and_is_still_recognized(self):
+        spec=importlib.util.spec_from_file_location('connector_install',ROOT/'scripts/install.py')
+        installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);home=root/'an installation';home.mkdir();config={'id':str(uuid.uuid4())};unit='acp-slack-adapter-'+config['id']+'.service';fragment=root/'.config/systemd/user'/unit;fragment.parent.mkdir(parents=True)
+            text=installer.service_unit(home)
+            section=text.split('[Service]\n')[1].split('\n[Install]')[0]
+            service=dict(line.split('=',1) for line in section.splitlines() if '=' in line)
+            # The connector exits 0 after a termination signal. Only Restart=always
+            # covers that clean exit; on-failure, even with RestartForceExitStatus=SIGTERM, does not.
+            self.assertEqual(service['Restart'],'always');self.assertEqual(service['RestartSec'],'5')
+            def run(*args,**kwargs):
+                if 'FragmentPath' in args:return str(fragment).encode()
+                if 'DropInPaths' in args:return b''
+                raise AssertionError('Unexpected service command')
+            fragment.write_text(text)
+            with patch.object(u.Path,'home',return_value=root),patch.object(u,'run',side_effect=run):
+                self.assertEqual(u.service(home,config),unit)
+    def test_update_stops_and_starts_through_the_service_manager(self):
+        # systemd leaves a unit it stopped itself alone, whatever its restart rule.
+        # A stop by signal would be undone by Restart=always during the swap.
+        calls=[]
+        controller=u.Controller.__new__(u.Controller);controller.service_binding=None;controller.unit='acp-slack-adapter-fixture.service'
+        with patch.object(u,'run',side_effect=lambda *args,**kwargs:calls.append(args)):
+            controller.control('stop');controller.control('start')
+        self.assertEqual(calls,[('/usr/bin/systemctl','--user','stop',controller.unit),('/usr/bin/systemctl','--user','start',controller.unit)])
 
 if __name__=='__main__':
     if len(sys.argv)>1 and sys.argv[1]=='--worker':fake_worker(Path(sys.argv[2]),sys.argv[3],sys.argv[4])

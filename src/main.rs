@@ -84,6 +84,7 @@ enum Action {
     /// Calls the same authenticated management API used by the web interface.
     Api {
         method: String,
+        /// Relative to /api/v1, such as `status` or `tokens`.
         path: String,
         #[arg(long)]
         body_file: Option<PathBuf>,

@@ -944,6 +944,10 @@ pub fn receive(c: &Config, store: &mut Store, p: &Value) -> Result<()> {
     let Some(channel) = e["channel"].as_str() else {
         return Ok(());
     };
+    // Slack sends channel events only where this app is a member.
+    if matches!(e["channel_type"].as_str(), Some("channel" | "group")) {
+        store.saw_channel_event()?;
+    }
     if !c.allows(channel, e["channel_type"].as_str().unwrap_or("")) {
         return Ok(());
     }

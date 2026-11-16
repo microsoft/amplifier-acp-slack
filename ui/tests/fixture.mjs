@@ -21,7 +21,9 @@ const mediaResult=()=>({verified:true,checked_at:Date.now(),ready:fileScopes,gra
 const events=[{id:5,time:Date.now(),kind:"decision",data:{decision:"pass",reason:"The humans are already working through the question."}},{id:4,time:Date.now(),kind:"delivery",data:{status:"sent",note:""}},{id:3,time:Date.now(),kind:"delivery",data:{status:"uncertain",note:"Inspect Slack before resending."}},{id:2,time:Date.now(),kind:"connection",data:{state:"connected"}},{id:1,time:Date.now(),kind:"view.ack",data:{}}];
 const conversations=[{id:"context-one",channel:"C_FIRST",thread:"",session_id:"session-one",resumable:true,updated_at:Date.now(),turns:3,last_outcome:"pass"},{id:"context-two",channel:"C_SECOND",thread:"1234.1",session_id:"session-two",resumable:true,updated_at:Date.now(),turns:2,last_outcome:"speak"}];
 const modeState={"context-one":"ask","context-two":"ask"};
-const status=()=>({saved_connections:savedConnections,connection_paused:connectionPaused,id:config.id,label:config.label,version:"fixture",enabled:config.enabled,setup_complete:config.setup_complete,config_revision:config.revision,runtime:{state:config.enabled?"running":"stopped",reason:"",updated_at:Date.now()},credentials:{slack:credentials},portrait,media:mediaChecked,state:{jobs:{pending:1,running:1,pass:4,speak:3},outbox:{sent:3,ready:1,uncertain:1},contexts:2,slack_connection:{state:socketState}},connections:[],addresses:{base_url:"https://fixture.invalid/"},restart_required:false});
+// What Slack listed at the last connection: null until observed, false while the agent is in no channel.
+let inChannel=null;
+const status=()=>({saved_connections:savedConnections,connection_paused:connectionPaused,id:config.id,label:config.label,version:"fixture",enabled:config.enabled,setup_complete:config.setup_complete,config_revision:config.revision,runtime:{state:config.enabled?"running":"stopped",reason:"",updated_at:Date.now()},credentials:{slack:credentials},portrait,media:mediaChecked,state:{jobs:{pending:1,running:1,pass:4,speak:3},outbox:{sent:3,ready:1,uncertain:1},contexts:2,in_channel:inChannel,slack_connection:{state:socketState}},connections:[],addresses:{base_url:"https://fixture.invalid/"},restart_required:false});
 function put(o,p,v){const keys=p.split(".");for(const k of keys.slice(0,-1)){if(!o[k]||typeof o[k]!=="object")o[k]={};o=o[k];}o[keys.at(-1)]=v;}
 function apply(view,commands){for(const c of commands){if(c.type==="navigate"){view.state.route=c.route;if(c.step!==undefined)view.state.step=c.step;}else if(c.type==="set_draft")put(view.state.draft,c.path,c.value);else if(c.type==="set_filter")view.state.filters[c.key]=c.value;else if(c.type==="select_conversation")view.state.selected_conversation=c.conversation_id;else if(c.type==="focus")view.state.focus=c.target;else if(c.type==="scroll")view.state.scroll={x:c.x,y:c.y};else if(c.type==="open_modal")view.state.modal=c.modal;else if(c.type==="close_modal")view.state.modal=null;else throw Error("Unknown view command");}view.revision++;view.ack=null;}
 const server=http.createServer(async(req,res)=>{
@@ -157,6 +159,22 @@ try{
   assert.equal(await page.locator('[data-control="slack.agent.open"]').getAttribute("href"),"https://slack.com/app_redirect?app=A_FIXTURE&team=T_WORKSHOP");
   await page.screenshot({path:path.join(artifacts,"dashboard.png"),fullPage:true});
   ok("Connect verifies and starts; a failed agent check retries without new token copies or app creation");
+  // A connected agent is in no channel until a person invites it; direct messages need no invitation.
+  const channels=page.locator('[data-control="connection.channels"]'),refreshed=()=>page.evaluate(()=>window.slackConnector.act("refresh"));
+  assert.equal(await channels.innerText(),"To bring Helper in Slack into a channel, open that channel in Slack and send /invite @Helper in Slack. It hears only the channels it has been added to. Direct messages work without an invitation.");
+  inChannel=false;await refreshed();
+  assert.equal(await channels.locator("h2").innerText(),"Not in any channel yet");
+  assert((await channels.innerText()).includes("In Slack, open the channel and send /invite @Helper in Slack."));
+  assert((await channels.innerText()).includes("Direct messages work without an invitation."));
+  await page.screenshot({path:path.join(artifacts,"dashboard-no-channel.png"),fullPage:true});
+  config.slack.allow_dms=false;config.revision++;await refreshed();
+  assert((await channels.innerText()).includes("Direct messages are turned off in Settings."));
+  config.slack.allow_dms=true;config.revision++;socketState="reconnecting";await refreshed();
+  assert.equal(await channels.count(),0,"No invitation advice while the connection itself needs attention");
+  socketState="connected";inChannel=true;await refreshed();
+  assert.equal(await channels.locator("h2").count(),0);assert((await channels.innerText()).includes("/invite @Helper in Slack"));
+  inChannel=null;await refreshed();
+  ok("The connected page says how to invite the agent into a channel, and says plainly when it is in none");
   // An optional image failure cannot strand an otherwise working connection.
   config={...config,enabled:false,setup_complete:false,revision:config.revision+1};credentials=false;portrait={};failImage=true;
   await page.evaluate(()=>window.slackConnector.act("refresh"));await page.evaluate(()=>window.slackConnector.act("navigate",{route:"setup"}));

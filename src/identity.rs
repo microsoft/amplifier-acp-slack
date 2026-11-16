@@ -35,15 +35,41 @@ pub struct Credential {
     expires_at: i64,
 }
 
-fn lock(home: &Path) -> Result<std::fs::File> {
+/// Pauses between attempts while the lock is busy: five attempts over 150 ms.
+const LOCK_RETRY_MS: [u64; 4] = [5, 15, 40, 90];
+
+/// One image update at a time. A busy lock is retried briefly before it is
+/// refused: a child process started anywhere in this process holds a copy of
+/// every open descriptor from fork until exec, so for a moment a lock that was
+/// just released still looks held. An update that is really running holds the
+/// lock throughout and is refused as before.
+async fn lock(home: &Path) -> Result<std::fs::File> {
+    lock_retrying(home, LOCK_RETRY_MS.map(Duration::from_millis)).await
+}
+/// `lock` with the caller's pauses. Public for the test that holds a child
+/// between fork and exec.
+#[doc(hidden)]
+pub async fn lock_retrying(
+    home: &Path,
+    pauses: impl IntoIterator<Item = Duration>,
+) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(home.join("portrait-sync.lock"))?;
-    file.try_lock_exclusive()
-        .context("An image update is already running; try again shortly")?;
-    Ok(file)
+    let mut pauses = pauses.into_iter();
+    loop {
+        let Err(error) = file.try_lock_exclusive() else {
+            return Ok(file);
+        };
+        match pauses.next() {
+            Some(pause) if crate::process::lock_busy(&error) => tokio::time::sleep(pause).await,
+            _ => {
+                return Err(error).context("An image update is already running; try again shortly");
+            }
+        }
+    }
 }
 pub fn status(home: &Path) -> Value {
     let saved = std::fs::read(home.join(STATUS)).ok().and_then(|v|serde_json::from_slice::<Value>(&v).ok()).unwrap_or(json!({"state":"not_connected","message":"Connect app configuration access to keep the Slack icon in sync."}));
@@ -79,7 +105,9 @@ pub async fn credential(
     Json(body): Json<Credential>,
 ) -> ApiResult<Json<Value>> {
     auth::check(&state, &headers, "admin", true)?;
-    let _guard = lock(&state.home).map_err(|e| ApiError::bad(e.to_string()))?;
+    let _guard = lock(&state.home)
+        .await
+        .map_err(|e| ApiError::bad(e.to_string()))?;
     if body.token.len() < 20
         || body.token.len() > 4096
         || body.refresh_token.len() > 4096
@@ -111,7 +139,9 @@ pub async fn disconnect(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     auth::check(&state, &headers, "admin", true)?;
-    let _guard = lock(&state.home).map_err(|e| ApiError::bad(e.to_string()))?;
+    let _guard = lock(&state.home)
+        .await
+        .map_err(|e| ApiError::bad(e.to_string()))?;
     if state.home.join(SECRET).exists() {
         std::fs::remove_file(state.home.join(SECRET))?;
     }
@@ -240,7 +270,7 @@ async fn sync_from(
     c: &Config,
     update: Option<&driver::IdentityUpdate>,
 ) -> Result<Value> {
-    let _guard = lock(home)?;
+    let _guard = lock(home).await?;
     let mut saved = status(home);
     if let Some(update) = update {
         saved["update_mode"] = if update.automatic { "events" } else { "manual" }.into();
@@ -575,7 +605,7 @@ pub async fn run(home: PathBuf, c: Config) {
         if !reconnect {
             return;
         } // Snapshot-only peer: manual refresh, never poll.
-        if let Ok(_guard) = lock(&home) {
+        if let Ok(_guard) = lock(&home).await {
             let mut saved = status(&home);
             saved["update_mode"] = "connecting".into();
             let _ = record(

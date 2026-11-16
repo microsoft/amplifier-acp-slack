@@ -1,0 +1,101 @@
+{
+  "audience": "Slack users and workspace administrators",
+  "citations": [
+    {
+      "path": "README.md",
+      "ref": "3498ea827487db370a941d632105bce805f54b8c",
+      "sha256": "7cc12e99807d12ef6f85bd8a773956c6a5f61d6a58178a4fb5ffb14ca655a136",
+      "url": "https://github.com/microsoft/amplifier-acp-slack/blob/3498ea827487db370a941d632105bce805f54b8c/README.md"
+    },
+    {
+      "path": "docs/architecture.md",
+      "ref": "3498ea827487db370a941d632105bce805f54b8c",
+      "sha256": "e36c253708e36422ec67a647f9f1502d955f5b9dcf2846bcc4ef94a8b464c699",
+      "url": "https://github.com/microsoft/amplifier-acp-slack/blob/3498ea827487db370a941d632105bce805f54b8c/docs/architecture.md"
+    }
+  ],
+  "display_name": "Slack Connector for Amplifier",
+  "edges": [
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "routing"
+    },
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "records"
+    },
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "setup"
+    },
+    {
+      "from": "self",
+      "relation": "integrates",
+      "to": "slack"
+    },
+    {
+      "from": "self",
+      "relation": "uses",
+      "to": "agent"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "self",
+      "kind": "self",
+      "label": "Slack Connector for Amplifier",
+      "repository": "microsoft/amplifier-acp-slack"
+    },
+    {
+      "id": "routing",
+      "kind": "internal",
+      "label": "Channel and thread routing"
+    },
+    {
+      "id": "records",
+      "kind": "internal",
+      "label": "Inbox, outbox and session bindings"
+    },
+    {
+      "id": "setup",
+      "kind": "internal",
+      "label": "Connector setup and administration"
+    },
+    {
+      "id": "slack",
+      "kind": "external",
+      "label": "Slack conversations and UI"
+    },
+    {
+      "id": "agent",
+      "kind": "external",
+      "label": "ACP agent endpoint"
+    }
+  ],
+  "notes": [
+    "Slack owns conversation membership/source messages; the agent endpoint owns reasoning and execution sessions.",
+    "Constellation Instance is optional; no required host or central provisioning service.",
+    "This focused architecture source does not establish a separately advertised Tool implementation, so do not invent one."
+  ],
+  "page_kind": "user-facing connector",
+  "purpose": "Give an existing ACP agent a presence in Slack channels, threads and direct messages.",
+  "ref": "3498ea827487db370a941d632105bce805f54b8c",
+  "repository": "microsoft/amplifier-acp-slack",
+  "roles": [
+    "Connection"
+  ],
+  "start_cta": {
+    "basis": "Existing approved README route; target release assets/availability not freshly audited in this plan.",
+    "label": "Download Slack Connector",
+    "url": "https://github.com/microsoft/amplifier-acp-slack/releases"
+  },
+  "summary": "Connects existing ACP agents to Slack-owned conversations and presentation.",
+  "supports_roles": [
+    "Conversation",
+    "Experience"
+  ],
+  "visibility": "public"
+}
