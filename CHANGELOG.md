@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.17.8
+
+Close a withdrawn approval card when the connected agent cancels that exact request, without ending the conversation or affecting another pending request. Late clicks cannot approve the withdrawn request; decisions already recorded remain intact. See [release notes](docs/releases/0.17.8.md).
+
 ## 0.17.7
 
 Show remembered allow and deny choices in Slack when the connected agent offers them. Decisions remain bound to the original request and person; the agent owns remembered rules and their revocation. The existing automatic-approval setting continues to choose only a single-request allow option. See [release notes](docs/releases/0.17.7.md).

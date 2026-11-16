@@ -389,7 +389,7 @@ struct Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         if let Ok(s) = Store::open(&self.home) {
-            let _=s.db.execute("UPDATE permissions SET status='cancelled',actor='turn ended',closed_at=?2 WHERE id=?1 AND status='pending'",params![&self.id,now_ms()]);
+            let _=s.db.execute("UPDATE permissions SET status='cancelled',actor='request ended',closed_at=?2 WHERE id=?1 AND status='pending'",params![&self.id,now_ms()]);
         }
         crate::work_status::changed(&self.home);
     }

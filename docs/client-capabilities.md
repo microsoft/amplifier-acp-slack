@@ -62,6 +62,12 @@ permission. Closed cards retain the original action summary and private details,
 remove decision buttons, and distinguish approval from actual execution. A stale
 button remains ineffective even if its visual update fails.
 
+An endpoint's `$/cancel_request` withdraws only the matching pending approval,
+including during session setup. Its card closes without ending the conversation;
+later clicks cannot grant permission and a separate current request can still be
+answered. Withdrawal does not undo a decision already recorded or establish
+whether an action ran. It adds no approval time or automatic retry.
+
 The connector binds every choice to its job, ACP session, configuration revision,
 source revision, conversation version, designated member, and Slack message.
 Control cards are excluded from the conversation projection so the connector's

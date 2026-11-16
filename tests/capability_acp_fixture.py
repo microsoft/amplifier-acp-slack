@@ -1,5 +1,5 @@
 """Independent ACP peer exercising client callbacks, not an agent runtime."""
-import json, os, sys, uuid
+import json, os, sys, time, uuid
 from pathlib import Path
 ROOT=Path(sys.argv[1])
 
@@ -34,7 +34,32 @@ for line in sys.stdin:
         payload=json.loads(p['prompt'][0]['text'].split('Latest conversation projection:\n',1)[1])
         trigger=payload['trigger']['text'];sid=p['sessionId']
         output='fixture done'
-        if 'permission' in trigger:
+        if 'withdrawn permission' in trigger:
+            options=[{'optionId':'yes','name':'Allow once','kind':'allow_once'},{'optionId':'forever','name':'Always allow','kind':'allow_always'}]
+            rid='withdrawn-'+str(uuid.uuid4())
+            send({'id':rid,'method':'session/request_permission','params':{'sessionId':sid,'toolCall':{'toolCallId':'withdrawn-tool','title':'Withdraw this request without ending the turn'},'options':options}})
+            for stage,request_id in (('foreign','not-this-request'),('current',rid)):
+                deadline=time.monotonic()+5
+                while not (ROOT/('withdraw-'+stage)).exists():
+                    assert time.monotonic()<deadline,'Withdrawal fixture barrier was not released'
+                    time.sleep(.01)
+                send({'method':'$/cancel_request','params':{'requestId':request_id}})
+                if stage=='foreign':
+                    # A real callback response fences processing of the earlier
+                    # unrelated notification without a timing-based assertion.
+                    assert call('fs/read_text_file',{'sessionId':sid,'path':str(cwd/'lifecycle.txt')})['result']['content']=='lifecycle callback'
+                record('withdraw_sent',stage=stage,request_id=request_id)
+            response=json.loads(sys.stdin.readline())
+            assert response['id']==rid and response['result']['outcome']=={'outcome':'cancelled'},response
+            record('withdraw_settled',response=response)
+            response=call('session/request_permission',{'sessionId':sid,'toolCall':{'toolCallId':'fresh-tool','title':'A separate current request'},'options':options})
+            assert response['result']['outcome']=={'outcome':'selected','optionId':'yes'},response
+            # A withdrawal received after the completed decision cannot erase it.
+            send({'method':'$/cancel_request','params':{'requestId':response['id']}})
+            send({'method':'$/cancel_request','params':{'requestId':rid}})
+            (cwd/'fresh-after-withdrawal.txt').write_text('Only the current request was approved')
+            output='withdrawn request stayed cancelled; current request approved'
+        elif 'permission' in trigger:
             send({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call',**{'toolCallId':'fixture-tool','title':'Create the harmless approval-check file','kind':'edit','locations':[{'path':str(cwd/'approved.txt')}],'rawInput':{'path':str(cwd/'approved.txt'),'content':'Explicitly approved'}}}}})
             options=[{'optionId':'yes','name':'Allow once','kind':'allow_once'},{'optionId':'no','name':'Deny once','kind':'reject_once'},{'optionId':'forever','name':'Always allow','kind':'allow_always'},{'optionId':'never','name':'Always reject','kind':'reject_always'}]
             if 'ambiguous' in trigger:options[3]['optionId']='yes'

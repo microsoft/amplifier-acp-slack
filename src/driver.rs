@@ -26,6 +26,19 @@ struct Peer {
     connection: amplifier_acp_connection::Connection,
     auth_methods: Value,
 }
+async fn cancellable_permission(
+    c: &Config,
+    home: &Path,
+    input: &Value,
+    sid: &str,
+    params: &Value,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> Result<Value> {
+    tokio::select! {
+        result=crate::permissions::request(c,home,input,sid,params)=>result,
+        _=cancelled=>Ok(json!({"outcome":{"outcome":"cancelled"}})),
+    }
+}
 impl Peer {
     async fn write(&mut self, value: Value) -> Result<()> {
         self.connection.sender.send(value)
@@ -73,12 +86,13 @@ impl Peer {
         }
         let id = self.send_request(method, params)?;
         let mut callbacks = tokio::task::JoinSet::new();
-        let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
+        let mut cancellations: HashMap<String, Option<tokio::sync::oneshot::Sender<()>>> =
+            HashMap::new();
         loop {
             let v = tokio::select! {
                 result=callbacks.join_next(),if !callbacks.is_empty()=>{
                     let (request_id,result): (Value,Result<Value>)=result.context("Missing setup callback")??;
-                    questions.remove(&request_id.to_string());
+                    cancellations.remove(&request_id.to_string());
                     self.write(match result {
                         Ok(result)=>json!({"jsonrpc":"2.0","id":request_id,"result":result}),
                         Err(_)=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"Client operation refused; inspect connector activity and configured scope"}}),
@@ -116,7 +130,10 @@ impl Peer {
                 return Ok(v["result"].clone());
             }
             if v["method"] == "$/cancel_request" {
-                if let Some(tx) = questions.remove(&v["params"]["requestId"].to_string()) {
+                if let Some(tx) = cancellations
+                    .get_mut(&v["params"]["requestId"].to_string())
+                    .and_then(Option::take)
+                {
                     let _ = tx.send(());
                 }
                 continue;
@@ -129,13 +146,15 @@ impl Peer {
                     || (sid.as_ref().is_some_and(|s| p["sessionId"] == *s)
                         && p.get("requestId").is_none()
                         && p.get("toolCallId").is_none());
-                if !scoped || callbacks.len() >= 16 || questions.contains_key(&v["id"].to_string())
+                if !scoped
+                    || callbacks.len() >= 16
+                    || cancellations.contains_key(&v["id"].to_string())
                 {
                     self.write(json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32602,"message":"Invalid question scope"}})).await?;
                     continue;
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                questions.insert(v["id"].to_string(), tx);
+                cancellations.insert(v["id"].to_string(), Some(tx));
                 let (c, home, input) = (c.clone(), home.to_owned(), input.clone());
                 callbacks.spawn(async move {let result=tokio::select!{r=crate::questions::request(&c,&home,&input,&v["params"])=>r,_=rx=>Ok(crate::elicitation::cancelled())};(v["id"].clone(),result)});
                 continue;
@@ -174,6 +193,18 @@ impl Peer {
                 )?));
             }
             ensure!(callbacks.len() < 16, "Too many pending setup callbacks");
+            let permission_cancel = if callback_method == "session/request_permission" {
+                let key = v["id"].to_string();
+                ensure!(
+                    !cancellations.contains_key(&key),
+                    "Duplicate permission callback"
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                cancellations.insert(key, Some(tx));
+                Some(rx)
+            } else {
+                None
+            };
             let (c, home, input, sid, tools, method) = (
                 c.clone(),
                 home.to_owned(),
@@ -183,8 +214,8 @@ impl Peer {
                 callback_method.to_owned(),
             );
             callbacks.spawn(async move {
-                let result = if method == "session/request_permission" {
-                    crate::permissions::request(&c, &home, &input, &sid, &v["params"]).await
+                let result = if let Some(cancelled) = permission_cancel {
+                    cancellable_permission(&c, &home, &input, &sid, &v["params"], cancelled).await
                 } else {
                     tools.call(&method, &v["params"]).await
                 };
@@ -745,7 +776,8 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let mut permissions = 0;
     let mut retried_direct = false;
     let mut callbacks = tokio::task::JoinSet::new();
-    let mut questions: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
+    let mut cancellations: HashMap<String, Option<tokio::sync::oneshot::Sender<()>>> =
+        HashMap::new();
     let mut tool_calls: HashMap<String, Value> = HashMap::new();
     let mut tool_observations_complete = true;
     let mut activity = crate::work_status::ToolActivity::default();
@@ -791,7 +823,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 },
                 result=callbacks.join_next(),if !callbacks.is_empty()=>{
                     let (request_id,result): (Value,Result<Value>)=result.context("Missing callback")??;
-                    questions.remove(&request_id.to_string());
+                    cancellations.remove(&request_id.to_string());
                     let response=match result {
                         Ok(result)=>json!({"jsonrpc":"2.0","id":request_id,"result":result}),
                         Err(_)=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"Client operation refused; inspect connector activity and configured scope"}}),
@@ -1216,7 +1248,10 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             }
         }
         if v["method"] == "$/cancel_request" {
-            if let Some(tx) = questions.remove(&v["params"]["requestId"].to_string()) {
+            if let Some(tx) = cancellations
+                .get_mut(&v["params"]["requestId"].to_string())
+                .and_then(Option::take)
+            {
                 let _ = tx.send(());
             }
             continue;
@@ -1234,12 +1269,13 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                     && p.get("requestId").is_none()
                     && p.get("toolCallId")
                         .is_none_or(|t| t.as_str().is_some_and(|t| tool_calls.contains_key(t))));
-            if !scoped || callbacks.len() >= 16 || questions.contains_key(&v["id"].to_string()) {
+            if !scoped || callbacks.len() >= 16 || cancellations.contains_key(&v["id"].to_string())
+            {
                 client.peer.write(json!({"jsonrpc":"2.0","id":v["id"],"error":{"code":-32602,"message":"Invalid question scope"}})).await?;
                 continue;
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
-            questions.insert(v["id"].to_string(), tx);
+            cancellations.insert(v["id"].to_string(), Some(tx));
             let (c, home, input) = (c.clone(), home.to_owned(), input.clone());
             callbacks.spawn(async move {let result=tokio::select!{r=crate::questions::request(&c,&home,&input,&v["params"])=>r,_=rx=>Ok(crate::elicitation::cancelled())};(v["id"].clone(),result)});
             continue;
@@ -1267,6 +1303,18 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 }
                 v["params"]["toolCall"] = merged;
             }
+            let permission_cancel = if method == "session/request_permission" {
+                let key = v["id"].to_string();
+                ensure!(
+                    !cancellations.contains_key(&key),
+                    "Duplicate permission callback"
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                cancellations.insert(key, Some(tx));
+                Some(rx)
+            } else {
+                None
+            };
             let (c, home, input, sid, tools) = (
                 c.clone(),
                 home.to_owned(),
@@ -1275,8 +1323,8 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 tools.clone(),
             );
             callbacks.spawn(async move {
-                let result = if method == "session/request_permission" {
-                    crate::permissions::request(&c, &home, &input, &sid, &v["params"]).await
+                let result = if let Some(cancelled) = permission_cancel {
+                    cancellable_permission(&c, &home, &input, &sid, &v["params"], cancelled).await
                 } else {
                     tools.call(&method, &v["params"]).await
                 };
