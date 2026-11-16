@@ -184,10 +184,10 @@ pub fn resolve(
         None => None,
     };
     let status = match choice.and_then(|v| v["kind"].as_str()) {
-        Some("allow_once") => "approved",
-        Some("reject_once") => "denied",
+        Some("allow_once" | "allow_always") => "approved",
+        Some("reject_once" | "reject_always") => "denied",
         None => "cancelled",
-        _ => anyhow::bail!("Persistent grants are not supported by this connector"),
+        _ => anyhow::bail!("Unsupported permission option"),
     };
     let n = store.db.execute("UPDATE permissions SET status=?2,option_id=?3,actor=?4,closed_at=?5 WHERE id=?1 AND status='pending' AND expires>?5 AND EXISTS(SELECT 1 FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=permissions.job_id AND j.status='running' AND j.version>=x.control_version)", params![id,status,option,actor,now_ms()])?;
     ensure!(n == 1, "Permission changed before the decision was applied");
@@ -252,8 +252,11 @@ pub async fn details(home: &Path, c: &Config, slack: &Slack, payload: &Value) ->
         let raw = serde_json::to_string_pretty(&p["request"]["toolCall"])?;
         let text: Vec<char> = raw.chars().take(24000).collect();
         let mut blocks = vec![
-            json!({"type":"section","text":{"type":"plain_text","text":format!("Status: {}. {}",p["status"].as_str().unwrap_or("closed"),if p["status"] == "pending" {"Close this window to decide on the original request. Allow once applies only to this action."} else {"This request is closed. These are the original action details; approval is not an execution result."})}}),
+            json!({"type":"section","text":{"type":"plain_text","text":format!("Status: {}. {}",p["status"].as_str().unwrap_or("closed"),if p["status"] == "pending" {"Close this window to decide on the original request. Allow once applies only to this request."} else {"This request is closed. These are the original action details; approval is not an execution result."})}}),
         ];
+        if has_remembered_options(&p["request"]["options"]) {
+            blocks.push(json!({"type":"section","text":{"type":"plain_text","text":REMEMBERED_OPTIONS_HELP}}));
+        }
         for chunk in text.chunks(2800) {
             blocks.push(json!({"type":"section","text":{"type":"plain_text","text":chunk.iter().collect::<String>()}}));
         }
@@ -291,11 +294,37 @@ fn summary(tool: &Value) -> String {
 fn details_button(id: &str) -> Value {
     json!({"type":"section","text":{"type":"plain_text","text":"Action details are available to the person who was asked."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}})
 }
-fn closed_card(id: &str, status: &str, tool: &Value) -> (String, Vec<Value>) {
-    let outcome = match status {
-        "approved" => "Approved. This records permission, not whether the action ran or succeeded.",
-        "denied" => "Declined. This request granted no permission.",
-        "expired" => {
+const REMEMBERED_OPTIONS_HELP: &str = "Always choices are offered and remembered by the agent, not Slack. Review the agent's stated scope before deciding; manage or revoke remembered rules in the agent's settings.";
+
+fn has_remembered_options(options: &Value) -> bool {
+    options.as_array().is_some_and(|options| {
+        options.iter().any(|option| {
+            matches!(
+                option["kind"].as_str(),
+                Some("allow_always" | "reject_always")
+            )
+        })
+    })
+}
+
+fn closed_card(
+    id: &str,
+    status: &str,
+    tool: &Value,
+    selected_kind: Option<&str>,
+) -> (String, Vec<Value>) {
+    let outcome = match (status, selected_kind) {
+        ("approved", Some("allow_always")) => {
+            "Always allow selected. The agent owns the remembered rule and its scope. This records permission, not whether the action ran or succeeded."
+        }
+        ("denied", Some("reject_always")) => {
+            "Always reject selected. The agent owns the remembered rule and its scope. This request granted no permission."
+        }
+        ("approved", _) => {
+            "Approved. This records permission, not whether the action ran or succeeded."
+        }
+        ("denied", _) => "Declined. This request granted no permission.",
+        ("expired", _) => {
             "Expired without approval. Ask the agent to try again when you are ready; a fresh request is required."
         }
         _ => "Cancelled. This request granted no permission.",
@@ -313,7 +342,7 @@ pub async fn refresh_messages(home: &Path, c: &Config, slack: &Slack) -> Result<
     let rows = {
         let store = Store::open(home)?;
         expire(&store, c)?;
-        let mut stmt=store.db.prepare("SELECT id,channel,slack_ts,status,body FROM permissions WHERE slack_ts IS NOT NULL AND status<>'pending' AND shown_status<>status LIMIT 20")?;
+        let mut stmt=store.db.prepare("SELECT id,channel,slack_ts,status,body,option_id FROM permissions WHERE slack_ts IS NOT NULL AND status<>'pending' AND shown_status<>status LIMIT 20")?;
         stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -321,13 +350,21 @@ pub async fn refresh_messages(home: &Path, c: &Config, slack: &Slack) -> Result<
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (id, channel, ts, status, body) in rows {
+    for (id, channel, ts, status, body, option_id) in rows {
         let request: Value = serde_json::from_str(&body)?;
-        let (text, blocks) = closed_card(&id, &status, &request["toolCall"]);
+        let selected_kind = option_id.as_deref().and_then(|id| {
+            request["options"]
+                .as_array()?
+                .iter()
+                .find(|option| option["optionId"] == id)?["kind"]
+                .as_str()
+        });
+        let (text, blocks) = closed_card(&id, &status, &request["toolCall"], selected_kind);
         if slack
             .call(
                 "chat.update",
@@ -417,9 +454,20 @@ pub async fn request(
     }
     let options: Vec<Value> = supplied
         .iter()
-        .filter(|v| matches!(v["kind"].as_str(), Some("allow_once" | "reject_once")))
+        .filter(|v| {
+            matches!(
+                v["kind"].as_str(),
+                Some("allow_once" | "reject_once" | "allow_always" | "reject_always")
+            )
+        })
         .filter(|v| v["optionId"].as_str().is_some_and(|s| s.len() <= 512) && v["name"].is_string())
-        .take(4)
+        .take(if c.acp.client.approvals_required {
+            4
+        } else {
+            // Automatic policy may only select allow_once. A display limit
+            // must not hide it behind multiple advertised persistent choices.
+            usize::MAX
+        })
         .cloned()
         .collect();
     if options.is_empty() {
@@ -500,9 +548,14 @@ pub async fn request(
     buttons.push(json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":"Cancel request"},"value":format!("{id}:cancel")}));
     // Slack requires action_id uniqueness within a block. Each option gets its own block.
     let mut blocks = vec![
-        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed\n{}\nAbout {} remains to decide. Approval requests in this turn share the same time budget. Allow once applies only to this action.",summary(&params["toolCall"]),remaining_wait_label(remaining))}}),
+        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed\n{}\nAbout {} remains to decide. Approval requests in this turn share the same time budget. Allow once applies only to this request.",summary(&params["toolCall"]),remaining_wait_label(remaining))}}),
     ];
     blocks.push(json!({"type":"section","text":{"type":"plain_text","text":"Review the action details privately before deciding."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}}));
+    if has_remembered_options(&body["options"]) {
+        blocks.push(
+            json!({"type":"section","text":{"type":"plain_text","text":REMEMBERED_OPTIONS_HELP}}),
+        );
+    }
     for button in buttons {
         blocks.push(json!({"type":"actions","elements":[button]}));
     }
@@ -553,19 +606,19 @@ mod tests {
     fn closed_cards_retain_context_and_private_details_without_decision_buttons() {
         let tool = json!({"title":"Run repository checks","kind":"execute","rawInput":{"command":"PRIVATE COMMAND"}});
         for status in ["approved", "denied", "expired", "cancelled"] {
-            let (text, blocks) = closed_card("request-1", status, &tool);
+            let (text, blocks) = closed_card("request-1", status, &tool, None);
             assert!(text.contains("Run repository checks"));
             assert!(!text.contains("PRIVATE COMMAND"));
             assert!(json!(blocks).to_string().contains("permission_details"));
             assert!(!json!(blocks).to_string().contains("acp_permission"));
         }
         assert!(
-            closed_card("id", "approved", &tool)
+            closed_card("id", "approved", &tool, None)
                 .0
                 .contains("not whether the action ran")
         );
         assert!(
-            closed_card("id", "expired", &tool)
+            closed_card("id", "expired", &tool, None)
                 .0
                 .contains("fresh request")
         );

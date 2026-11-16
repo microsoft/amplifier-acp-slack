@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.17.7
+
+Show remembered allow and deny choices in Slack when the connected agent offers them. Decisions remain bound to the original request and person; the agent owns remembered rules and their revocation. The existing automatic-approval setting continues to choose only a single-request allow option. See [release notes](docs/releases/0.17.7.md).
+
 ## 0.17.6
 
 Bind setup to the intended Slack workspace, explain channel invitations, and improve terminal status, API errors and image synchronization. New Linux source services restart after outside termination; existing units require the documented policy change. See [release notes](docs/releases/0.17.6.md).

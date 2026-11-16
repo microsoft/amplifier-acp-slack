@@ -71,9 +71,11 @@ async def main():
             assert (workspace/'client-file.txt').read_text()=='first\nsecond\n';assert not (home/'no.txt').exists()
             passed('Filesystem line ranges, cross-root and symlink rejection; terminal isolation, output, release and concurrent wait/kill')
             _,post=await permission('Dapproval')
-            assert all(b.get('elements',[{}])[0].get('value','').split(':')[-1]!='2' for b in post['blocks'])
-            for override in ({'user':{'id':'UOTHER'}},{'container':{'channel_id':'Dother','message_ts':post['ts']}},{'team':{'id':'Tother'}},{'api_app_id':'Aother'}):
-                await fixture.action(post,0,**override)
+            buttons=[b['elements'][0] for b in post['blocks'] if b.get('type')=='actions']
+            assert [b['text']['text'] for b in buttons]==['Allow once','Deny once','Always allow','Always reject','Cancel request']
+            assert 'remembered by the agent, not Slack' in json.dumps(post)
+            for override in ({'user':{'id':'UOTHER'}},{'container':{'channel_id':'Dother','message_ts':post['ts']}},{'container':{'channel_id':post['channel'],'message_ts':'wrong-message'}},{'team':{'id':'Tother'}},{'api_app_id':'Aother'}):
+                await fixture.action(post,2,**override)
                 assert count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='pending'",(post['client_msg_id'],))==1
             assert not (workspace/'approved.txt').exists()
             await fixture.action(post,0,action_id='permission_details',user={'id':'UOTHER'})
@@ -94,8 +96,31 @@ async def main():
             await fixture.action(post,0,action_id='permission_details')
             await until(lambda:len(fixture.views)>views_before,'closed request details available')
             passed('Private Slack details show merged tool-call arguments only to the initiating human')
-            passed('Approval requires the initiating human without an allowlist and exact app/workspace/message; replay and persistent grants rejected')
+            passed('Approval requires the initiating human and exact app/workspace/message; foreign persistent choices and replay are refused')
             (workspace/'approved.txt').unlink()
+            _,post=await permission('Dalways')
+            await fixture.action(post,2)
+            await until(lambda:any(p.get('channel')=='Dalways' and p.get('markdown_text')=='permission '+json.dumps({'outcome':'selected','optionId':'forever'}) for p in fixture.posts),'exact persistent allow returned to peer')
+            assert (workspace/'approved.txt').read_text()=='Explicitly approved'
+            assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0]==('approved','forever')
+            await until(lambda:any(p.get('channel')=='Dalways' for p in fixture.updated),'persistent allow card closed')
+            closed=next(p for p in fixture.updated if p['channel']=='Dalways')
+            assert 'Always allow selected' in json.dumps(closed)
+            assert 'agent owns the remembered rule and its scope' in json.dumps(closed)
+            (workspace/'approved.txt').unlink()
+            await fixture.action(post,2)
+            assert not (workspace/'approved.txt').exists()
+            # This independent peer deliberately remembers no rule. A second call
+            # must still ask: the connector must not infer a durable grant itself.
+            _,post=await permission('Dalways','permission requested again')
+            assert rows(home,'SELECT status FROM permissions WHERE id=?',(post['client_msg_id'],))[0][0]=='pending'
+            await fixture.action(post,3)
+            await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='denied'",(post['client_msg_id'],))==1,'persistent reject recorded')
+            assert rows(home,'SELECT option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0][0]=='never'
+            await until(lambda:any(p.get('channel')=='Dalways' and p.get('markdown_text')=='permission '+json.dumps({'outcome':'selected','optionId':'never'}) for p in fixture.posts),'exact persistent rejection returned to peer')
+            assert not (workspace/'approved.txt').exists()
+            await until(lambda:any(p.get('channel')=='Dalways' and 'Always reject selected' in json.dumps(p) for p in fixture.updated),'persistent reject card closed')
+            passed('Always choices return exact endpoint IDs; the agent owns remembered scope and the connector grants no inferred future permission')
             _,post=await permission('Ddenial');await fixture.action(post,1)
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='denied'",(post['client_msg_id'],))==1,'denial recorded')
             await until(lambda:any(p['channel']=='Ddenial' for p in fixture.posts),'denied turn returns')
@@ -109,7 +134,7 @@ async def main():
             passed('A cancelled direct turn explains that work stopped, without posting partial agent output or retrying')
             _,post=await permission('Dexpire')
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='expired'",(post['client_msg_id'],))==1,'permission expires',timeout=10)
-            await fixture.action(post,0);assert not (workspace/'approved.txt').exists();passed('Unanswered requests expire and cannot be approved later')
+            await fixture.action(post,2);assert not (workspace/'approved.txt').exists();passed('Unanswered requests expire and cannot be approved later')
             _,post=await permission('Dadmin');status,data=await api('GET','permissions');assert status==200
             matching=next(p for p in data['items'] if p['id']==post['client_msg_id']);assert matching['request']['toolCall']['rawInput']['content']=='Explicitly approved'
             status,data=await api('POST',f"permissions/{post['client_msg_id']}/decision",{'option_id':'no'});assert status==200,data
@@ -117,10 +142,10 @@ async def main():
             passed('Dashboard/CLI/API decisions use explicit administrator authority, not a caller-supplied Slack identity')
             m,post=await permission('Dedit');await fixture.edit(m,'Changed my mind, stop')
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='cancelled'",(post['client_msg_id'],))==1,'source change cancels')
-            await fixture.action(post,0);assert not (workspace/'approved.txt').exists();passed('Editing the source invalidates an outstanding request')
+            await fixture.action(post,2);assert not (workspace/'approved.txt').exists();passed('Editing the source invalidates an outstanding request')
             _,post=await permission('Drestart');await stop()
             assert count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='cancelled'",(post['client_msg_id'],))==1
-            await start();await fixture.action(post,0);assert not (workspace/'approved.txt').exists();passed('Stopping/restarting cancels pending permissions and never replays work')
+            await start();await fixture.action(post,2);assert not (workspace/'approved.txt').exists();passed('Stopping/restarting cancels pending permissions and never replays work')
             assert count(home,"SELECT COUNT(*) FROM messages WHERE body LIKE '%Agent permission needs your decision%'")==0
             passed('Connector control cards stay outside conversation history and cannot make a completed reply stale')
             prior=len(fixture.approvals);await fixture.send('Dambiguous','ambiguous permission')

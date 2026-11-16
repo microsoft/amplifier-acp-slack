@@ -36,8 +36,8 @@ for line in sys.stdin:
         output='fixture done'
         if 'permission' in trigger:
             send({'method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call',**{'toolCallId':'fixture-tool','title':'Create the harmless approval-check file','kind':'edit','locations':[{'path':str(cwd/'approved.txt')}],'rawInput':{'path':str(cwd/'approved.txt'),'content':'Explicitly approved'}}}}})
-            options=[{'optionId':'yes','name':'Allow once','kind':'allow_once'},{'optionId':'no','name':'Deny once','kind':'reject_once'},{'optionId':'forever','name':'Always allow','kind':'allow_always'}]
-            if 'ambiguous' in trigger:options[1]['optionId']='yes'
+            options=[{'optionId':'yes','name':'Allow once','kind':'allow_once'},{'optionId':'no','name':'Deny once','kind':'reject_once'},{'optionId':'forever','name':'Always allow','kind':'allow_always'},{'optionId':'never','name':'Always reject','kind':'reject_always'}]
+            if 'ambiguous' in trigger:options[3]['optionId']='yes'
             response=call('session/request_permission',{'sessionId':sid,'toolCall':{'toolCallId':'fixture-tool'},'options':options})
             if 'ambiguous' in trigger:
                 assert 'error' in response
@@ -46,7 +46,7 @@ for line in sys.stdin:
                 continue
             outcome=response['result']['outcome']
             output='permission '+json.dumps(outcome)
-            if outcome.get('optionId')=='yes':
+            if outcome.get('optionId') in ('yes','forever'):
                 (cwd/'approved.txt').write_text('Explicitly approved')
             if 'successive' in trigger:
                 outcomes=[outcome]
