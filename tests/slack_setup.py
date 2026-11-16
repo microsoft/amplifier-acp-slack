@@ -131,6 +131,42 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
         self.assertTrue(s.execute(self.home,'status',{})['authorized'])
 
+    def test_discard_keeps_access_after_deploy_loses_ack_before_app_record(self):
+        self.auth()
+        saved=(self.folder/'auth/credentials.json').read_bytes()
+        def lost_ack(folder,*args,cwd=None,auth_dir=None):
+            if args[0]=='deploy':
+                self.calls.append(args)
+                self.created+=1  # Simulated remote effect before any local app record.
+                raise s.subprocess.TimeoutExpired('fixture deploy',120)
+            return self.cli(folder,*args,cwd=cwd,auth_dir=auth_dir)
+        with patch.object(s,'cli',lost_ack):
+            with self.assertRaises(s.subprocess.TimeoutExpired):
+                s.execute(self.home,'connect',{'manifest':{},'team_id':self.team})
+        self.assertFalse((self.folder/'project/.slack/apps.json').exists())
+        self.assertFalse((self.folder/'issued.json').exists())
+        manifest=(self.folder/'project/manifest.json').read_bytes()
+        calls=list(self.calls)
+        with self.assertRaises(s.SetupError):s.execute(self.home,'discard',{})
+        self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        self.assertEqual(manifest,(self.folder/'project/manifest.json').read_bytes())
+        self.assertTrue(s.execute(self.home,'status',{})['authorized'])
+        self.assertEqual(self.calls,calls)  # No reconciliation request or automatic retry.
+        self.assertEqual(self.created,1)
+
+    def test_discard_keeps_legacy_prepared_project_without_claiming_no_deploy(self):
+        self.auth()
+        saved=(self.folder/'auth/credentials.json').read_bytes()
+        # An older helper leaves no durable attempt marker. Its existing project
+        # cannot establish whether an external deploy did or did not happen.
+        project=s.prepare_project(self.folder,{},'',{'team_id':self.team})
+        self.assertFalse((project/'.slack/apps.json').exists())
+        calls=list(self.calls)
+        with self.assertRaises(s.SetupError):s.execute(self.home,'discard',{})
+        self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        self.assertEqual(self.calls,calls)
+        self.assertEqual(self.created,0)
+
     def test_reopening_authorization_preserves_pending_code(self):
         first=s.execute(self.home,'authorize',{})
         second=s.execute(self.home,'authorize',{})

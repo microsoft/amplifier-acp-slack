@@ -636,7 +636,7 @@ if '--challenge' in sys.argv:
         assert!(!folder.join("project").exists());
 
         // Confirming the approved workspace is what reaches app creation. The
-        // fixture CLI declines the deploy, so nothing further is saved.
+        // fixture CLI fails without an app record; that cannot prove no effect.
         assert!(
             action(
                 State(state.clone()),
@@ -650,15 +650,20 @@ if '--challenge' in sys.argv:
         assert!(!state.home.join("secrets/slack.json").exists());
         assert!(state.instance_config().slack.team_id.is_empty());
 
-        // Discarding the approval lets another workspace be authorized instead.
-        let result = action(State(state.clone()), headers, request("discard", "", ""))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(result["authorized"], false);
-        assert_eq!(result["authorized_workspace"], Value::Null);
-        assert_eq!(result["next_action"], "authorize");
-        assert!(!configured(&state.home));
+        // A failed external attempt keeps its reconciliation access even though
+        // neither the Rust config nor the CLI app record identifies an app yet.
+        assert!(!folder.join("project/.slack/apps.json").exists());
+        let saved = std::fs::read(folder.join("auth/credentials.json")).unwrap();
+        let ApiError(_, message, _) =
+            action(State(state.clone()), headers, request("discard", "", ""))
+                .await
+                .unwrap_err();
+        assert!(message.contains("saved Slack access was kept"), "{message}");
+        assert_eq!(
+            saved,
+            std::fs::read(folder.join("auth/credentials.json")).unwrap()
+        );
+        assert!(configured(&state.home));
     }
 
     #[cfg(target_os = "linux")]

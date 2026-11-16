@@ -251,10 +251,11 @@ def execute(home, action, body):
             (folder / 'pending.json').unlink(missing_ok=True)
             return summary(folder)
         if action == 'discard':
-            # Drops an approval that no app was created with, so another workspace
-            # can be authorized instead. A recorded app keeps its access.
-            if read(folder / 'project/.slack/apps.json', {}).get('apps'):
-                raise SetupError('This connection already has its Slack app, so its Slack access was kept.')
+            # Project preparation precedes external deploy. A missing apps.json
+            # cannot prove that deploy had no effect: its reply may have been lost.
+            # Keep access even for older attempts that have no explicit marker.
+            if (folder / 'project').exists():
+                raise SetupError('Slack app setup was already prepared or attempted, so saved Slack access was kept. Check that setup before switching workspaces.')
             for name in ('auth/credentials.json', 'pending-auth/credentials.json', 'authorization-health.json'):
                 (folder / name).unlink(missing_ok=True)
             return summary(folder)

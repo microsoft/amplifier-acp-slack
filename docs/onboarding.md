@@ -79,9 +79,12 @@ stays false and the connection cannot start. With a declared workspace:
 With no declared workspace, `confirm` saves the approval and stops at
 `next_action: "connect"`. The page says which workspace Slack approved and asks
 before creating the agent there. `connect` creates the app; `discard` removes
-that local approval so another workspace can be authorized. `discard` never
-applies once the connection has its app, and it does not revoke the removed
-token at Slack, which expires on Slack’s own schedule. A connected installation
+that local approval so another workspace can be authorized. `discard` refuses
+once app setup has been prepared, even if no app was recorded: a missing local
+record does not prove a timed-out deploy created nothing at Slack. Saved access
+is kept so that attempt can be reconciled; discard sends no request or retry.
+An unused approval removed before setup is not revoked at Slack, and its token
+expires on Slack's own schedule. A connected installation
 is never asked to authorize again; its page shows **Connected to** its workspace.
 
 ### Slack authorization destination
