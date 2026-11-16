@@ -132,6 +132,29 @@ async def main():
             assert count(home,"SELECT COUNT(*) FROM audit WHERE kind='acp_turn_cancelled'")==1
             assert count(home,"SELECT COUNT(*) FROM audit WHERE kind='driver_failed'")==0
             passed('A cancelled direct turn explains that work stopped, without posting partial agent output or retrying')
+            prior=len(fixture.approvals)
+            _,withdrawn=await permission('Dwithdraw','withdrawn permission')
+            def withdrawal_sent(stage):
+                return any(json.loads(line).get('stage')==stage for line in (workspace/'callbacks.jsonl').read_text().splitlines())
+            (workspace/'withdraw-foreign').touch()
+            await until(lambda:withdrawal_sent('foreign'),'unrelated cancellation observed')
+            assert rows(home,'SELECT status FROM permissions WHERE id=?',(withdrawn['client_msg_id'],))[0][0]=='pending'
+            (workspace/'withdraw-current').touch()
+            await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='cancelled'",(withdrawn['client_msg_id'],))==1,'exact withdrawn permission cancelled')
+            await until(lambda:len(fixture.approvals)==prior+2,'fresh request after withdrawal')
+            current=fixture.approvals[-1]
+            assert current['client_msg_id']!=withdrawn['client_msg_id']
+            assert not any(p.get('channel')=='Dwithdraw' for p in fixture.posts),'Withdrawal must not end the original turn'
+            await until(lambda:any(p.get('ts')==withdrawn['ts'] and 'acp_permission' not in json.dumps(p) for p in fixture.updated),'withdrawn card controls removed')
+            await fixture.action(withdrawn,1)
+            assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(withdrawn['client_msg_id'],))[0]==('cancelled',None)
+            assert rows(home,'SELECT status FROM permissions WHERE id=?',(current['client_msg_id'],))[0][0]=='pending'
+            assert not (workspace/'fresh-after-withdrawal.txt').exists()
+            await fixture.action(current,0)
+            await until(lambda:any(p.get('channel')=='Dwithdraw' and p.get('markdown_text')=='withdrawn request stayed cancelled; current request approved' for p in fixture.posts),'same turn completes after current approval')
+            assert (workspace/'fresh-after-withdrawal.txt').read_text()=='Only the current request was approved'
+            assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(current['client_msg_id'],))[0]==('approved','yes')
+            passed('Exact backend withdrawal closes only its pending permission card; a late Always click cannot grant or affect a subsequent request in the same turn')
             _,post=await permission('Dexpire')
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='expired'",(post['client_msg_id'],))==1,'permission expires',timeout=10)
             await fixture.action(post,2);assert not (workspace/'approved.txt').exists();passed('Unanswered requests expire and cannot be approved later')
