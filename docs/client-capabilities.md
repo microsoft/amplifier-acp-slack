@@ -28,11 +28,17 @@ list of approvers. The legacy `approval_users` field remains readable for old
 configurations but is deprecated and no longer restricts requesting humans. A different group member, bot, workspace, app, message,
 stale request, or replay cannot grant permission.
 
-The card offers the endpoint's single-use allow/reject options and cancellation.
-Persistent `allow_always`/`reject_always` grants are deliberately omitted. If an
-endpoint only offers persistent choices, the request is cancelled. Tool call
-updates are merged with the permission request so a request containing only a
-tool-call ID can still show its actual arguments.
+The card offers the endpoint's `allow_once`, `reject_once`, `allow_always`, and
+`reject_always` choices when supplied, plus cancellation. Slack returns the exact
+selected option ID to that same live request; it does not invent a reusable rule
+or automatically match future requests. The agent owns the scope, persistence,
+and revocation of an Always choice. Review the agent's stated scope before
+choosing it, and manage or revoke remembered rules in the agent's settings.
+Unknown choices are omitted; a request with no supported choices is cancelled.
+With automatic approval enabled, the connector still selects only `allow_once`,
+never a persistent choice. Tool call updates are merged with the permission
+request so a request containing only a tool-call ID can still show its actual
+arguments.
 
 **Review details** opens a private Slack modal for that same authorized person.
 Full request details also appear in the connector dashboard for its owner. Slack
@@ -120,7 +126,8 @@ that already executes its own commands under the same OS account.
 - `GET /api/v1/permissions` returns pending and recent requests, decisions, exact
   actors, expiry and complete tool details; requires `admin` access.
 - `POST /api/v1/permissions/{id}/decision` with `{"option_id":"<advertised ID>"}`
-  selects that single-use option. `{"option_id":null}` cancels. Requires `admin`.
+  selects that exact advertised option. Any remembered scope belongs to the
+  agent. `{"option_id":null}` cancels. Requires `admin`.
 - Activity records request/decision/expiry and callback method/success. It never
   includes file contents, terminal output, tool arguments or provider stderr.
 - The dashboard's review modal and decision controls are exposed through

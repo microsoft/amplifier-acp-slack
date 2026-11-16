@@ -31,6 +31,8 @@ for line in sys.stdin:
   options=[{'optionId':'once','name':'Allow once','kind':'allow_once'}, {'optionId':'deny','name':'Decline','kind':'reject_once'}]
   if scenario=='deny':options=options[1:]
   if scenario=='persistent':options=[{'optionId':'always','name':'Always','kind':'allow_always'}]
+  if scenario=='mixed':options=[{'optionId':'always','name':'Always','kind':'allow_always'},*options,{'optionId':'never','name':'Never','kind':'reject_always'}]
+  if scenario=='crowded':options=[{'optionId':f'always-{i}','name':'Always','kind':'allow_always'} for i in range(4)]+options
   if scenario=='unknown':options=[{'optionId':'new','name':'Future','kind':'future_kind'}]
   if scenario=='duplicate':options[1]['optionId']='once'
   (root/'ready').write_text('ready')
@@ -103,8 +105,15 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn automatic_policy_uses_single_use_choice_without_slack_credentials_or_human_wait() {
-    for bot in [false, true] {
-        let f = Fixture::new("allow", bot);
+    for (scenario, bot) in [
+        ("allow", false),
+        ("allow", true),
+        ("mixed", false),
+        ("mixed", true),
+        ("crowded", false),
+        ("crowded", true),
+    ] {
+        let f = Fixture::new(scenario, bot);
         let result = f.run().await;
         assert_eq!(
             result["result"]["outcome"],
