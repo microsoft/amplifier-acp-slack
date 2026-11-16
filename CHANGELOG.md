@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.17.6
+
+Bind setup to the intended Slack workspace, explain channel invitations, and improve terminal status, API errors and image synchronization. New Linux source services restart after outside termination; existing units require the documented policy change. See [release notes](docs/releases/0.17.6.md).
+
 ## 0.17.4
 
 Inspect exact original Slack submissions and retained Instance work references without resending input. Existing sessions, work and delivery evidence are preserved. See [release notes](docs/releases/0.17.4.md).
