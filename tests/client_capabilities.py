@@ -84,7 +84,7 @@ async def main():
             _,post=await permission('Dapproval')
             buttons=[b['elements'][0] for b in post['blocks'] if b.get('type')=='actions']
             assert [b['text']['text'] for b in buttons]==['Allow this request','Deny','Remember matching action','Block matching action','Cancel request']
-            assert 'Always also applies to future matching requests' in json.dumps(post)
+            assert 'Remember covers matching requests' in json.dumps(post)
             assert 'not the permission duration' in json.dumps(post)
             assert 'Explicitly approved' not in json.dumps(post) and str(workspace) not in json.dumps(post)
             assert all(len(b['text']['text'])<=30 for b in buttons)
@@ -173,7 +173,7 @@ async def main():
             await until(lambda:any(p.get('channel')=='Dalways' for p in fixture.updated),'persistent allow card closed')
             closed=next(p for p in fixture.updated if p['channel']=='Dalways')
             assert 'Remember matching action selected' in json.dumps(closed)
-            assert 'agent owns the remembered rule and its scope' in json.dumps(closed)
+            assert "Manage the rule in the agent's settings" in json.dumps(closed)
             (workspace/'approved.txt').unlink()
             await fixture.action(post,2)
             assert not (workspace/'approved.txt').exists()
@@ -186,7 +186,7 @@ async def main():
             assert rows(home,'SELECT option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0][0]=='never'
             await until(lambda:any(p.get('channel')=='Dalways' and p.get('markdown_text')=='permission '+json.dumps({'outcome':'selected','optionId':'never'}) for p in fixture.posts),'exact persistent rejection returned to peer')
             assert not (workspace/'approved.txt').exists()
-            await until(lambda:any(p.get('channel')=='Dalways' and 'Always reject selected' in json.dumps(p) for p in fixture.updated),'persistent reject card closed')
+            await until(lambda:any(p.get('channel')=='Dalways' and 'Block matching action selected' in json.dumps(p) for p in fixture.updated),'persistent reject card closed')
             passed('Always choices return exact endpoint IDs; the agent owns remembered scope and the connector grants no inferred future permission')
             _,post=await permission('Ddenial');await fixture.action(post,1)
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='denied'",(post['client_msg_id'],))==1,'denial recorded')
