@@ -599,9 +599,7 @@ fn closed_card(
         ("denied", Some("reject_always")) => {
             "Block matching action selected. No permission granted."
         }
-        ("approved", _) => {
-            "Approved for this request. Execution is not confirmed here."
-        }
+        ("approved", _) => "Approved for this request. Execution is not confirmed here.",
         ("denied", _) => "Declined. This request granted no permission.",
         ("expired", _) => {
             "Expired without approval. Ask the agent to try again when you are ready; a fresh request is required."
@@ -611,7 +609,9 @@ fn closed_card(
     let text = format!("{}\n{outcome}", summary(tool));
     (
         text.clone(),
-        vec![json!({"type":"section","text":{"type":"plain_text","text":text},"accessory":details_button(id)["accessory"]})],
+        vec![
+            json!({"type":"section","text":{"type":"plain_text","text":text},"accessory":details_button(id)["accessory"]}),
+        ],
     )
 }
 pub async fn refresh_messages(home: &Path, c: &Config, slack: &Slack) -> Result<()> {
