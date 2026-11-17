@@ -317,7 +317,7 @@ fn section(text: impl Into<String>) -> Value {
 fn details_button(id: &str) -> Value {
     json!({"type":"section","text":{"type":"plain_text","text":"View the request details privately."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"View request"},"value":id}})
 }
-const REMEMBERED_OPTIONS_HELP: &str = "Always also applies to future matching requests. Review the scope in View request; you can remove the rule in the agent's settings.";
+const REMEMBERED_OPTIONS_HELP: &str = "Remember covers matching requests. Different commands can still ask. To stop individual prompts, choose Automatic in your agent's approval settings, when supported.";
 const DETAILS_LIMIT: usize = 24000;
 const DETAILS_SHORTENED: &str = "Some details are shortened. Do not approve unless you can understand the complete request. The connector owner can inspect the full request in its dashboard.";
 
@@ -325,8 +325,8 @@ fn option_label(option: &Value, options: &[Value], index: usize) -> String {
     let label = match option["kind"].as_str() {
         Some("allow_once") => "Allow this request",
         Some("reject_once") => "Deny",
-        Some("allow_always") => "Always allow this",
-        Some("reject_always") => "Always deny this",
+        Some("allow_always") => "Remember matching action",
+        Some("reject_always") => "Block matching action",
         _ => "Review choice",
     };
     // Do not collapse multiple producer choices of the same kind. The number
@@ -594,13 +594,13 @@ fn closed_card(
 ) -> (String, Vec<Value>) {
     let outcome = match (status, selected_kind) {
         ("approved", Some("allow_always")) => {
-            "Always allow selected. The agent owns the remembered rule and its scope. This records permission, not whether the action ran or succeeded."
+            "Remember matching action selected. Manage the rule in the agent's settings."
         }
         ("denied", Some("reject_always")) => {
-            "Always reject selected. The agent owns the remembered rule and its scope. This request granted no permission."
+            "Block matching action selected. No permission granted."
         }
         ("approved", _) => {
-            "Approved. This records permission, not whether the action ran or succeeded."
+            "Approved for this request. Execution is not confirmed here."
         }
         ("denied", _) => "Declined. This request granted no permission.",
         ("expired", _) => {
@@ -611,10 +611,7 @@ fn closed_card(
     let text = format!("{}\n{outcome}", summary(tool));
     (
         text.clone(),
-        vec![
-            json!({"type":"section","text":{"type":"plain_text","text":text}}),
-            details_button(id),
-        ],
+        vec![json!({"type":"section","text":{"type":"plain_text","text":text},"accessory":details_button(id)["accessory"]})],
     )
 }
 pub async fn refresh_messages(home: &Path, c: &Config, slack: &Slack) -> Result<()> {
@@ -880,7 +877,7 @@ mod tests {
         assert!(
             closed_card("id", "approved", &tool, None)
                 .0
-                .contains("not whether the action ran")
+                .contains("Execution is not confirmed here")
         );
         assert!(
             closed_card("id", "expired", &tool, None)
@@ -922,7 +919,7 @@ mod tests {
             vec![
                 "Allow this request",
                 "Deny",
-                "Always allow this",
+                "Remember matching action",
                 "Cancel request"
             ]
         );
