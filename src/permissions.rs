@@ -233,32 +233,70 @@ pub fn action(store: &Store, c: &Config, payload: &Value) -> Result<()> {
     )
 }
 pub async fn details(home: &Path, c: &Config, slack: &Slack, payload: &Value) -> Result<()> {
-    let view = {
+    // A neutral explanation still requires an authentic click on this exact card.
+    // It grants neither request visibility nor permission to decide for its recipient.
+    ensure!(
+        payload["type"] == "block_actions"
+            && payload["actions"].as_array().is_some_and(|a| a.len() == 1)
+            && payload["actions"][0]["action_id"] == "permission_details"
+            && payload["team"]["id"] == c.slack.team_id
+            && payload["api_app_id"] == c.slack.app_id
+            && payload["user"]["id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+            && matches!(
+                payload["user"].get("is_bot"),
+                None | Some(Value::Bool(false))
+            ),
+        "Invalid permission details interaction"
+    );
+    let (view, notice) = {
         let store = Store::open(home)?;
         let id = payload["actions"][0]["value"]
             .as_str()
             .context("Missing request")?;
         let p = current(&store, id)?.context("Permission not found")?;
         ensure!(
-            payload["team"]["id"] == c.slack.team_id
-                && payload["api_app_id"] == c.slack.app_id
-                && payload["user"]["id"] == p["approver"]
-                && payload["container"]["channel_id"] == p["channel"]
+            payload["container"]["channel_id"] == p["channel"]
                 && payload["container"]["message_ts"] == p["slack_ts"]
-                && p["slack_ts"].is_string()
-                && payload["user"].get("is_bot") != Some(&json!(true)),
-            "Permission details belong to another person or conversation"
+                && p["slack_ts"].is_string(),
+            "Permission details belong to another conversation"
         );
-        details_view(&p)
+        if payload["user"]["id"] == p["approver"] {
+            (
+                details_view(&p),
+                "If the request window didn't open, try View request again.",
+            )
+        } else {
+            let notice = "Only the person who received this request can view its details.";
+            (
+                json!({"type":"modal","title":{"type":"plain_text","text":"Private request"},"close":{"type":"plain_text","text":"Close"},"blocks":[section(notice)]}),
+                notice,
+            )
+        }
     };
+    if let Some(trigger) = payload["trigger_id"].as_str().filter(|s| !s.is_empty())
+        && slack
+            .call(
+                "views.open",
+                json!({"trigger_id":trigger,"view":view}),
+                false,
+            )
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+    // An expired or missing trigger cannot open a modal. Attempt one private,
+    // content-free notice to the clicking member; never retry either delivery.
     slack
         .call(
-            "views.open",
-            json!({"trigger_id":payload["trigger_id"],"view":view}),
+            "chat.postEphemeral",
+            json!({"channel":payload["container"]["channel_id"],"user":payload["user"]["id"],"text":notice,"mrkdwn":false}),
             false,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Could not open permission details"))?;
+        .map_err(|_| anyhow::anyhow!("Could not deliver the private permission details notice"))?;
     Ok(())
 }
 // Display-only helpers. Producer text is inert plain_text, never parsed into
