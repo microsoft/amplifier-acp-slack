@@ -83,7 +83,7 @@ async def main():
                 passed('Filesystem line ranges, cross-root and symlink rejection; terminal isolation, output, release and concurrent wait/kill')
             _,post=await permission('Dapproval')
             buttons=[b['elements'][0] for b in post['blocks'] if b.get('type')=='actions']
-            assert [b['text']['text'] for b in buttons]==['Allow this request','Deny','Always allow this','Always deny this','Cancel request']
+            assert [b['text']['text'] for b in buttons]==['Allow this request','Deny','Remember matching action','Block matching action','Cancel request']
             assert 'Always also applies to future matching requests' in json.dumps(post)
             assert 'not the permission duration' in json.dumps(post)
             assert 'Explicitly approved' not in json.dumps(post) and str(workspace) not in json.dumps(post)
@@ -112,7 +112,7 @@ async def main():
             closed=next(p for p in fixture.updated if p['channel']=='Dapproval')
             assert 'Create the harmless approval-check file' in json.dumps(closed),closed
             assert 'permission_details' in json.dumps(closed) and 'acp_permission' not in json.dumps(closed)
-            assert 'not whether the action ran' in json.dumps(closed)
+            assert 'Execution is not confirmed here' in json.dumps(closed)
             views_before=len(fixture.views)
             await fixture.action(post,0,action_id='permission_details')
             await until(lambda:len(fixture.views)>views_before,'closed request details available')
@@ -172,7 +172,7 @@ async def main():
             assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0]==('approved','forever')
             await until(lambda:any(p.get('channel')=='Dalways' for p in fixture.updated),'persistent allow card closed')
             closed=next(p for p in fixture.updated if p['channel']=='Dalways')
-            assert 'Always allow selected' in json.dumps(closed)
+            assert 'Remember matching action selected' in json.dumps(closed)
             assert 'agent owns the remembered rule and its scope' in json.dumps(closed)
             (workspace/'approved.txt').unlink()
             await fixture.action(post,2)
