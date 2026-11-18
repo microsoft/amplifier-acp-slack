@@ -11,6 +11,7 @@ pub mod driver;
 pub mod elicitation;
 pub mod error;
 pub mod identity;
+pub mod links;
 pub mod media;
 mod message_content;
 pub mod model;

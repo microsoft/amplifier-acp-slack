@@ -49,6 +49,7 @@ class SlackFixture:
         body = dict(request.query) if request.method == "GET" else await request.json()
         if method == "auth.test":
             return web.json_response({"ok": True, "team_id": "Ttest", "team": "Test workspace",
+                                      "url": "https://test-workspace.slack.com/",
                                       "user_id": "U" + name, "bot_id": "B" + name})
         if method == "bots.info":
             return web.json_response({"ok": True, "bot": {"id": "B" + name, "app_id": "A" + name}})
@@ -429,6 +430,13 @@ async def main():
             assert not protocol(homes["beta"], "session_load")
             assert any("direct plain reply" in m["text"] for m in beta_prompts[-1]["input"]["history"])
             passed("An ACP agent without session/load works through fresh sessions and bounded Slack history")
+
+            assert rows(homes["beta"], "SELECT value FROM settings WHERE key='slack_workspace_url'") == [("https://test-workspace.slack.com/",)]
+            latest = beta_prompts[-1]["input"]
+            stamp = latest["trigger"]["ts"].replace(".", "")
+            assert latest["links"]["conversation"] == "https://test-workspace.slack.com/archives/Cbeta"
+            assert latest["links"]["trigger"].startswith("https://test-workspace.slack.com/archives/Cbeta/p" + stamp)
+            passed("Startup keeps the workspace address Slack reports, and the projection links the conversation and the triggering message in Slack's own form")
 
             await fixture.send("Cbeta", "<@Ubeta> slow REQUEST-SURVIVES-ASIDE")
             await until(lambda: has_prompt("beta", "REQUEST-SURVIVES-ASIDE"), "direct request in progress")
