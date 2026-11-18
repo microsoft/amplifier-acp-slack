@@ -1,3 +1,5 @@
+Slack 0.17.13 reduces repeated conversation context and lets an ambient turn finish quietly after a peer update. See [the 0.17.13 notes](https://github.com/microsoft/amplifier-acp-slack/blob/main/docs/releases/0.17.13.md).
+
 Slack 0.17.12 adds direct Slack message/thread links, private messages to the agent’s configured owner, and text extraction for PDFs that cannot be passed whole. Private messages are restricted to source conversations the owner can read and recheck that access before queued delivery or rate-limit retries. Uncertain sends are never repeated. PDF text includes coverage and omission notices, with bounded input, output and processing time. See [the 0.17.12 notes](https://github.com/microsoft/amplifier-acp-slack/blob/main/docs/releases/0.17.12.md).
 
 Slack 0.17.11 clarifies that remembered approval choices apply to matching actions and points to the agent’s Automatic setting for stopping individual approval prompts. Completed cards are shorter. Existing approval policy and remembered rules remain unchanged. See [the 0.17.11 notes](https://github.com/microsoft/amplifier-acp-slack/blob/main/docs/releases/0.17.11.md).
