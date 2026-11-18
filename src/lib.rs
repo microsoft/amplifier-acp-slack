@@ -37,6 +37,8 @@ pub mod handoff;
 
 pub mod huddles;
 
+pub mod owner_message;
+
 pub mod reconnect;
 
 pub mod steering;

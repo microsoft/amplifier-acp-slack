@@ -102,7 +102,7 @@ fn original_current(db: &Connection, c: &Config, h: &Huddle) -> Result<bool> {
         && h.binding.bot_user == c.slack.bot_user_id
         && current_source(db, c, &h.binding.source)?)
 }
-fn job_source(db: &Connection, c: &Config, job: &str) -> Result<Message> {
+pub(crate) fn job_source(db: &Connection, c: &Config, job: &str) -> Result<Message> {
     let (raw,state,version,control):(String,String,i64,i64)=db.query_row(
         "SELECT j.trigger,j.status,j.version,x.control_version FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=?1",[job],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
@@ -116,7 +116,7 @@ fn job_source(db: &Connection, c: &Config, job: &str) -> Result<Message> {
 // Reserve the writer before reading source state. A deferred transaction can
 // read successfully while the publisher owns the writer, then fail its upgrade
 // immediately (SQLITE_BUSY) instead of honoring the connection busy timeout.
-fn source_transaction<'a>(
+pub(crate) fn source_transaction<'a>(
     s: &'a mut Store,
     c: &Config,
     job: &str,
