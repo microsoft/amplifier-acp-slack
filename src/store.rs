@@ -93,6 +93,7 @@ impl Store {
                 }
             }
         }
+        crate::file_reply::initialize(&store)?;
         crate::permissions::initialize(&store)?;
         crate::followup::initialize(&store)?;
         crate::handoff::initialize(&store)?;
