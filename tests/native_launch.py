@@ -21,6 +21,18 @@ import xml.etree.ElementTree as ET
 import zipfile
 import uuid
 
+def exact_path_identity(first,second):
+    """Same resolved path AND file; spelling normalization is Windows-only."""
+    a,b=Path(first).resolve(strict=True),Path(second).resolve(strict=True)
+    def key(path):
+        value=str(path)
+        if os.name=='nt':
+            if value.startswith('\\\\?\\UNC\\'):value='\\\\'+value[8:]
+            elif value.startswith('\\\\?\\'):value=value[4:]
+            value=os.path.normcase(value)
+        return value
+    return key(a)==key(b) and os.path.samefile(a,b)
+
 def run_startup_query(powershell,query,env):
     print('startup-inspection: before-powershell',file=sys.stderr,flush=True)
     try:
@@ -193,13 +205,284 @@ def request(base,path,body=None,headers=None):
     try:response=urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=20)
     except urllib.error.HTTPError as e:response=e
     with response:return response.status,{k.lower():v for k,v in response.headers.items()},json.load(response)
+
+def fresh_setup_status(home,base,headers):
+    """Status must not launch or materialize the setup helper."""
+    script=home/'secrets/slack-setup-helper.py';folder=home/'secrets/slack-setup'
+    assert not os.path.lexists(script) and not os.path.lexists(folder),'Expected untouched fresh setup'
+    status,_,value=request(base,'/api/v1/setup/slack',headers=headers)
+    assert status==200 and value['authorized'] is False and value['authorization_pending'] is False
+    assert value['setup_complete'] is False and value['connection_running'] is False
+    assert not os.path.lexists(script) and not os.path.lexists(folder),'Read-only setup GET materialized a helper or directory'
+    return value
+
+def prepare_fresh_setup_tool(home,base,headers):
+    """One explicit local discard on this empty fixture materializes its helper.
+
+    There is no approval, ticket, project or app to discard. The production
+    action starts no Slack authorization, CLI download or external request.
+    An uncertain reply is fatal; no fallback helper copy or action replay.
+    """
+    script=home/'secrets/slack-setup-helper.py';folder=home/'secrets/slack-setup'
+    assert not os.path.lexists(script) and not os.path.lexists(folder),'Setup tool preparation requires untouched fixture state'
+    config_path=home/'adapter.json';before=config_path.read_bytes();config=json.loads(before)
+    assert config['enabled'] is False and config['setup_complete'] is False and not config['slack']['app_id']
+    protected={p:p.read_bytes() for p in (home/'secrets').rglob('*') if p.is_file()}
+    status,_,value=request(base,'/api/v1/setup/slack',{'action':'discard'},headers=headers)
+    assert status==200 and value['authorized'] is False and value['authorization']=='missing'
+    assert value['setup_complete'] is False and value['connection_running'] is False
+    assert config_path.read_bytes()==before and all(p.read_bytes()==saved for p,saved in protected.items()),'Local fixture preparation changed existing configuration/account state'
+    assert script.is_file() and not script.is_symlink()
+    assert script.read_bytes()==(Path(__file__).resolve().parents[1]/'scripts/slack_setup.py').read_bytes(),'Materialized helper differs from exact compiled source'
+    assert folder.is_dir() and not folder.is_symlink()
+    assert not any(os.path.lexists(folder/name) for name in ('auth','pending-auth','pending.json','project','issued.json','bin','cli.json')),'Fresh local discard created authorization or external-tool state'
+    # The real saved reader must accept the exact directories made by the
+    # explicit helper. A successful helper reply alone does not prove this.
+    materialized={p:p.read_bytes() for p in (home/'secrets').rglob('*') if p.is_file()}
+    status,_,saved=request(base,'/api/v1/setup/slack',headers=headers)
+    assert status==200 and saved['authorized'] is False and saved['authorization']=='missing' and saved['authorization_pending'] is False,'Post-discard saved setup read failed'
+    assert saved['setup_complete'] is False and saved['connection_running'] is False
+    assert config_path.read_bytes()==before and materialized=={p:p.read_bytes() for p in (home/'secrets').rglob('*') if p.is_file()},'Read-only post-discard status changed retained setup/account state'
+
+def finite_setup(binary,root,env):
+    """Actual create-only entry point; no server, browser, Slack or model."""
+    home=root/'finite setup café 子'
+    command=[str(binary),'--home',str(home),'native-setup']
+    created=subprocess.run(command,env=env,capture_output=True,text=True,encoding='utf-8',timeout=60)
+    assert created.returncode==0,created.stderr
+    receipt=json.loads(created.stdout)
+    config=json.loads((home/'adapter.json').read_text(encoding='utf-8'))
+    assert receipt['schema']=='com.microsoft.amplifier.slack-native-setup/1'
+    assert receipt['created'] is True and receipt['serving'] is False
+    assert receipt['id']==config['id'] and exact_path_identity(receipt['home'],home)
+    assert Path(receipt['executable']).is_file()
+    assert receipt['management']=={'kind':'installation-local-cli','api_version':'acp-slack-adapter.management/1','relative_api_paths':True,'requires_running_connector':True}
+    assert not config['enabled'] and not config['setup_complete'] and not config['acp']['command']
+    assert not (home/'endpoints.json').exists() and not (home/'startup.json').exists()
+    assert not (home/'secrets/local-password').exists()
+    for secret in ['first-account','control-token']:
+        raw=(home/'secrets'/secret).read_text(encoding='utf-8')
+        value=json.loads(raw)['token'] if secret=='first-account' else raw.strip()
+        assert value and value not in created.stdout and value not in created.stderr
+    def snapshot():
+        return {str(p.relative_to(home)):hashlib.sha256(p.read_bytes()).hexdigest() for p in home.rglob('*') if p.is_file()}
+    before=snapshot()
+    refused=subprocess.run(command,env=env,capture_output=True,text=True,encoding='utf-8',timeout=20)
+    assert refused.returncode!=0 and snapshot()==before
+    occupied=root/'existing unrelated folder';occupied.mkdir();(occupied/'owner-data').write_bytes(b'preserve me')
+    refused=subprocess.run([str(binary),'--home',str(occupied),'native-setup'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20)
+    assert refused.returncode!=0 and list(occupied.iterdir())==[occupied/'owner-data']
+    assert (occupied/'owner-data').read_bytes()==b'preserve me'
+    return ['finite native setup exits without starting service or exposing credentials','repeated native setup preserves exact existing installation','native setup refuses unrelated existing folder']
+
+def manager_record_projection(value):
+    """Content-free identity/phase evidence; never copy arbitrary record fields."""
+    def digest(item):return hashlib.sha256(json.dumps(item,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    def canonical_id(value):
+        try:return isinstance(value,str) and str(uuid.UUID(value))==value
+        except ValueError:return False
+    result={}
+    for key in ('id','request_id','start_request_id','update_plan'):
+        if canonical_id(value.get(key)):result[key]=value[key]
+    for key in ('schema','process_absent'):
+        if type(value.get(key)) in (int,bool):result[key]=value[key]
+    enums={'phase':{'registering','registered','registration_refused','start_intent','accepted','refused','unknown','ready','observing_existing','intent','inactive','retired'},
+           'action':{'stop','retire'},'dispatch_outcome':{'unconfirmed','accepted','refused','unknown'}}
+    for key,allowed in enums.items():
+        if isinstance(value.get(key),str):result[key]=value[key] if value[key] in allowed else 'unrecognized'
+    for key in ('binding','profile','service','before','outcome','observation'):
+        if key in value:result[key+'_sha256']=digest(value[key])
+    binding=value.get('binding')
+    if isinstance(binding,dict):
+        result['binding_id']=binding['id'] if canonical_id(binding.get('id')) else None
+        sha=binding.get('binary_sha256')
+        if isinstance(sha,str) and re.fullmatch('[0-9a-f]{64}',sha):result['binary_sha256']=sha
+    for key in ('process','process_identity'):
+        process=value.get(key)
+        if process is None and key in value:result[key]=None
+        if not isinstance(process,dict):continue
+        observed={}
+        for field in ('pid','session_id'):
+            if type(process.get(field)) is int and 0<=process[field]<=2**32-1:observed[field]=process[field]
+        for field in ('start_ticks','creation_time_100ns','start_seconds','start_microseconds','boot_seconds','boot_microseconds'):
+            raw=process.get(field)
+            if isinstance(raw,str) and re.fullmatch('[0-9]{1,24}',raw):observed[field]=raw
+        if process.get('platform') in ('windows','macos'):observed['platform']=process['platform']
+        if canonical_id(process.get('boot_id')):observed['boot_id']=process['boot_id']
+        result[key]=observed
+    return result
+
+def managed_failure_records(home,expected_home,events):
+    """One read-only snapshot of this fixture's issued fixed manager records.
+
+    This is not a fresh process/manager query or a settlement observation. Reads
+    are not retried. Missing, unsafe, changing and unreadable records stay distinct.
+    """
+    result={'schema':1,'read_only':True,'scope':'saved records only; not atomic or current process liveness','observation_monotonic':time.monotonic(),'records':{}}
+    def identity(info):return (info.st_dev,info.st_ino)
+    def ordinary(info,folder=False):
+        return (stat.S_ISDIR(info.st_mode) if folder else stat.S_ISREG(info.st_mode)) and not getattr(info,'st_file_attributes',0)&getattr(stat,'FILE_ATTRIBUTE_REPARSE_POINT',0x400)
+    if expected_home is None:
+        result['unavailable']='fresh_home_identity_not_recorded';return result
+    try:
+        current=home.lstat()
+        if not ordinary(current,True) or identity(current)!=expected_home:
+            result['unavailable']='fresh_home_identity_changed';return result
+    except OSError as error:
+        result['unavailable']='home_read_error';result['errno']=error.errno;return result
+    paths=['native-manager/active.json','native-manager/enrollment.json','native-manager/control.json']
+    # These IDs come only from commands already issued by the fixture. Neither
+    # pointers nor directory enumeration can expand the collection scope.
+    for event in events[:16]:
+        action,args=event.get('action'),event.get('args',[])
+        if action not in ('native-start','native-stop','native-retire') or len(args)!=2 or args[0]!='--request-id':continue
+        try:
+            if str(uuid.UUID(args[1]))!=args[1]:continue
+        except (ValueError,TypeError,AttributeError):continue
+        if action=='native-start':paths.extend([f'native-manager/requests/{args[1]}.json',f'native-manager/requests/{args[1]}.launched.json'])
+        else:paths.append(f'native-manager/controls/{args[1]}.json')
+    result['truncated']=len(events)>16 or len(paths)>16
+    for relative in dict.fromkeys(paths[:16]):
+        row={};result['records'][relative]=row
+        try:
+            if identity(home.lstat())!=expected_home:raise ValueError('home changed')
+            path=home
+            for component in Path(relative).parts[:-1]:
+                path=path/component
+                if not ordinary(path.lstat(),True):raise ValueError('unsafe directory')
+            path=home/relative;before=path.lstat()
+            if not ordinary(before) or before.st_nlink!=1:raise ValueError('unsafe file')
+            if before.st_size>65536:
+                row.update(state='oversize',size=before.st_size);continue
+            flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)
+            with os.fdopen(os.open(path,flags),'rb') as stream:
+                opened=os.fstat(stream.fileno())
+                if not ordinary(opened) or identity(opened)!=identity(before):raise ValueError('opened identity changed')
+                raw=stream.read(65537);after=os.fstat(stream.fileno())
+            row['size']=len(raw)
+            if len(raw)>65536:row['state']='oversize';continue
+            row['sha256']=hashlib.sha256(raw).hexdigest()
+            if identity(path.lstat())!=identity(before) or identity(home.lstat())!=expected_home or (after.st_size,after.st_mtime_ns)!=(before.st_size,before.st_mtime_ns):
+                row['state']='changed_during_read';continue
+            try:value=json.loads(raw)
+            except (ValueError,UnicodeError):row['state']='malformed';continue
+            if not isinstance(value,dict):row['state']='invalid_record';continue
+            row.update(state='observed',projection=manager_record_projection(value))
+        except FileNotFoundError:row['state']='absent_at_read'
+        except OSError as error:row.update(state='read_error',error_type=type(error).__name__,errno=error.errno)
+        except ValueError:row['state']='unsafe_or_changed'
+    return result
+
+def retain_managed_failure(receipt,home,expected_home,events,save):
+    # Diagnostics and receipt persistence must never replace the original
+    # action exception, including interruption while collecting evidence.
+    try:receipt['manager_records']=managed_failure_records(home,expected_home,events)
+    except BaseException as error:receipt['manager_records']={'unavailable':'diagnostic_error','error_type':type(error).__name__}
+    try:save()
+    except BaseException as error:receipt['diagnostic_save_error']=type(error).__name__
+
+def managed_lifecycle(binary,env,result=None):
+    """Actual fixed OS profile, separate from the legacy startup-toggle proof.
+
+    Each native action keeps its 60-second owner bound; 65 seconds is only the
+    CLI launch/serialization/reap envelope. There is no action retry. An unknown
+    result retains this fresh home and any registration for inspection.
+    """
+    root=Path(tempfile.mkdtemp(prefix='Slack managed café 子 ')).resolve()
+    home=root/'installation';events=[];home_identity=None
+    receipt={'schema':1,'scope':'actual fresh fixed-manager lifecycle','home':str(home),'passed':False,'events':events,'external_authorization':False,'model_calls':0,'action_retry':False}
+    target=result.with_name(result.name.replace('-native-launch-result.json','-native-manager-result.json')) if result else root/'manager-result.json'
+    def save():
+        if target.parent.exists():target.write_text(json.dumps(receipt,indent=2)+'\n',encoding='utf-8')
+    def call(exe,action,*args,timeout=65):
+        at=time.monotonic();proc=subprocess.Popen([str(exe),'--home',str(home),action,*args],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        row={'action':action,'args':list(args),'caller_pid':proc.pid,'started_monotonic':at};events.append(row);save()
+        try:out,err=proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill();out,err=proc.communicate(timeout=5);row.update(elapsed=time.monotonic()-at,caller_exit=proc.returncode,outcome='unknown');save();raise
+        row.update(elapsed=time.monotonic()-at,caller_exit=proc.returncode,stdout=out[:65536].decode('utf-8',errors='replace'),stderr=err[:8192].decode('utf-8',errors='replace'));save()
+        assert proc.returncode==0,(action,proc.returncode,row['stderr'])
+        assert len(out)<=65536 and len(err)<=8192,'Managed fixture output exceeded bound'
+        value=json.loads(out);row['result']=value;save();return value
+    def exact(value):
+        assert value['schema']=='com.microsoft.amplifier.slack-native-status/1'
+        assert value['id']==setup['id'] and exact_path_identity(value['home'],home)
+        assert exact_path_identity(value['executable'],installed)
+        assert value['autostart'] is False and value['startup_change_supported'] is False
+    def ready(value,request,process=None):
+        exact(value)
+        assert value['state']=='ready' and value['profile_matches'] is True
+        assert value['request_current'] is True and value['launch_observed'] is True
+        assert value['request']['request_id']==request and value['pid']==value['process_identity']['pid']
+        assert value['process_identity']['pid']>0 and len(value['process_identity'])>=3
+        if process is not None:assert value['process_identity']==process,'Managed generation changed after caller exit'
+        return value['process_identity']
+    def stopped(value,request,start,process,phase='inactive'):
+        exact(value);assert value['state']==phase and value['control_current'] is True
+        c=value['control'];assert c['request_id']==request and c['start_request_id']==start
+        assert c['action']==('retire' if phase=='retired' else 'stop') and c['phase']==phase
+        assert c['process_identity']==process and c['process_absent'] is True
+    def protected():
+        paths=[home/'adapter.json',home/'native-installation.json']+sorted((home/'secrets').rglob('*'))
+        return {str(p.relative_to(home)):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths if p.is_file()}
+    def console_probe(process):
+        if os.name!='nt':return {'applicable':False,'reason':'Windows console observation'}
+        # A separate no-console observer attaches only long enough to establish
+        # whether this exact live GUI-subsystem generation has a console.
+        code="""import ctypes,json,sys
+k=ctypes.WinDLL('kernel32',use_last_error=True)
+k.FreeConsole()
+ok=bool(k.AttachConsole(int(sys.argv[1])))
+error=0 if ok else ctypes.get_last_error()
+if ok:k.FreeConsole()
+print(json.dumps({'attached':ok,'error':error}))
+"""
+        observed=subprocess.run([sys.executable,'-I','-B','-c',code,str(process['pid'])],env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=10,creationflags=subprocess.CREATE_NO_WINDOW)
+        assert observed.returncode==0,observed.stderr
+        proof=json.loads(observed.stdout);assert proof=={'attached':False,'error':6},proof
+        return proof
+    try:
+        setup=call(binary,'native-setup',timeout=60);assert setup['created'] is True and setup['serving'] is False
+        home_entry=home.lstat();assert stat.S_ISDIR(home_entry.st_mode) and not home.is_symlink()
+        home_identity=(home_entry.st_dev,home_entry.st_ino)
+        installed=Path(setup['executable']);assert installed.is_file()
+        initial_config=json.loads((home/'adapter.json').read_text(encoding='utf-8'));assert initial_config['enabled'] is False and initial_config['setup_complete'] is False and not initial_config['acp']['command']
+        first=str(uuid.uuid4());receipt['first_request_id']=first
+        initial=call(installed,'native-start','--request-id',first);generation=ready(initial,first)
+        receipt['service']=initial['service'];receipt['first_generation']=generation;receipt['first_process_relationship']=initial['process_relationship']
+        assert generation['pid']!=events[-1]['caller_pid'],'Native start remained the service process'
+        baseline=protected();receipt['protected_before']=baseline
+        time.sleep(.25)
+        observed=call(installed,'native-status');ready(observed,first,generation);assert observed['service']==initial['service']
+        receipt['console_observation']=console_probe(generation)
+        ready(call(installed,'native-status'),first,generation)
+        stop_id=str(uuid.uuid4());stopped(call(installed,'native-stop','--request-id',stop_id),stop_id,first,generation)
+        inactive=call(installed,'native-status');exact(inactive);assert inactive['state']=='inactive' and inactive['profile_matches'] is True
+        assert protected()==baseline,'Stop changed existing configuration or private state'
+        second=str(uuid.uuid4());receipt['second_request_id']=second
+        restarted=call(installed,'native-start','--request-id',second);next_generation=ready(restarted,second)
+        assert next_generation!=generation and restarted['service']==initial['service'],'Restart changed profile or reused old generation'
+        ready(call(installed,'native-status'),second,next_generation)
+        assert protected()==baseline,'Restart changed existing configuration or private state'
+        second_stop=str(uuid.uuid4());stopped(call(installed,'native-stop','--request-id',second_stop),second_stop,second,next_generation)
+        retire=str(uuid.uuid4());stopped(call(installed,'native-retire','--request-id',retire),retire,second,next_generation,'retired')
+        absent=call(installed,'native-status');exact(absent);assert absent['state']=='retired' and absent['request_current'] is True
+        assert protected()==baseline,'Retirement changed retained installation data'
+        receipt.update(passed=True,second_generation=next_generation,second_process_relationship=restarted['process_relationship'],protected_after=protected(),registration_absent=True,cleanup='checked profile retired; exact fresh home removal pending')
+        save();shutil.rmtree(root);receipt['cleanup']='checked profile retired; exact fresh home removed';save()
+    except BaseException as error:
+        receipt.update(passed=False,error_type=type(error).__name__,error=str(error)[:2048],retained_home=home.exists(),cleanup='not attempted after failed or unknown action')
+        retain_managed_failure(receipt,home,home_identity,events,save);raise
+    return receipt
+
 def run(package,result,browser=False,verify_setup_tool=False,verify_startup=False):
-    checks=[]
+    checks=[];manager_receipt=None
     with tempfile.TemporaryDirectory(prefix='Slack native café 子 ') as temporary:
         root=Path(temporary);bundle=root/'download';bundle.mkdir();extract(package,bundle)
         binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file())
         binary.chmod(0o755);home=root/'private connection';env={k:v for k,v in os.environ.items() if not k.upper().startswith(('SLACK_','OPENAI_','ANTHROPIC_','AZURE_','GOOGLE_','AMPLIFIER_'))};env['PATH']=str(root/'no-tools');env['PYTHONDONTWRITEBYTECODE']='1';env['USER']='Native café 子';env['USERNAME']='Native café 子'
         if verify_startup:env['PATH']=str(Path(os.environ['SystemRoot'])/'System32') if os.name=='nt' else '/usr/bin:/bin'
+        checks.extend(finite_setup(binary,root,env))
         def start():
             log=open(root/'server.log','ab');p=subprocess.Popen([str(binary),'--home',str(home),'--no-browser'],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
             for _ in range(400):
@@ -231,7 +514,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             status_run=subprocess.run([str(binary),'--home',str(home),'api','GET','status'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert status_run.returncode==0,status_run.stderr;assert json.loads(status_run.stdout)['id']==config['id'];checks.append('same-connection listener proof before CLI authorization')
             private_python=home/'runtime/python'/('python.exe' if os.name=='nt' else 'bin/python3')
             py=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c','import ssl,sqlite3,json; print(json.dumps({"isolated":__import__("sys").flags.isolated,"ssl":bool(ssl.OPENSSL_VERSION)}))'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert py.returncode==0,py.stderr;assert json.loads(py.stdout)=={'isolated':1,'ssl':True};checks.append('private Python starts without system tools')
-            cookie=headers['set-cookie'].split(';',1)[0];status,_,_=request(base,'/api/v1/setup/slack',headers={'Cookie':cookie});assert status==200;checks.append('guided Slack setup status uses bundled runtime without network or credentials')
+            cookie=headers['set-cookie'].split(';',1)[0];fresh_setup_status(home,base,{'Cookie':cookie});checks.append('guided Slack setup GET reads saved state without creating a helper, directory or credentials')
             if verify_startup:
                 if os.name!='nt' and __import__('sys').platform!='darwin':raise AssertionError('Startup fixture is limited to native Windows/Mac CI')
                 startup_headers={'Cookie':cookie,'X-CSRF-Token':session['csrf']};label='acp-slack-adapter-'+config['id']
@@ -260,6 +543,8 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                 checks.append('independent native absence confirms startup removal preserves installation and account')
 
             if verify_setup_tool:
+                prepare_fresh_setup_tool(home,base,{'Cookie':cookie,'X-CSRF-Token':session['csrf']})
+                checks.append('one explicit fresh-home local discard materializes the exact helper; subsequent read-only saved setup succeeds without authorization/network or account/configuration changes')
                 code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
                 vendor_env={**env,'SLACK_SKIP_UPDATE':'true','NO_COLOR':'1'}
                 verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150)
@@ -293,7 +578,11 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             checks.append('native private helper reuses an existing paused Slack connection without app creation, engine launch or configuration changes')
         finally:p.terminate();p.wait(timeout=20);log.close()
         if not verify_startup:assert not (home/'startup.json').exists();checks.append('startup false does not register an OS service')
+        if verify_startup:
+            manager_receipt=managed_lifecycle(binary,env,result)
+            checks.append('actual fixed native manager survives caller exit; exact generation, stop, same-profile restart and checked retirement preserve private state')
     receipt={'passed':True,'checks':checks,'package':str(package),'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),'limitations':['No real Slack authorization or model/provider call','No publisher signing/notarization claim','Current-user startup registration exercised only when verify_startup is enabled; automatic sign-in launch is not simulated']}
+    receipt['managed_lifecycle']=manager_receipt
     if result:result.write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt,indent=2))
 if __name__=='__main__':
