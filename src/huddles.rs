@@ -72,6 +72,9 @@ fn load(db: &Connection, id: &str) -> Result<Huddle> {
     })
 }
 pub(crate) fn current_source(db: &Connection, c: &Config, source: &Message) -> Result<bool> {
+    Ok(!source.channel.starts_with('D') && current_reply_source(db, c, source)?)
+}
+fn current_reply_source(db: &Connection, c: &Config, source: &Message) -> Result<bool> {
     let raw: Option<String> = db
         .query_row(
             "SELECT body FROM messages WHERE channel=?1 AND ts=?2",
@@ -84,7 +87,6 @@ pub(crate) fn current_source(db: &Connection, c: &Config, source: &Message) -> R
         .transpose()?;
     Ok(c.enabled
         && source.team == c.slack.team_id
-        && !source.channel.starts_with('D')
         && c.allows(&source.channel, "")
         && c.should_wake(&source.channel, &source.text)
         && current.is_some_and(|m| {
@@ -103,12 +105,20 @@ fn original_current(db: &Connection, c: &Config, h: &Huddle) -> Result<bool> {
         && current_source(db, c, &h.binding.source)?)
 }
 pub(crate) fn job_source(db: &Connection, c: &Config, job: &str) -> Result<Message> {
+    let source = reply_job_source(db, c, job)?;
+    ensure!(
+        !source.channel.starts_with('D'),
+        "A channel source is required"
+    );
+    Ok(source)
+}
+pub(crate) fn reply_job_source(db: &Connection, c: &Config, job: &str) -> Result<Message> {
     let (raw,state,version,control):(String,String,i64,i64)=db.query_row(
         "SELECT j.trigger,j.status,j.version,x.control_version FROM jobs j JOIN contexts x ON x.id=j.context WHERE j.id=?1",[job],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     let source: Message = serde_json::from_str(&raw)?;
     ensure!(
-        state == "running" && version >= control && current_source(db, c, &source)?,
+        state == "running" && version >= control && current_reply_source(db, c, &source)?,
         "Current conversation source or connection changed"
     );
     Ok(source)

@@ -257,9 +257,9 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.schema == 1, "Unsupported configuration schema");
         ensure!(
-            (1..=4).contains(&self.media.max_files)
+            (1..=crate::media::MAX_FILES).contains(&self.media.max_files)
                 && (1..=2 * 1024 * 1024).contains(&self.media.max_file_bytes),
-            "Media limits: 1–4 files, up to 2 MiB each"
+            "Media limits: 1–8 files, up to 2 MiB each"
         );
         ensure!(
             uuid::Uuid::parse_str(&self.id).is_ok(),
