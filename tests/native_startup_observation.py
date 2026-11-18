@@ -153,11 +153,11 @@ class ManagedFailureRecordTests(unittest.TestCase):
         self.assertTrue(result['read_only']);self.assertNotIn(self.canary,json.dumps(result))
         self.assertEqual(len(result['records']),6)
         for path in (active,request,witness):
-            row=result['records'][str(path.relative_to(self.home))]
+            row=result['records'][path.relative_to(self.home).as_posix()]
             self.assertEqual(row['state'],'observed');self.assertEqual(row['sha256'],hashlib.sha256(before[path]).hexdigest())
-        observed=result['records'][str(witness.relative_to(self.home))]['projection']
+        observed=result['records'][witness.relative_to(self.home).as_posix()]['projection']
         self.assertEqual(observed['process'],{'platform':'windows','pid':123,'creation_time_100ns':'456','session_id':1})
-        self.assertEqual(observed['binding_sha256'],result['records'][str(request.relative_to(self.home))]['projection']['binding_sha256'])
+        self.assertEqual(observed['binding_sha256'],result['records'][request.relative_to(self.home).as_posix()]['projection']['binding_sha256'])
         self.assertEqual(before,{p:p.read_bytes() for p in self.home.rglob('*') if p.is_file()})
 
     def test_missing_witness_and_unissued_pointer_remain_readonly_absence(self):
