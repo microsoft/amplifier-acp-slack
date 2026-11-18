@@ -18,6 +18,7 @@ pub mod model;
 pub mod pdf_text;
 pub mod permissions;
 pub mod process;
+mod projection;
 pub mod provisioning;
 pub mod questions;
 pub mod relocation;

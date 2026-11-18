@@ -19,7 +19,7 @@ use tokio::process::{Child, Command};
 
 pub fn request(c: &Config, m: &Message, history: Vec<Message>) -> Value {
     json!({"conversation":{"surface":"slack","workspace":m.team,"channel":m.channel,"thread":m.thread,"context":m.context()},"your_slack_user_id":c.slack.bot_user_id,
-       "history_scope":"Latest bounded projection of this conversation (up to 80 observed messages / 60KB). It supersedes earlier versions of these messages; it is not a complete archive.","history":history,"trigger":m})
+       "history_scope":"Latest bounded projection of this conversation (up to 80 observed messages / 60KB). It supersedes earlier versions of these messages; it is not a complete archive. Orientation text_in_history references point to the full message here by channel, message ID and revision.","history":history,"trigger":m})
 }
 
 struct Peer {
@@ -710,7 +710,9 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     if prior_delivery.is_array() {
         diagnostic_input["prior_source_delivery"] = prior_delivery;
     }
+    crate::projection::compact(&mut diagnostic_input);
     let input = &diagnostic_input;
+    let projection = crate::projection::metadata(input, &format!("slack:{}", c.id), &init);
     let ambient = host_attention || optional_participation(c, input);
     let continuation = input.get("accepted_work_continuation").is_some();
     let instruction = if continuation {
@@ -773,8 +775,11 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
         crate::work_status::track_input(home, input)?;
     }
     let mut params = json!({"sessionId":sid,"prompt":blocks});
+    if let Some(projection) = &projection {
+        params["_meta"][crate::projection::META] = projection.clone();
+    }
     if let Some(offer) = &attention_offer {
-        params["_meta"] = json!({crate::attention::META:offer});
+        params["_meta"][crate::attention::META] = offer.clone();
     }
     let mut source_metadata = if deciding {
         None
@@ -1052,6 +1057,22 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 )?;
             }
             if deciding {
+                if output.trim().is_empty() {
+                    if !tool_observations_complete
+                        || !callbacks.is_empty()
+                        || tool_calls
+                            .values()
+                            .any(|u| !matches!(u["status"].as_str(), Some("completed" | "failed")))
+                    {
+                        return Err(crate::diagnostics::Failure::unsettled_terminal().into());
+                    }
+                    return Ok(Decision {
+                        decision: "pass".into(),
+                        text: String::new(),
+                        reason: "No contribution returned".into(),
+                        media: vec![],
+                    });
+                }
                 let choice: Value = serde_json::from_str(
                     output
                         .trim()
@@ -1091,6 +1112,9 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 media.clear();
                 media_omitted = false;
                 let mut params = json!({"sessionId":sid,"prompt":response_blocks});
+                if let Some(projection) = &projection {
+                    params["_meta"][crate::projection::META] = projection.clone();
+                }
                 source_metadata =
                     crate::submissions::prepare(&store, c, &init, input, &sid, &endpoint)?;
                 if let Some(metadata) = &source_metadata {
@@ -1124,7 +1148,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 output = "The agent returned attachment content.".into();
             }
             output = crate::followup::capture(home, c, input, &output)?;
-            let quiet_continuation = (continuation || huddle_delivery)
+            let quiet_continuation = (continuation || huddle_delivery || ambient)
                 && (output.trim().is_empty()
                     || parse_decision(&output).is_ok_and(|d| d.decision == "pass"));
             if quiet_continuation
@@ -1142,14 +1166,23 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 [input["job_id"].as_str().unwrap_or("")],
                 |r| r.get(0),
             )?;
-            let mut d = if quiet_continuation {
+            let mut d = if quiet_continuation
+                && ambient
+                && !continuation
+                && !huddle_delivery
+                && !output.trim().is_empty()
+            {
+                parse_decision(&output)?
+            } else if quiet_continuation {
                 Decision {
                     decision: "pass".into(),
                     text: String::new(),
                     reason: if huddle_delivery {
                         "Side-conversation delivery retained; no duplicate public reply"
-                    } else {
+                    } else if continuation {
                         "Accepted work inspected; no new public reply"
+                    } else {
+                        "No new public contribution"
                     }
                     .into(),
                     media: vec![],
@@ -1442,7 +1475,14 @@ pub fn parse_decision(text: &str) -> Result<Decision> {
         .or_else(|| s.strip_prefix("```"))
         .map(|v| v.trim().strip_suffix("```").unwrap_or(v).trim())
         .unwrap_or(s);
-    let d: Decision = serde_json::from_str(s).context(crate::diagnostics::Failure::answer())?;
+    let mut value: Value = serde_json::from_str(s).context(crate::diagnostics::Failure::answer())?;
+    // A pass has no public text. Providers sometimes spell the absent optional
+    // field as null; do not broaden this to speak, malformed JSON or extra keys.
+    if value["decision"] == "pass" && value.get("text") == Some(&Value::Null) {
+        value.as_object_mut().unwrap().remove("text");
+    }
+    let d: Decision =
+        serde_json::from_value(value).context(crate::diagnostics::Failure::answer())?;
     d.validate()
         .map_err(|e| e.context(crate::diagnostics::Failure::answer()))?;
     Ok(d)
@@ -1810,5 +1850,29 @@ mod participation_tests {
                 .text,
             "Yes"
         );
+    }
+}
+
+#[cfg(test)]
+mod quiet_decision_tests {
+    use super::*;
+    #[test]
+    fn pass_accepts_absent_or_null_text_but_never_public_text() {
+        for text in [
+            r#"{"decision":"pass","reason":"nothing new"}"#,
+            r#"{"decision":"pass","text":null,"reason":"nothing new"}"#,
+        ] {
+            assert_eq!(parse_decision(text).unwrap().decision, "pass");
+        }
+        for text in [
+            r#"{"decision":"speak","text":null}"#,
+            r#"{"decision":"pass","text":"do publish this"}"#,
+            r#"{"decision":"pass","text":42}"#,
+            r#"{"decision":"pass","unknown":true}"#,
+            r#"{"decision":"pass"}{"decision":"pass"}"#,
+            "",
+        ] {
+            assert!(parse_decision(text).is_err(), "{text}");
+        }
     }
 }

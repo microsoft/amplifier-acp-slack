@@ -568,7 +568,7 @@ fn messages(
             .or_else(|| message["bot_id"].as_str())
             .unwrap_or("unknown");
         let thread = message["thread_ts"].as_str().filter(|s| timestamp(s));
-        result.push(json!({"id":ts,"message_id":ts,"conversation_id":channel,"text":text,
+        result.push(json!({"id":ts,"message_id":ts,"revision":message["edited"]["ts"].as_str().unwrap_or(ts),"conversation_id":channel,"text":text,
             "actor":actor,"actor_id":actor,"at":ts,"url":links.message(channel,ts,thread),
             "thread_id":thread,"reply_count":message["reply_count"].as_u64().unwrap_or(0),
             "latest_reply":message["latest_reply"].as_str().filter(|s|timestamp(s)),"truncated":text_truncated,
