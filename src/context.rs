@@ -1184,10 +1184,9 @@ pub async fn mcp(
                     .extend(crate::huddles::tools());
             }
             if grant.job_id.is_some()
-                && crate::owner_message::offered(
+                && crate::owner_message::listed(
                     &config,
                     authority.origin.as_ref().is_some_and(|c| !c.direct),
-                    !grant.actor_bot,
                 )
             {
                 result["tools"]
@@ -1333,20 +1332,26 @@ pub async fn mcp(
                 let Some(job) = grant.job_id.as_deref() else {
                     return Err(ApiError::forbidden());
                 };
-                if !crate::owner_message::offered(
+                if !crate::owner_message::listed(
                     &config,
                     authority.origin.as_ref().is_some_and(|c| !c.direct),
-                    !grant.actor_bot,
                 ) {
                     return Err(ApiError::forbidden());
                 }
-                let value = crate::owner_message::call(
-                    &config,
-                    &state.home,
-                    job,
-                    &body["params"]["arguments"],
-                )
-                .await?;
+                // The tool is listed for every response in an eligible conversation,
+                // so that the list does not change with whoever spoke last. Who asked
+                // is decided here, before anything is opened or queued.
+                let value = if grant.actor_bot {
+                    crate::owner_message::refused_for_an_agent()
+                } else {
+                    crate::owner_message::call(
+                        &config,
+                        &state.home,
+                        job,
+                        &body["params"]["arguments"],
+                    )
+                    .await?
+                };
                 return Ok(rpc(
                     id,
                     json!({"content":[{"type":"text","text":value.to_string()}],"isError":value["accepted"]!=true,"structuredContent":value}),
