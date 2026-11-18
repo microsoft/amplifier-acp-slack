@@ -16,6 +16,213 @@ use tokio::{
     process::Command,
 };
 
+#[derive(Debug)]
+struct ConfirmationRefusal(&'static str);
+impl std::fmt::Display for ConfirmationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            "invalid_confirmation_format" => "Enter the confirmation code shown by Slack.",
+            "authorization_expired" => "That authorization attempt expired. Start authorization again.",
+            _ => "Slack refused that confirmation code and expired its ticket. Start authorization again.",
+        })
+    }
+}
+impl std::error::Error for ConfirmationRefusal {}
+fn helper_result(doc: Value) -> anyhow::Result<Value> {
+    if doc["ok"] == true {
+        return Ok(doc["result"].clone());
+    }
+    let refused = &doc["confirmation_refusal"];
+    if doc["ok"] == false && refused["schema"] == 1 && refused["action"] == "confirm" {
+        let code = match refused["code"].as_str() {
+            Some("invalid_confirmation_format") => Some("invalid_confirmation_format"),
+            Some("authorization_expired") => Some("authorization_expired"),
+            Some("invalid_challenge") => Some("invalid_challenge"),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return Err(ConfirmationRefusal(code).into());
+        }
+    }
+    anyhow::bail!(
+        "{}",
+        doc["error"]
+            .as_str()
+            .unwrap_or("Slack setup could not complete")
+    )
+}
+
+// GET reads only fixed owner-protected files. It never materializes a helper,
+// starts the Slack CLI, creates a ticket, repairs a path, or changes permissions.
+fn setup_file(home: &Path, relative: &str) -> anyhow::Result<Option<Value>> {
+    use anyhow::ensure;
+    use std::io::Read;
+    let path = home.join("secrets/slack-setup").join(relative);
+    let mut directory = home.to_owned();
+    // Legacy installations can have a readable home while their secrets subtree
+    // is private. Observe that root without repairing or tightening its policy.
+    let root = std::fs::symlink_metadata(home)?;
+    ensure!(
+        root.is_dir() && !root.file_type().is_symlink(),
+        "Unsafe connector home"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            root.uid() == unsafe { libc::geteuid() } && root.mode() & 0o022 == 0,
+            "Connector home is not owner-controlled"
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            root.file_attributes() & 0x400 == 0,
+            "Connector home is a reparse point"
+        );
+    }
+    for component in Path::new("secrets/slack-setup")
+        .join(relative)
+        .parent()
+        .unwrap()
+        .components()
+    {
+        directory.push(component);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(_) => amplifier_native_platform::validate_private_directory(&directory)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Unsafe saved Slack setup file"
+    );
+    crate::config::check_private(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= 1024 * 1024,
+        "Invalid saved Slack setup file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+            "Saved Slack setup file is not private"
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "Saved Slack setup file is a reparse point"
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 1024 * 1024,
+        "Saved Slack setup file exceeded its read bound"
+    );
+    let value: Value = serde_json::from_slice(&bytes)?;
+    ensure!(value.is_object(), "Saved Slack setup is malformed");
+    Ok(Some(value))
+}
+
+fn saved_setup_summary(home: &Path) -> anyhow::Result<Value> {
+    use anyhow::ensure;
+    let credentials = setup_file(home, "auth/credentials.json")?.unwrap_or(json!({}));
+    let mut entries = Vec::new();
+    for entry in credentials
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|v| v.is_object())
+    {
+        if let Some(token) = entry.get("token") {
+            ensure!(
+                token.is_string() || token.is_null(),
+                "Malformed saved Slack authorization"
+            );
+            if token.as_str().is_some_and(|v| !v.is_empty()) {
+                entries.push(entry);
+            }
+        }
+    }
+    let mut result =
+        json!({"authorized":false,"authorization":"missing","authorization_pending":false});
+    if entries.len() == 1 {
+        let auth = entries[0];
+        let team = auth["team_id"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Saved Slack authorization has no workspace"))?;
+        let workspace = auth
+            .get("team_domain")
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Malformed saved Slack workspace"))
+            })
+            .transpose()?
+            .unwrap_or(team);
+        result = json!({"authorized":true,"authorization":"managed","authorization_pending":false,"team_id":team,"workspace":workspace});
+    }
+    let health = setup_file(home, "authorization-health.json")?.unwrap_or(json!({}));
+    if result["authorized"] == true && health["state"] == "needs_attention" {
+        result["authorization"] = json!("needs_attention");
+        result["authorization_issue"] =
+            json!("Saved Slack authorization needs attention. Reconnect through the guided flow.");
+    }
+    let pending = setup_file(home, "pending.json")?.unwrap_or(json!({}));
+    let seconds = pending
+        .get("expires_at")
+        .map(|v| {
+            v.as_f64()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| anyhow::anyhow!("Malformed pending Slack authorization"))
+        })
+        .transpose()?
+        .unwrap_or(0.0);
+    if seconds > crate::model::now_ms() as f64 / 1000.0 {
+        let ticket = pending["ticket"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Pending Slack authorization has no ticket"))?;
+        ensure!(
+            !ticket.is_empty()
+                && ticket.len() <= 1024
+                && ticket
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_+/=.-".contains(&b)),
+            "Invalid pending Slack authorization ticket"
+        );
+        result["authorization_pending"] = json!(true);
+        result["authorization_command"] =
+            json!({"command":format!("/slackauthticket {ticket}"),"expires_at":seconds});
+    }
+    Ok(result)
+}
+
 pub fn configured(home: &Path) -> bool {
     home.join("secrets/slack-setup/auth/credentials.json")
         .exists()
@@ -67,26 +274,27 @@ pub async fn helper(home: &Path, action: &str, body: Value) -> anyhow::Result<Va
             "Slack setup helper could not run"
         );
         let doc: Value = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(
-            doc["ok"] == true,
-            "{}",
-            doc["error"]
-                .as_str()
-                .unwrap_or("Slack setup could not complete")
-        );
-        Ok::<_, anyhow::Error>(doc["result"].clone())
+        helper_result(doc)
     })
     .await;
     result.map_err(|_| {
         anyhow::anyhow!(
-            "Slack setup timed out. Retry; saved authorization and app identity are preserved."
+            "Slack setup timed out; its outcome is not confirmed. Check saved setup before continuing."
         )
     })?
 }
 
-pub async fn get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+pub async fn get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<(HeaderMap, Json<Value>)> {
     auth::check(&state, &headers, "admin", false)?;
-    Ok(Json(setup_status(&state).await?))
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        "no-store".parse().unwrap(),
+    );
+    Ok((response_headers, Json(setup_status(&state).await?)))
 }
 
 fn connection_ready(state: &AppState) -> bool {
@@ -153,10 +361,7 @@ fn workspace(team: &str, detail: &str, text: &str) -> Value {
 }
 
 async fn setup_status(state: &AppState) -> anyhow::Result<Value> {
-    Ok(describe_setup(
-        state,
-        helper(&state.home, "status", json!({})).await?,
-    ))
+    Ok(describe_setup(state, saved_setup_summary(&state.home)?))
 }
 
 fn update_image(state: &Arc<AppState>) {
@@ -211,13 +416,26 @@ pub async fn action(
         return Ok(Json(describe_setup(&state, result)));
     }
     if body.action != "connect" {
-        let mut result = helper(
+        let response = helper(
             &state.home,
             &body.action,
             json!({"challenge":body.challenge,"team_id":c.slack.team_id,"team_name":c.slack.workspace_name}),
-        )
-        .await
-        .map_err(|e| ApiError::bad(e.to_string()))?;
+        ).await;
+        let mut result = match response {
+            Ok(value) => value,
+            Err(error) => {
+                if body.action == "confirm"
+                    && let Some(refusal) = error.downcast_ref::<ConfirmationRefusal>()
+                {
+                    let mut value = setup_status(&state).await?;
+                    let current = state.instance_config();
+                    value["confirmation_refusal"] = json!({"schema":1,"action":"confirm","code":refusal.0,"id":current.id,"config_revision":current.revision});
+                    value["message"] = json!(refusal.to_string());
+                    return Ok(Json(value));
+                }
+                return Err(ApiError::bad(error.to_string()));
+            }
+        };
         if body.action == "confirm" {
             let _ = std::fs::remove_file(state.home.join("secrets/portrait-disabled"));
             state.event(
@@ -748,5 +966,215 @@ if '--challenge' in sys.argv:
             before
         );
         assert_eq!(state.instance_config().slack.app_id, "AEXISTING");
+    }
+    #[test]
+    fn saved_status_is_read_only_and_retains_only_transient_pending_command() {
+        let (_home, state, _) = fresh("", "");
+        let directory = state.home.join("secrets/slack-setup");
+        let empty = saved_setup_summary(&state.home).unwrap();
+        assert_eq!(empty["authorization"], "missing");
+        assert!(!directory.exists());
+        let path = directory.join("pending.json");
+        private_write(&path, serde_json::to_vec(&json!({"ticket":"fixed-ticket","expires_at":crate::model::now_ms() as f64/1000.0+600.0})).unwrap().as_slice()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let first = saved_setup_summary(&state.home).unwrap();
+        let second = saved_setup_summary(&state.home).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["authorization_pending"], true);
+        assert_eq!(
+            first["authorization_command"]["command"],
+            "/slackauthticket fixed-ticket"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!state.home.join("secrets/slack-setup-helper.py").exists());
+        assert!(!directory.join("owner.lock").exists());
+        private_write(&path, br#"{"ticket":"expired-ticket","expires_at":0}"#).unwrap();
+        let expired = saved_setup_summary(&state.home).unwrap();
+        assert_eq!(expired["authorization_pending"], false);
+        assert!(expired.get("authorization_command").is_none());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn saved_status_refuses_malformed_or_unsafe_files_instead_of_missing() {
+        let (_home, state, _) = fresh("", "");
+        let path = state.home.join("secrets/slack-setup/pending.json");
+        for bytes in [
+            b"{".as_slice(),
+            b"[]",
+            br#"{"expires_at":"future"}"#,
+            br#"{"expires_at":999999999999,"ticket":"bad ticket"}"#,
+        ] {
+            private_write(&path, bytes).unwrap();
+            assert!(saved_setup_summary(&state.home).is_err());
+        }
+        private_write(&path, &vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(saved_setup_summary(&state.home).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            std::fs::remove_file(&path).unwrap();
+            let elsewhere = state.home.join("outside.json");
+            private_write(&elsewhere, b"{}").unwrap();
+            symlink(&elsewhere, &path).unwrap();
+            assert!(saved_setup_summary(&state.home).is_err());
+            std::fs::remove_file(&path).unwrap();
+            private_write(&path, b"{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(saved_setup_summary(&state.home).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_command_requires_admin_authentication() {
+        let (_home, state, headers) = fresh("", "");
+        private_write(&state.home.join("secrets/slack-setup/pending.json"),serde_json::to_vec(&json!({"ticket":"private-ticket","expires_at":crate::model::now_ms() as f64/1000.0+600.0})).unwrap().as_slice()).unwrap();
+        assert!(get(State(state.clone()), HeaderMap::new()).await.is_err());
+        let (response_headers, Json(result)) = get(State(state.clone()), headers).await.unwrap();
+        assert_eq!(
+            response_headers[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        assert_eq!(
+            result["authorization_command"]["command"],
+            "/slackauthticket private-ticket"
+        );
+        assert!(!state.home.join("secrets/slack-setup-helper.py").exists());
+    }
+
+    #[test]
+    fn only_exact_helper_refusal_envelope_preserves_typed_confirmation() {
+        for code in [
+            "invalid_confirmation_format",
+            "authorization_expired",
+            "invalid_challenge",
+        ] {
+            let error=helper_result(json!({"ok":false,"error":"must not be reflected","confirmation_refusal":{"schema":1,"action":"confirm","code":code}})).unwrap_err();
+            assert_eq!(error.downcast_ref::<ConfirmationRefusal>().unwrap().0, code);
+            assert!(!error.to_string().contains("must not be reflected"));
+        }
+        for doc in [
+            json!({"ok":false,"error":"generic"}),
+            json!({"ok":false,"confirmation_refusal":{"schema":1,"action":"connect","code":"invalid_challenge"}}),
+            json!({"ok":false,"confirmation_refusal":{"schema":2,"action":"confirm","code":"invalid_challenge"}}),
+            json!({"ok":false,"confirmation_refusal":{"schema":1,"action":"confirm","code":"other"}}),
+        ] {
+            assert!(
+                helper_result(doc)
+                    .unwrap_err()
+                    .downcast_ref::<ConfirmationRefusal>()
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn saved_status_matches_helper_summary_without_launching_it_on_get() {
+        for (credentials, pending) in [
+            (json!({}), json!({})),
+            (json!({}), json!({"ticket":"expired","expires_at":0})),
+            (
+                json!({}),
+                json!({"ticket":"pending","expires_at":crate::model::now_ms() as f64/1000.0+600.0}),
+            ),
+            (
+                json!({"TONE":{"token":"private-never-output","refresh_token":"private-refresh","team_id":"TONE","team_domain":"one"}}),
+                json!({}),
+            ),
+        ] {
+            let (_home, state, _) = fresh("", "");
+            private_write(
+                &state.home.join("secrets/slack-setup/auth/credentials.json"),
+                serde_json::to_vec(&credentials).unwrap().as_slice(),
+            )
+            .unwrap();
+            private_write(
+                &state.home.join("secrets/slack-setup/pending.json"),
+                serde_json::to_vec(&pending).unwrap().as_slice(),
+            )
+            .unwrap();
+            let old = helper(&state.home, "status", json!({})).await.unwrap();
+            let mut new = saved_setup_summary(&state.home).unwrap();
+            new.as_object_mut().unwrap().remove("authorization_command");
+            assert_eq!(old, new);
+            assert!(!new.to_string().contains("private-never-output"));
+            assert!(!new.to_string().contains("private-refresh"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn actual_helper_known_confirmation_refusal_is_typed_but_generic_nonzero_is_not() {
+        use sha2::{Digest, Sha256};
+        for known in [false, true] {
+            let (_home, state, headers) = fresh("", "");
+            let folder = approving_cli(&state, "TONE", "one");
+            private_write(
+                &folder.join("auth/credentials.json"),
+                br#"{"TOLD":{"team_id":"TOLD","token":"preserved"}}"#,
+            )
+            .unwrap();
+            let before = std::fs::read(folder.join("auth/credentials.json")).unwrap();
+            let output = if known {
+                "The following error was returned by the apps.hosted.exchangeAuthTicket Slack API method\nThe challenge code is invalid (invalid_challenge)"
+            } else {
+                "generic invalid_challenge failure"
+            };
+            let script = format!(
+                "#!/usr/bin/env python3\nimport sys\nprint({:?},file=sys.stderr)\nraise SystemExit(1)\n",
+                output
+            );
+            let binary = folder.join("bin/slack");
+            private_write(&binary, script.as_bytes()).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            private_write(&folder.join("cli.json"),serde_json::to_vec(&json!({"version":"4.12.0","sha256":format!("{:x}",Sha256::digest(script.as_bytes()))})).unwrap().as_slice()).unwrap();
+            let result = action(
+                State(state.clone()),
+                headers,
+                request("confirm", "fixture-code", ""),
+            )
+            .await;
+            if known {
+                let value = result.unwrap().0;
+                assert_eq!(value["confirmation_refusal"]["code"], "invalid_challenge");
+                assert_eq!(
+                    value["confirmation_refusal"]["id"],
+                    state.instance_config().id
+                );
+                assert!(!folder.join("pending.json").exists());
+            } else {
+                assert!(result.is_err());
+                assert!(folder.join("pending.json").exists());
+            }
+            assert_eq!(
+                std::fs::read(folder.join("auth/credentials.json")).unwrap(),
+                before
+            );
+            assert!(!folder.join("project").exists());
+            assert!(!state.instance_config().setup_complete);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn legacy_readable_home_keeps_its_policy_while_secrets_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_home, state, _) = fresh("", "");
+        std::fs::set_permissions(&state.home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            saved_setup_summary(&state.home).unwrap()["authorization"],
+            "missing"
+        );
+        assert_eq!(
+            std::fs::metadata(&state.home).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::set_permissions(
+            state.home.join("secrets"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(saved_setup_summary(&state.home).is_err());
     }
 }

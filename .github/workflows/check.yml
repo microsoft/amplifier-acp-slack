@@ -74,6 +74,7 @@ jobs:
         working-directory: ui/tests
       - run: npm test
         working-directory: ui/tests
+      - run: node tests/native-update-ui.mjs
   native:
     strategy:
       fail-fast: false
@@ -122,6 +123,7 @@ jobs:
       - run: python tests/slack_setup.py
       - run: python tests/native_update.py
       - run: python tests/native_startup_observation.py
+      - run: python tests/native_update_process.py --self-test
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package private runtime and verify platform binary
         shell: bash
@@ -146,12 +148,16 @@ jobs:
           python tests/native_launch.py --package "$ARCHIVE" --verify-setup-tool $EXTRA --result ${{ matrix.target }}-native-launch-result.json
           python tests/native_update_process.py --package "$ARCHIVE" --result ${{ matrix.target }}-native-update-result.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: native-slack-${{ matrix.target }}-${{ github.sha }}
           path: |
             dist/*
             *-native-launch-result.json
+            *-native-manager-result.json
             *-native-update-result.json
+            *-native-update-result-managed.json
+            *-native-update-result.phases.json
           if-no-files-found: error
   publish:
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'microsoft/amplifier-acp-slack'

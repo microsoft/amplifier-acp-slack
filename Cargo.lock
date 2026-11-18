@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acp-slack-adapter"
-version = "0.17.12"
+version = "0.18.0"
 dependencies = [
  "amplifier-acp-connection",
  "amplifier-native-platform",
@@ -143,13 +143,15 @@ dependencies = [
 [[package]]
 name = "amplifier-native-platform"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/amplifier-constellation?rev=9fb0d7c3472b99b4fe2846caf81739fe29b1be9a#9fb0d7c3472b99b4fe2846caf81739fe29b1be9a"
+source = "git+https://github.com/microsoft/amplifier-constellation?rev=836738e04b436ddd4bc3751c49671440e10ed12a#836738e04b436ddd4bc3751c49671440e10ed12a"
 dependencies = [
  "anyhow",
  "argon2",
  "hmac",
  "libc",
  "rand_core 0.6.4",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "url",
  "uuid",

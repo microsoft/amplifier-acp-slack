@@ -40,6 +40,34 @@ class SetupError(Exception):
     pass
 
 
+class ConfirmationRefusal(SetupError):
+    """An exact local validation or completed ticket-exchange rejection."""
+    MESSAGES = {
+        'invalid_confirmation_format': 'Enter the confirmation code shown by Slack.',
+        'authorization_expired': 'That authorization attempt expired. Start authorization again.',
+        'invalid_challenge': 'Slack refused that confirmation code and expired its ticket. Start authorization again.',
+    }
+
+    def __init__(self, code):
+        super().__init__(self.MESSAGES[code])
+        self.code = code
+
+
+def explicit_invalid_challenge(result, args, auth_dir):
+    # Pinned Slack CLI 4.12.0: ExchangeAuthTicket returns its API error before
+    # saveNewAuth. Match that method and exact known heading, not a substring
+    # echoed by a generic failure. Any credential output contradicts refusal.
+    if (result.returncode <= 0 or len(args) != 6 or args[:2] != ('auth', 'login')
+            or args[2] != '--ticket' or args[4] != '--challenge' or auth_dir is None
+            or os.path.lexists(auth_dir / 'credentials.json')):
+        return False
+    output = result.stdout + result.stderr
+    lines = {line.strip() for line in output.splitlines()}
+    return ('The following error was returned by the apps.hosted.exchangeAuthTicket Slack API method' in lines
+            and 'The challenge code is invalid (invalid_challenge)' in lines
+            and set(re.findall(r'\(([a-z][a-z0-9_]+)\)', output)) == {'invalid_challenge'})
+
+
 def read(path, default=None):
     return json.loads(path.read_text()) if path.exists() else default
 
@@ -110,6 +138,8 @@ def cli(folder, *args, cwd=None, auth_dir=None):
                             input='', text=True, capture_output=True, timeout=120, **window)
     output = result.stdout + result.stderr
     if result.returncode:
+        if explicit_invalid_challenge(result, args, auth_dir):
+            raise ConfirmationRefusal('invalid_challenge')
         for code, explanation in [
             ('app_approval_request_pending', 'The app is awaiting Slack administrator approval. After approval, choose Connect again.'),
             ('app_approval_request_eligible', 'Slack requires administrator approval for this app. Ask your workspace administrator to approve it, then retry.'),
@@ -234,13 +264,24 @@ def execute(home, action, body):
             pending = read(folder / 'pending.json', {})
             challenge = body.get('challenge', '').strip()
             if pending.get('expires_at', 0) <= time.time():
-                raise SetupError('That authorization attempt expired. Start authorization again.')
+                raise ConfirmationRefusal('authorization_expired')
             if not re.fullmatch(r'[A-Za-z0-9_-]{4,256}', challenge):
-                raise SetupError('Enter the confirmation code Slack showed after you approved access.')
+                raise ConfirmationRefusal('invalid_confirmation_format')
             staging = folder / 'pending-auth'
             staging.mkdir(mode=0o700, exist_ok=True)
             (staging / 'credentials.json').unlink(missing_ok=True)
-            cli(folder, 'auth', 'login', '--ticket', pending['ticket'], '--challenge', challenge, auth_dir=staging)
+            try:
+                cli(folder, 'auth', 'login', '--ticket', pending['ticket'], '--challenge', challenge, auth_dir=staging)
+            except ConfirmationRefusal as error:
+                if error.code != 'invalid_challenge' or os.path.lexists(staging / 'credentials.json'):
+                    raise SetupError('Slack authorization was not confirmed. Check saved setup before continuing.')
+                # This known Slack rejection expires this ticket. Retire only
+                # the exact pending ticket under our existing installation lock;
+                # creating a replacement still requires explicit authorize.
+                if read(folder / 'pending.json', {}) != pending:
+                    raise SetupError('Slack authorization changed. Check saved setup before continuing.')
+                (folder / 'pending.json').unlink()
+                raise
             auth = authorization(folder, staging)
             if body.get('team_id') and auth['team_id'] != body['team_id']:
                 # Slack consumed the ticket for this approval. Drop both, so the next
@@ -293,6 +334,8 @@ def main():
         request = json.load(sys.stdin)
         value = execute(Path(sys.argv[1]), request['action'], request.get('body', {}))
         print(json.dumps({'ok': True, 'result': value}))
+    except ConfirmationRefusal as error:
+        print(json.dumps({'ok': False, 'error': str(error), 'confirmation_refusal': {'schema': 1, 'action': 'confirm', 'code': error.code}}))
     except SetupError as error:
         print(json.dumps({'ok': False, 'error': str(error)}))
     except Exception:

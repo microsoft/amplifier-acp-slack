@@ -43,6 +43,32 @@ class SetupChildTests(unittest.TestCase):
                     if platform=='win32':self.assertEqual(kwargs['creationflags'],0x08000000)
                     else:self.assertNotIn('creationflags',kwargs)
 
+class ConfirmationRefusalTests(unittest.TestCase):
+    exact = ('The following error was returned by the apps.hosted.exchangeAuthTicket Slack API method\n\n'
+             'The challenge code is invalid (invalid_challenge)\n')
+    def test_only_exact_completed_exchange_rejection_is_typed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary); args=('auth','login','--ticket','fixture-ticket','--challenge','fixture-code')
+            result=SimpleNamespace(returncode=1,stdout='',stderr=self.exact)
+            self.assertTrue(s.explicit_invalid_challenge(result,args,folder))
+            for output in ['invalid_challenge', 'example '+self.exact,
+                           self.exact.replace('apps.hosted.exchangeAuthTicket','other.method'),
+                           self.exact+'Another failure (request_timeout)\n']:
+                with self.subTest(output=output):self.assertFalse(s.explicit_invalid_challenge(SimpleNamespace(returncode=1,stdout='',stderr=output),args,folder))
+            for code in [0,-9]:self.assertFalse(s.explicit_invalid_challenge(SimpleNamespace(returncode=code,stdout='',stderr=self.exact),args,folder))
+            self.assertFalse(s.explicit_invalid_challenge(result,('deploy',),folder))
+            (folder/'credentials.json').write_text('{}')
+            self.assertFalse(s.explicit_invalid_challenge(result,args,folder))
+
+    def test_cli_preserves_generic_unknowns_and_never_returns_raw_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary)
+            for output,kind in [(self.exact,s.ConfirmationRefusal),('private external failure invalid_challenge',s.SetupError)]:
+                with self.subTest(known=kind is s.ConfirmationRefusal), patch.object(s,'ensure_cli',return_value=folder/'slack'), patch.object(s.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr=output)):
+                    with self.assertRaises(kind) as error:s.cli(folder,'auth','login','--ticket','fixture-ticket','--challenge','fixture-code',auth_dir=folder/'pending-auth')
+                    if kind is s.SetupError:self.assertNotIsInstance(error.exception,s.ConfirmationRefusal)
+                    self.assertNotIn('private external failure',str(error.exception))
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -86,6 +112,30 @@ class SetupTests(unittest.TestCase):
         self.assertFalse((self.folder/'pending.json').exists())
         for p in self.folder.rglob('*.json'):
             self.assertNotIn('secret-code',p.read_text())
+
+    def test_invalid_format_and_expiry_refuse_without_cli_dispatch(self):
+        self.auth();saved=(self.folder/'auth/credentials.json').read_bytes()
+        s.execute(self.home,'authorize',{});pending=(self.folder/'pending.json').read_bytes();calls=list(self.calls)
+        with self.assertRaises(s.ConfirmationRefusal) as error:s.execute(self.home,'confirm',{'challenge':'bad code with spaces'})
+        self.assertEqual(error.exception.code,'invalid_confirmation_format');self.assertEqual(calls,self.calls)
+        self.assertEqual(pending,(self.folder/'pending.json').read_bytes());self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        s.write(self.folder/'pending.json',{'ticket':'expired','expires_at':0})
+        with self.assertRaises(s.ConfirmationRefusal) as error:s.execute(self.home,'confirm',{'challenge':'code'})
+        self.assertEqual(error.exception.code,'authorization_expired');self.assertEqual(calls,self.calls)
+
+    def test_known_invalid_challenge_retires_only_exact_pending_and_new_authorize_is_explicit(self):
+        self.auth();saved=(self.folder/'auth/credentials.json').read_bytes();s.execute(self.home,'authorize',{})
+        def refused(*args,**kwargs):raise s.ConfirmationRefusal('invalid_challenge')
+        calls=list(self.calls)
+        with patch.object(s,'cli',refused), self.assertRaises(s.ConfirmationRefusal):s.execute(self.home,'confirm',{'challenge':'wrong-code'})
+        self.assertFalse((self.folder/'pending.json').exists());self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes());self.assertEqual(calls,self.calls)
+        self.assertFalse((self.folder/'project').exists());self.assertEqual(self.created,0)
+        s.execute(self.home,'authorize',{});self.assertEqual(len(self.calls),len(calls)+1)
+
+    def test_generic_confirmation_timeout_preserves_pending_and_saved_access(self):
+        self.auth();saved=(self.folder/'auth/credentials.json').read_bytes();s.execute(self.home,'authorize',{});pending=(self.folder/'pending.json').read_bytes()
+        with patch.object(s,'cli',side_effect=s.subprocess.TimeoutExpired('fixture',120)), self.assertRaises(s.subprocess.TimeoutExpired):s.execute(self.home,'confirm',{'challenge':'code'})
+        self.assertEqual(pending,(self.folder/'pending.json').read_bytes());self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes());self.assertEqual(self.created,0)
 
     def test_wrong_workspace_reauthorization_preserves_previous_credentials(self):
         self.auth()

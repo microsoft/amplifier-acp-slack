@@ -31,7 +31,7 @@ pub fn default_home() -> Result<PathBuf> {
 /// the same create-only bundle path as first launch, without serving or opening
 /// a browser. Keep private first-account/control capabilities out of the result.
 pub fn setup(home: &Path) -> Result<Value> {
-    create(home)?;
+    create_inner(home, true)?;
     let home = std::fs::canonicalize(home)?;
     let config = Config::load(&home)?;
     let executable = home.join("bin").join(if cfg!(windows) {
@@ -57,6 +57,9 @@ pub fn setup(home: &Path) -> Result<Value> {
 }
 
 pub fn create(home: &Path) -> Result<()> {
+    create_inner(home, false)
+}
+fn create_inner(home: &Path, managed: bool) -> Result<()> {
     ensure!(
         !home.exists(),
         "This folder already exists; choose a new installation folder"
@@ -76,9 +79,13 @@ pub fn create(home: &Path) -> Result<()> {
         config.server.auth_mode = AuthMode::LocalPassword;
         config.server.web_transport = WebTransport::LocalHttp;
         config.save(&stage)?;
+        let mut marker = json!({"schema":1,"id":config.id,"update_owner":"installation"});
+        if managed {
+            marker["manager_owner"] = json!(crate::native_manager::OWNER);
+        }
         platform::private_create(
             &stage.join("native-installation.json"),
-            &serde_json::to_vec(&json!({"schema":1,"id":config.id,"update_owner":"installation"}))?,
+            &serde_json::to_vec(&marker)?,
         )?;
         platform::copy_self(&APPLICATION, &stage)?;
         install_support(&stage)?;
@@ -109,6 +116,28 @@ pub async fn launch(home: PathBuf, open_browser: bool) -> Result<()> {
         create(&home)?;
     }
     let config = Config::load(&home)?;
+    if crate::native_manager::is_managed(&home)? {
+        let observed = crate::native_manager::status(&home).await?;
+        let result = if observed["state"] == "ready" {
+            observed
+        } else {
+            ensure!(
+                matches!(
+                    observed["state"].as_str(),
+                    Some("inactive" | "not_registered")
+                ),
+                "Native connector startup is unresolved; inspect the original request instead of starting another one"
+            );
+            crate::native_manager::start(&home, uuid::Uuid::new_v4(), None).await?
+        };
+        ensure!(
+            result["state"] == "ready"
+                && result["request_current"] == true
+                && result["launch_observed"] == true,
+            "Native connector startup is not confirmed; inspect native-status and retain the request identity"
+        );
+        return ready(&home, &Config::load(&home)?, open_browser);
+    }
     let lock_path = home.join("service.lock");
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -202,6 +231,10 @@ pub fn ready(home: &Path, config: &Config, open_browser: bool) -> Result<()> {
     Ok(())
 }
 pub fn set_startup(home: &Path, enabled: bool) -> Result<()> {
+    ensure!(
+        !crate::native_manager::is_managed(home)?,
+        "This connector uses its own native manager with startup at sign-in off. Changing that preference is not yet supported; its existing service was preserved."
+    );
     let config = Config::load(home)?;
     ensure!(
         config.server.auth_mode == AuthMode::LocalPassword,
@@ -230,6 +263,11 @@ pub async fn startup_get(
     headers: HeaderMap,
 ) -> crate::error::ApiResult<Json<Value>> {
     auth::check(&state, &headers, "admin", false)?;
+    if crate::native_manager::is_managed(&state.home)? {
+        return Ok(Json(
+            json!({"configured":false,"change_supported":false,"manager_owner":crate::native_manager::OWNER,"reason":"Startup at sign-in is off. This manager profile does not yet support changing that preference."}),
+        ));
+    }
     let status = std::fs::read(state.home.join("startup.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -244,6 +282,17 @@ pub async fn startup_set(
     auth::check(&state, &headers, "admin", true)?;
     set_startup(&state.home, input.enabled)?;
     Ok(Json(json!({"configured":input.enabled})))
+}
+
+// Slack's fixed setup POST owns a 180-second helper. Its reply envelope must
+// allow that owner to finish and serialize its response; all other routes keep
+// their existing 90-second transport bound. This never repeats a request.
+fn local_api_timeout(method: &str, path: &str) -> Duration {
+    Duration::from_secs(if method == "POST" && path == "setup/slack" {
+        180 + 10
+    } else {
+        90
+    })
 }
 
 pub async fn local_api(
@@ -262,7 +311,7 @@ pub async fn local_api(
     let token = std::fs::read_to_string(token_path)?;
     if config.server.web_transport == WebTransport::LocalHttp {
         return tokio::time::timeout(
-            Duration::from_secs(90),
+            local_api_timeout(method, path),
             proved_local_api(&config, token.trim(), method, path, body),
         )
         .await
@@ -282,7 +331,7 @@ pub async fn local_api(
         .context("Missing local certificate")?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(90))
+        .timeout(local_api_timeout(method, path))
         .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(
             certificate,
         )?)?)
@@ -503,14 +552,38 @@ fn copy_runtime_contents(
 
 #[cfg(test)]
 mod api_result_tests {
-    use super::api_result;
+    use super::{api_result, local_api_timeout};
     use axum::http::StatusCode;
     use serde_json::json;
+    use std::time::Duration;
 
     fn error(path: &str, status: StatusCode, body: &[u8]) -> String {
         api_result("GET", path, status, body)
             .unwrap_err()
             .to_string()
+    }
+    #[test]
+    fn only_fixed_slack_setup_post_carries_the_helper_response_envelope() {
+        assert_eq!(
+            local_api_timeout("POST", "setup/slack"),
+            Duration::from_secs(190)
+        );
+        for (method, path) in [
+            ("GET", "setup/slack"),
+            ("PUT", "setup/slack"),
+            ("POST", "setup/slack/"),
+            ("POST", "setup/slack?retry=1"),
+            ("POST", "setup/complete"),
+            ("POST", "native-update"),
+            ("GET", "status"),
+            ("post", "setup/slack"),
+        ] {
+            assert_eq!(
+                local_api_timeout(method, path),
+                Duration::from_secs(90),
+                "unexpected extended route {method} {path}"
+            );
+        }
     }
     #[test]
     fn a_wrong_path_reports_its_status_and_how_paths_are_written() {

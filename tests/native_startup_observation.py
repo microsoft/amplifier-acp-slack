@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import ntpath
 from pathlib import Path
 import plistlib
 import subprocess
@@ -25,6 +26,33 @@ spec.loader.exec_module(m)
 
 
 class FixtureTests(unittest.TestCase):
+    def test_exact_path_identity_refuses_copy_hardlink_and_missing_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            original=Path(folder)/'original';original.write_bytes(b'fixture')
+            copied=Path(folder)/'copy';copied.write_bytes(original.read_bytes())
+            self.assertTrue(m.exact_path_identity(original,original.parent/'.'/original.name))
+            self.assertFalse(m.exact_path_identity(original,copied))
+            linked=Path(folder)/'hardlink';os.link(original,linked)
+            self.assertTrue(os.path.samefile(original,linked))
+            self.assertFalse(m.exact_path_identity(original,linked),'A different hardlink path must not gain authority')
+            with self.assertRaises(FileNotFoundError):m.exact_path_identity(original,Path(folder)/'missing')
+
+    def test_exact_path_identity_windows_spelling_still_requires_resolved_path_and_file(self):
+        def resolve(value):
+            return types.SimpleNamespace(resolve=lambda *,strict: value if strict else self.fail('resolution must be strict'))
+        pairs=[(r'C:\Users\RUNNER~1\home',r'C:\Users\runneradmin\home',False),
+               (r'\\?\C:\Users\runneradmin\home',r'C:\Users\RUNNERADMIN\home',True),
+               (r'\\?\UNC\server\share\home',r'\\server\share\home',True),
+               (r'\\.\C:\Users\runneradmin\home',r'C:\Users\runneradmin\home',False),
+               (r'C:\Users\runneradmin\other',r'C:\Users\runneradmin\home',False)]
+        with patch.object(m,'Path',side_effect=resolve),patch.object(m.os,'name','nt'),patch.object(m.os.path,'normcase',side_effect=ntpath.normcase),patch.object(m.os.path,'samefile',return_value=True) as same:
+            for first,second,expected in pairs:
+                with self.subTest(first=first,second=second):self.assertEqual(m.exact_path_identity(first,second),expected)
+            same.return_value=False
+            self.assertFalse(m.exact_path_identity(r'\\?\C:\home',r'C:\home'),'Equal path spelling is not file identity')
+        # Real Windows Path.resolve must resolve short names first. This pure
+        # boundary does not pretend unmatched RUNNER~1 spelling is canonical.
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -181,5 +209,32 @@ class FixtureTests(unittest.TestCase):
         good=self.encoded(self.owned).decode()
         for encoded in ['!!!!',self.owned['xml']+'=',base64.b64encode(b'\xff').decode()]:
             with self.subTest(encoded=encoded),self.assertRaises(ValueError):m.parse_startup_observation(good.replace(self.owned['xml'],encoded))
+
+
+    def test_managed_failed_setup_retains_partial_home_without_cleanup_or_retry(self):
+        root=self.root/'managed-retained';home=root/'installation';home.mkdir(parents=True);(home/'partial').write_bytes(b'keep')
+        process=types.SimpleNamespace(pid=991,returncode=1,communicate=lambda timeout:(b'',b'refused'))
+        result=self.root/'test-native-launch-result.json'
+        with patch.object(m.tempfile,'mkdtemp',return_value=str(root)),patch.object(m.subprocess,'Popen',return_value=process) as launch,patch.object(m.shutil,'rmtree') as remove:
+            with self.assertRaises(AssertionError):m.managed_lifecycle(self.home/'bin/acp-slack-adapter',{},result)
+            launch.assert_called_once();remove.assert_not_called()
+        self.assertEqual((home/'partial').read_bytes(),b'keep')
+        saved=json.loads(result.with_name('test-native-manager-result.json').read_text());self.assertFalse(saved['passed']);self.assertTrue(saved['retained_home'])
+
+    def test_managed_setup_timeout_reaps_only_caller_and_retains_unknown(self):
+        root=self.root/'managed-unknown';home=root/'installation';home.mkdir(parents=True);(home/'partial').write_bytes(b'keep')
+        class Unknown:
+            pid=992;returncode=None;calls=0;killed=False
+            def communicate(self,timeout):
+                self.calls+=1
+                if self.calls==1:raise subprocess.TimeoutExpired(['fixture-setup'],timeout)
+                self.returncode=-9;return b'',b''
+            def kill(self):self.killed=True
+        process=Unknown();result=self.root/'unknown-native-launch-result.json'
+        with patch.object(m.tempfile,'mkdtemp',return_value=str(root)),patch.object(m.subprocess,'Popen',return_value=process) as launch,patch.object(m.shutil,'rmtree') as remove:
+            with self.assertRaises(subprocess.TimeoutExpired):m.managed_lifecycle(self.home/'bin/acp-slack-adapter',{},result)
+            launch.assert_called_once();remove.assert_not_called()
+        self.assertTrue(process.killed);self.assertEqual(process.calls,2);self.assertEqual((home/'partial').read_bytes(),b'keep')
+        saved=json.loads(result.with_name('unknown-native-manager-result.json').read_text());self.assertEqual(saved['events'][0]['outcome'],'unknown');self.assertFalse(saved['action_retry'])
 
 if __name__ == '__main__':unittest.main()

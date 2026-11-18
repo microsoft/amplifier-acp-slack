@@ -21,6 +21,18 @@ import xml.etree.ElementTree as ET
 import zipfile
 import uuid
 
+def exact_path_identity(first,second):
+    """Same resolved path AND file; spelling normalization is Windows-only."""
+    a,b=Path(first).resolve(strict=True),Path(second).resolve(strict=True)
+    def key(path):
+        value=str(path)
+        if os.name=='nt':
+            if value.startswith('\\\\?\\UNC\\'):value='\\\\'+value[8:]
+            elif value.startswith('\\\\?\\'):value=value[4:]
+            value=os.path.normcase(value)
+        return value
+    return key(a)==key(b) and os.path.samefile(a,b)
+
 def run_startup_query(powershell,query,env):
     print('startup-inspection: before-powershell',file=sys.stderr,flush=True)
     try:
@@ -204,7 +216,7 @@ def finite_setup(binary,root,env):
     config=json.loads((home/'adapter.json').read_text(encoding='utf-8'))
     assert receipt['schema']=='com.microsoft.amplifier.slack-native-setup/1'
     assert receipt['created'] is True and receipt['serving'] is False
-    assert receipt['id']==config['id'] and Path(receipt['home']).resolve()==home.resolve()
+    assert receipt['id']==config['id'] and exact_path_identity(receipt['home'],home)
     assert Path(receipt['executable']).is_file()
     assert receipt['management']=={'kind':'installation-local-cli','api_version':'acp-slack-adapter.management/1','relative_api_paths':True,'requires_running_connector':True}
     assert not config['enabled'] and not config['setup_complete'] and not config['acp']['command']
@@ -225,8 +237,100 @@ def finite_setup(binary,root,env):
     assert (occupied/'owner-data').read_bytes()==b'preserve me'
     return ['finite native setup exits without starting service or exposing credentials','repeated native setup preserves exact existing installation','native setup refuses unrelated existing folder']
 
+def managed_lifecycle(binary,env,result=None):
+    """Actual fixed OS profile, separate from the legacy startup-toggle proof.
+
+    Each native action keeps its 60-second owner bound; 65 seconds is only the
+    CLI launch/serialization/reap envelope. There is no action retry. An unknown
+    result retains this fresh home and any registration for inspection.
+    """
+    root=Path(tempfile.mkdtemp(prefix='Slack managed café 子 ')).resolve()
+    home=root/'installation';events=[]
+    receipt={'schema':1,'scope':'actual fresh fixed-manager lifecycle','home':str(home),'passed':False,'events':events,'external_authorization':False,'model_calls':0,'action_retry':False}
+    target=result.with_name(result.name.replace('-native-launch-result.json','-native-manager-result.json')) if result else root/'manager-result.json'
+    def save():
+        if target.parent.exists():target.write_text(json.dumps(receipt,indent=2)+'\n',encoding='utf-8')
+    def call(exe,action,*args,timeout=65):
+        at=time.monotonic();proc=subprocess.Popen([str(exe),'--home',str(home),action,*args],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        row={'action':action,'args':list(args),'caller_pid':proc.pid,'started_monotonic':at};events.append(row);save()
+        try:out,err=proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill();out,err=proc.communicate(timeout=5);row.update(elapsed=time.monotonic()-at,caller_exit=proc.returncode,outcome='unknown');save();raise
+        row.update(elapsed=time.monotonic()-at,caller_exit=proc.returncode,stdout=out[:65536].decode('utf-8',errors='replace'),stderr=err[:8192].decode('utf-8',errors='replace'));save()
+        assert proc.returncode==0,(action,proc.returncode,row['stderr'])
+        assert len(out)<=65536 and len(err)<=8192,'Managed fixture output exceeded bound'
+        value=json.loads(out);row['result']=value;save();return value
+    def exact(value):
+        assert value['schema']=='com.microsoft.amplifier.slack-native-status/1'
+        assert value['id']==setup['id'] and exact_path_identity(value['home'],home)
+        assert exact_path_identity(value['executable'],installed)
+        assert value['autostart'] is False and value['startup_change_supported'] is False
+    def ready(value,request,process=None):
+        exact(value)
+        assert value['state']=='ready' and value['profile_matches'] is True
+        assert value['request_current'] is True and value['launch_observed'] is True
+        assert value['request']['request_id']==request and value['pid']==value['process_identity']['pid']
+        assert value['process_identity']['pid']>0 and len(value['process_identity'])>=3
+        if process is not None:assert value['process_identity']==process,'Managed generation changed after caller exit'
+        return value['process_identity']
+    def stopped(value,request,start,process,phase='inactive'):
+        exact(value);assert value['state']==phase and value['control_current'] is True
+        c=value['control'];assert c['request_id']==request and c['start_request_id']==start
+        assert c['action']==('retire' if phase=='retired' else 'stop') and c['phase']==phase
+        assert c['process_identity']==process and c['process_absent'] is True
+    def protected():
+        paths=[home/'adapter.json',home/'native-installation.json']+sorted((home/'secrets').rglob('*'))
+        return {str(p.relative_to(home)):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths if p.is_file()}
+    def console_probe(process):
+        if os.name!='nt':return {'applicable':False,'reason':'Windows console observation'}
+        # A separate no-console observer attaches only long enough to establish
+        # whether this exact live GUI-subsystem generation has a console.
+        code="""import ctypes,json,sys
+k=ctypes.WinDLL('kernel32',use_last_error=True)
+k.FreeConsole()
+ok=bool(k.AttachConsole(int(sys.argv[1])))
+error=0 if ok else ctypes.get_last_error()
+if ok:k.FreeConsole()
+print(json.dumps({'attached':ok,'error':error}))
+"""
+        observed=subprocess.run([sys.executable,'-I','-B','-c',code,str(process['pid'])],env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=10,creationflags=subprocess.CREATE_NO_WINDOW)
+        assert observed.returncode==0,observed.stderr
+        proof=json.loads(observed.stdout);assert proof=={'attached':False,'error':6},proof
+        return proof
+    try:
+        setup=call(binary,'native-setup',timeout=60);assert setup['created'] is True and setup['serving'] is False
+        installed=Path(setup['executable']);assert installed.is_file()
+        initial_config=json.loads((home/'adapter.json').read_text(encoding='utf-8'));assert initial_config['enabled'] is False and initial_config['setup_complete'] is False and not initial_config['acp']['command']
+        first=str(uuid.uuid4());receipt['first_request_id']=first
+        initial=call(installed,'native-start','--request-id',first);generation=ready(initial,first)
+        receipt['service']=initial['service'];receipt['first_generation']=generation;receipt['first_process_relationship']=initial['process_relationship']
+        assert generation['pid']!=events[-1]['caller_pid'],'Native start remained the service process'
+        baseline=protected();receipt['protected_before']=baseline
+        time.sleep(.25)
+        observed=call(installed,'native-status');ready(observed,first,generation);assert observed['service']==initial['service']
+        receipt['console_observation']=console_probe(generation)
+        ready(call(installed,'native-status'),first,generation)
+        stop_id=str(uuid.uuid4());stopped(call(installed,'native-stop','--request-id',stop_id),stop_id,first,generation)
+        inactive=call(installed,'native-status');exact(inactive);assert inactive['state']=='inactive' and inactive['profile_matches'] is True
+        assert protected()==baseline,'Stop changed existing configuration or private state'
+        second=str(uuid.uuid4());receipt['second_request_id']=second
+        restarted=call(installed,'native-start','--request-id',second);next_generation=ready(restarted,second)
+        assert next_generation!=generation and restarted['service']==initial['service'],'Restart changed profile or reused old generation'
+        ready(call(installed,'native-status'),second,next_generation)
+        assert protected()==baseline,'Restart changed existing configuration or private state'
+        second_stop=str(uuid.uuid4());stopped(call(installed,'native-stop','--request-id',second_stop),second_stop,second,next_generation)
+        retire=str(uuid.uuid4());stopped(call(installed,'native-retire','--request-id',retire),retire,second,next_generation,'retired')
+        absent=call(installed,'native-status');exact(absent);assert absent['state']=='retired' and absent['request_current'] is True
+        assert protected()==baseline,'Retirement changed retained installation data'
+        receipt.update(passed=True,second_generation=next_generation,second_process_relationship=restarted['process_relationship'],protected_after=protected(),registration_absent=True,cleanup='checked profile retired; exact fresh home removal pending')
+        save();shutil.rmtree(root);receipt['cleanup']='checked profile retired; exact fresh home removed';save()
+    except BaseException as error:
+        receipt.update(passed=False,error_type=type(error).__name__,error=str(error)[:2048],retained_home=home.exists(),cleanup='not attempted after failed or unknown action')
+        save();raise
+    return receipt
+
 def run(package,result,browser=False,verify_setup_tool=False,verify_startup=False):
-    checks=[]
+    checks=[];manager_receipt=None
     with tempfile.TemporaryDirectory(prefix='Slack native café 子 ') as temporary:
         root=Path(temporary);bundle=root/'download';bundle.mkdir();extract(package,bundle)
         binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file())
@@ -326,7 +430,11 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             checks.append('native private helper reuses an existing paused Slack connection without app creation, engine launch or configuration changes')
         finally:p.terminate();p.wait(timeout=20);log.close()
         if not verify_startup:assert not (home/'startup.json').exists();checks.append('startup false does not register an OS service')
+        if verify_startup:
+            manager_receipt=managed_lifecycle(binary,env,result)
+            checks.append('actual fixed native manager survives caller exit; exact generation, stop, same-profile restart and checked retirement preserve private state')
     receipt={'passed':True,'checks':checks,'package':str(package),'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),'limitations':['No real Slack authorization or model/provider call','No publisher signing/notarization claim','Current-user startup registration exercised only when verify_startup is enabled; automatic sign-in launch is not simulated']}
+    receipt['managed_lifecycle']=manager_receipt
     if result:result.write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt,indent=2))
 if __name__=='__main__':
