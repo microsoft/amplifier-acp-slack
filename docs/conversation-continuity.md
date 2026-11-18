@@ -80,6 +80,20 @@ the number of scanned messages, and the original message IDs and source links.
 Conversation-root searches do not implicitly search thread replies. Search does
 not alter the audience rules or invoke Slack's workspace-wide search API.
 
+A source link is the address Slack itself gives for that conversation or message
+(Copy link, `chat.getPermalink`):
+`https://<workspace>.slack.com/archives/<conversation>/p<timestamp digits>`, with
+`?thread_ts=<root>&cid=<conversation>` for a message in a thread. Slack opens that
+form in the client a reader is using, and shows it as a message reference when it
+is written into a message. The workspace address comes from `auth.test` at
+startup and is kept with the installation's state. Until a start has recorded
+it, links keep the web client's form,
+`https://app.slack.com/client/<workspace ID>/<conversation>?message_ts=<timestamp>`.
+Delivery receipts use the same links. Once the address is known, each prompt also
+carries `links` for the conversation, its thread and the triggering message, and
+tells the agent that Slack shows its reply as standard Markdown, so
+`[words](address)` is a link.
+
 Each prompt and the `context_tools_setup` activity record distinguish disabled
 context, a peer without HTTP MCP, and a supplied descriptor. Supplying a descriptor
 does not verify that the peer registered the tools or successfully authenticated

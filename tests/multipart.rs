@@ -123,6 +123,19 @@ async fn retry_keeps_confirmed_parts_and_receipts_without_duplicate_messages() {
         receipt["items"][0]["parts"][0]["url"],
         "https://app.slack.com/client/Ttest/Dtest?message_ts=1.000001"
     );
+    acp_slack_adapter::links::remember(
+        &store.lock().unwrap(),
+        Some("https://example-team.slack.com/"),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .response_delivery(&context, "future")
+            .unwrap()["items"][0]["parts"][0]["url"],
+        "https://example-team.slack.com/archives/Dtest/p1000001"
+    );
     assert_eq!(
         slack.publish_durable(&out, &store).await.unwrap(),
         "1.000001"

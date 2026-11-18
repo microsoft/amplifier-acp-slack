@@ -20,6 +20,7 @@ pub struct Slack {
     bot_id: String,
     people: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     granted_scopes: Arc<Mutex<Option<Vec<String>>>>,
+    workspace_url: Arc<Mutex<Option<String>>>,
 }
 #[derive(Debug)]
 pub enum ApiError {
@@ -42,6 +43,7 @@ impl Slack {
             bot_id: c.slack.bot_id.clone(),
             people: Arc::new(Mutex::new(std::collections::HashMap::new())),
             granted_scopes: Arc::new(Mutex::new(None)),
+            workspace_url: Arc::new(Mutex::new(None)),
         })
     }
     pub async fn call(
@@ -147,7 +149,12 @@ impl Slack {
                 && d["bot_id"] == c.slack.bot_id,
             "Slack credential identity does not match this installation"
         );
+        *self.workspace_url.lock().unwrap() = d["url"].as_str().and_then(crate::links::workspace);
         Ok(())
+    }
+    /// The workspace address the last successful `verify` reported, if usable.
+    pub fn workspace_url(&self) -> Option<String> {
+        self.workspace_url.lock().unwrap().clone()
     }
     /// Resume only confirmed portions of a multipart reply. Each attempted part
     /// has a durable identity before sending; uncertain effects are never replayed.
