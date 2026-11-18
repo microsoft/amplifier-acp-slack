@@ -52,13 +52,8 @@ fn helper_result(doc: Value) -> anyhow::Result<Value> {
     )
 }
 
-// GET reads only fixed owner-protected files. It never materializes a helper,
-// starts the Slack CLI, creates a ticket, repairs a path, or changes permissions.
-fn setup_file(home: &Path, relative: &str) -> anyhow::Result<Option<Value>> {
+fn validate_setup_home(home: &Path) -> anyhow::Result<()> {
     use anyhow::ensure;
-    use std::io::Read;
-    let path = home.join("secrets/slack-setup").join(relative);
-    let mut directory = home.to_owned();
     // Legacy installations can have a readable home while their secrets subtree
     // is private. Observe that root without repairing or tightening its policy.
     let root = std::fs::symlink_metadata(home)?;
@@ -82,6 +77,17 @@ fn setup_file(home: &Path, relative: &str) -> anyhow::Result<Option<Value>> {
             "Connector home is a reparse point"
         );
     }
+    Ok(())
+}
+
+// GET reads only fixed owner-protected files. It never materializes a helper,
+// starts the Slack CLI, creates a ticket, repairs a path, or changes permissions.
+fn setup_file(home: &Path, relative: &str) -> anyhow::Result<Option<Value>> {
+    use anyhow::ensure;
+    use std::io::Read;
+    let path = home.join("secrets/slack-setup").join(relative);
+    let mut directory = home.to_owned();
+    validate_setup_home(home)?;
     for component in Path::new("secrets/slack-setup")
         .join(relative)
         .parent()
@@ -228,10 +234,48 @@ pub fn configured(home: &Path) -> bool {
         .exists()
 }
 
+fn prepare_helper_storage(home: &Path, action: &str) -> anyhow::Result<()> {
+    use amplifier_native_platform::{private_create_dir, validate_private_directory};
+    anyhow::ensure!(
+        matches!(
+            action,
+            "authorize" | "confirm" | "connect" | "token" | "discard" | "status"
+        ),
+        "Unknown Slack setup helper action"
+    );
+    validate_setup_home(home)?;
+    validate_private_directory(&home.join("secrets"))?;
+    let folder = home.join("secrets/slack-setup");
+    let auth = matches!(action, "authorize" | "confirm" | "connect" | "token");
+    let mut missing = Vec::new();
+    for (path, needed) in [
+        (folder.clone(), true),
+        (folder.join("auth"), auth),
+        (folder.join("pending-auth"), action == "confirm"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => validate_private_directory(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && needed => {
+                missing.push(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Validate all existing fixed entries before creating any missing ones.
+    for path in missing {
+        // Creation-time owner/DACL, not a permission repair. A raced
+        // existing entry refuses; it is never adopted or rewritten.
+        private_create_dir(&path)?;
+        validate_private_directory(&path)?;
+    }
+    // Never precreate project: its existence fences an uncertain deployment.
+    Ok(())
+}
+
 pub async fn helper(home: &Path, action: &str, body: Value) -> anyhow::Result<Value> {
     // Use a pipe for codes and tokens; no command-line credential or CLI log output.
     let script = home.join("secrets/slack-setup-helper.py");
-    private_write(&script, include_bytes!("../scripts/slack_setup.py"))?;
     let bundled = crate::desktop::python_path(home);
     let config = crate::config::Config::load(home)?;
     let program = if bundled.is_file() {
@@ -243,6 +287,11 @@ pub async fn helper(home: &Path, action: &str, body: Value) -> anyhow::Result<Va
         );
         std::path::PathBuf::from("python3")
     };
+    // Explicit helper actions own materialization. Python's Windows mkdir(0700)
+    // policy is not the current-user/SYSTEM-only policy used by saved reads.
+    // Its later exist_ok mkdir calls retain these already protected directories.
+    prepare_helper_storage(home, action)?;
+    private_write(&script, include_bytes!("../scripts/slack_setup.py"))?;
     let mut command = Command::new(program);
     command.args(["-I", "-B", "-X", "utf8"]);
     command
@@ -671,6 +720,71 @@ if '--challenge' in sys.argv:
             before
         );
         assert!(!state.home.join("secrets/slack-setup/project").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn actual_fresh_helper_then_saved_get_and_paused_reuse_preserve_state() {
+        // The real helper performs only local discard. Slack authorization and
+        // connection creation are never attempted; saved access below is fictional.
+        let (_home, state, headers) = fresh("", "");
+        let before = std::fs::read(state.home.join("adapter.json")).unwrap();
+        let folder = state.home.join("secrets/slack-setup");
+        let (_, Json(first)) = get(State(state.clone()), headers.clone()).await.unwrap();
+        assert_eq!(first["authorization"], "missing");
+        assert!(!folder.exists());
+        let Json(discarded) = action(
+            State(state.clone()),
+            headers.clone(),
+            request("discard", "", ""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(discarded["authorization"], "missing");
+        amplifier_native_platform::validate_private_directory(&folder).unwrap();
+        let helper = state.home.join("secrets/slack-setup-helper.py");
+        assert_eq!(
+            std::fs::read(&helper).unwrap(),
+            include_bytes!("../scripts/slack_setup.py")
+        );
+        let (_, Json(saved)) = get(State(state.clone()), headers.clone()).await.unwrap();
+        assert_eq!(saved["authorization"], "missing");
+        assert_eq!(saved["authorization_pending"], false);
+        assert_eq!(
+            std::fs::read(state.home.join("adapter.json")).unwrap(),
+            before
+        );
+        {
+            let mut config = state.config.write().unwrap();
+            config.setup_complete = true;
+            config.slack.team_id = "TFIXTURE".into();
+            config.slack.app_id = "AFIXTURE".into();
+            config.slack.loopback_test = true;
+        }
+        let credentials = state.home.join("secrets/slack.json");
+        private_write(
+            &credentials,
+            br#"{"app_token":"test-app","bot_token":"test-bot"}"#,
+        )
+        .unwrap();
+        let revision = state.instance_config().revision;
+        let credentials_before = std::fs::read(&credentials).unwrap();
+        let Json(reused) = action(State(state.clone()), headers, request("connect", "", ""))
+            .await
+            .unwrap();
+        assert_eq!(reused["connection_reused"], true);
+        assert_eq!(reused["connection_ready"], true);
+        assert_eq!(reused["connection_running"], false);
+        assert_eq!(reused["next_action"], "done");
+        assert_eq!(state.instance_config().revision, revision);
+        assert_eq!(std::fs::read(&credentials).unwrap(), credentials_before);
+        assert_eq!(
+            std::fs::read(state.home.join("adapter.json")).unwrap(),
+            before
+        );
+        assert!(!folder.join("project").exists());
+        assert!(!folder.join("auth").exists());
+        assert!(!folder.join("pending-auth").exists());
     }
 
     // This fixture exercises the legacy Linux system-Python/PAM installation path.
@@ -1162,6 +1276,196 @@ if '--challenge' in sys.argv:
             assert!(!state.instance_config().setup_complete);
         }
     }
+    #[test]
+    fn explicit_helper_storage_uses_private_fixed_directories_without_deployment_intent() {
+        for action in [
+            "discard",
+            "status",
+            "authorize",
+            "confirm",
+            "connect",
+            "token",
+        ] {
+            let (_home, state, _) = fresh("", "");
+            let before = std::fs::read(state.home.join("adapter.json")).unwrap();
+            let folder = state.home.join("secrets/slack-setup");
+            assert_eq!(
+                saved_setup_summary(&state.home).unwrap()["authorization"],
+                "missing"
+            );
+            assert!(!folder.exists(), "read-only status materialized setup");
+            prepare_helper_storage(&state.home, action).unwrap();
+            amplifier_native_platform::validate_private_directory(&folder).unwrap();
+            let auth = matches!(action, "authorize" | "confirm" | "connect" | "token");
+            for (name, expected) in [("auth", auth), ("pending-auth", action == "confirm")] {
+                assert_eq!(folder.join(name).exists(), expected, "{action}/{name}");
+                if expected {
+                    amplifier_native_platform::validate_private_directory(&folder.join(name))
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                saved_setup_summary(&state.home).unwrap()["authorization"],
+                "missing"
+            );
+            for name in [
+                "project",
+                "bin",
+                "pending.json",
+                "issued.json",
+                "auth/credentials.json",
+                "pending-auth/credentials.json",
+            ] {
+                assert!(!folder.join(name).exists(), "{action} created {name}");
+            }
+            assert_eq!(
+                std::fs::read(state.home.join("adapter.json")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_helper_storage_reuses_valid_paths_without_changing_saved_access() {
+        let (_home, state, _) = fresh("", "");
+        prepare_helper_storage(&state.home, "confirm").unwrap();
+        let folder = state.home.join("secrets/slack-setup");
+        let access = folder.join("auth/credentials.json");
+        let pending = folder.join("pending-auth/credentials.json");
+        private_write(
+            &access,
+            br#"{"TEAM":{"team_id":"TEAM","token":"private-fixture"}}"#,
+        )
+        .unwrap();
+        private_write(&pending, br#"{"retained":"unknown"}"#).unwrap();
+        let before = [
+            std::fs::read(&access).unwrap(),
+            std::fs::read(&pending).unwrap(),
+        ];
+        for action in [
+            "authorize",
+            "confirm",
+            "connect",
+            "token",
+            "discard",
+            "status",
+        ] {
+            prepare_helper_storage(&state.home, action).unwrap();
+            assert_eq!(
+                [
+                    std::fs::read(&access).unwrap(),
+                    std::fs::read(&pending).unwrap()
+                ],
+                before
+            );
+            assert!(!folder.join("project").exists());
+        }
+    }
+
+    #[test]
+    fn explicit_helper_storage_refuses_non_directory_entries_before_creating_siblings() {
+        for name in [
+            "slack-setup",
+            "slack-setup/auth",
+            "slack-setup/pending-auth",
+        ] {
+            let (_home, state, _) = fresh("", "");
+            let path = state.home.join("secrets").join(name);
+            private_write(&path, b"preserve unrelated entry").unwrap();
+            assert!(prepare_helper_storage(&state.home, "confirm").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"preserve unrelated entry");
+            assert!(!state.home.join("secrets/slack-setup-helper.py").exists());
+            if name.ends_with("pending-auth") {
+                assert!(!state.home.join("secrets/slack-setup/auth").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_helper_storage_refuses_existing_non_private_policy_without_repair() {
+        for name in [
+            "slack-setup",
+            "slack-setup/auth",
+            "slack-setup/pending-auth",
+        ] {
+            let (_home, state, _) = fresh("", "");
+            let folder = state.home.join("secrets/slack-setup");
+            if name != "slack-setup" {
+                amplifier_native_platform::private_create_dir(&folder).unwrap();
+            }
+            let path = state.home.join("secrets").join(name);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            #[cfg(windows)]
+            {
+                // This CI test uses the explicitly installed test interpreter,
+                // not a product dependency or a private-home policy repair.
+                // CPython 3.13 mkdir(0700) permits Administrators/Owner Rights.
+                let python = std::path::PathBuf::from(
+                    std::env::var_os("pythonLocation")
+                        .expect("Windows fixture requires its explicit Python setup path"),
+                )
+                .join("python.exe");
+                assert!(python.is_absolute() && python.is_file());
+                let output = std::process::Command::new(python)
+                    .args([
+                        "-I",
+                        "-B",
+                        "-c",
+                        "import pathlib,sys; pathlib.Path(sys.argv[1]).mkdir(mode=0o700)",
+                    ])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "fixture mkdir failed");
+            }
+            let before = amplifier_native_platform::validate_private_directory(&path)
+                .unwrap_err()
+                .to_string();
+            std::fs::write(path.join("preserved"), b"unchanged").unwrap();
+            assert!(prepare_helper_storage(&state.home, "confirm").is_err());
+            assert_eq!(
+                amplifier_native_platform::validate_private_directory(&path)
+                    .unwrap_err()
+                    .to_string(),
+                before
+            );
+            assert_eq!(std::fs::read(path.join("preserved")).unwrap(), b"unchanged");
+            assert!(!state.home.join("secrets/slack-setup-helper.py").exists());
+            if name.ends_with("pending-auth") {
+                assert!(!folder.join("auth").exists());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o755
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_helper_storage_refuses_symlink_without_following_or_repair() {
+        use std::os::unix::fs::symlink;
+        let (_home, state, _) = fresh("", "");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("preserved"), b"unchanged").unwrap();
+        symlink(outside.path(), state.home.join("secrets/slack-setup")).unwrap();
+        assert!(prepare_helper_storage(&state.home, "confirm").is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("preserved")).unwrap(),
+            b"unchanged"
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn legacy_readable_home_keeps_its_policy_while_secrets_are_private() {

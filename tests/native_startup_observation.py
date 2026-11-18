@@ -57,8 +57,9 @@ class SetupToolFixtureTests(unittest.TestCase):
             m.fresh_setup_status(self.home,'http://fixture.invalid',self.headers)
             self.assertFalse((self.home/'secrets/slack-setup-helper.py').exists())
             m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
-            self.assertEqual(request.call_count,2)
-            self.assertEqual(request.call_args.args[2],{'action':'discard'})
+            self.assertEqual(request.call_count,3)
+            self.assertEqual(request.call_args_list[1].args[2],{'action':'discard'})
+            self.assertEqual(len(request.call_args.args),2,'Final call is a read-only GET')
             cli.assert_not_called();ensure.assert_not_called();network.assert_not_called()
         self.assertEqual((self.home/'secrets/local-password').read_bytes(),b'unchanged private fixture')
 
@@ -122,6 +123,18 @@ class SetupToolFixtureTests(unittest.TestCase):
             request.assert_called_once()
             (self.home/'secrets/slack-setup-helper.py').unlink()
             (self.home/'secrets/slack-setup/owner.lock').unlink();(self.home/'secrets/slack-setup').rmdir()
+
+    def test_post_discard_read_failure_preserves_helper_and_never_repeats_action(self):
+        def observe(*args,**kwargs):
+            if len(args)==2:return 500,{}, {'error':'unavailable'}
+            return self.local_action(*args,**kwargs)
+        with patch.object(m,'request',side_effect=observe) as request,self.assertRaisesRegex(AssertionError,'Post-discard'):
+            m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+        self.assertEqual(request.call_count,2)
+        self.assertEqual(request.call_args_list[0].args[2],{'action':'discard'})
+        self.assertEqual(len(request.call_args.args),2)
+        self.assertEqual((self.home/'secrets/slack-setup-helper.py').read_bytes(),self.helper_source.read_bytes())
+        self.assertEqual((self.home/'secrets/local-password').read_bytes(),b'unchanged private fixture')
 
 
 class ManagedFailureRecordTests(unittest.TestCase):

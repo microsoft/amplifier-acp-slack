@@ -236,6 +236,13 @@ def prepare_fresh_setup_tool(home,base,headers):
     assert script.read_bytes()==(Path(__file__).resolve().parents[1]/'scripts/slack_setup.py').read_bytes(),'Materialized helper differs from exact compiled source'
     assert folder.is_dir() and not folder.is_symlink()
     assert not any(os.path.lexists(folder/name) for name in ('auth','pending-auth','pending.json','project','issued.json','bin','cli.json')),'Fresh local discard created authorization or external-tool state'
+    # The real saved reader must accept the exact directories made by the
+    # explicit helper. A successful helper reply alone does not prove this.
+    materialized={p:p.read_bytes() for p in (home/'secrets').rglob('*') if p.is_file()}
+    status,_,saved=request(base,'/api/v1/setup/slack',headers=headers)
+    assert status==200 and saved['authorized'] is False and saved['authorization']=='missing' and saved['authorization_pending'] is False,'Post-discard saved setup read failed'
+    assert saved['setup_complete'] is False and saved['connection_running'] is False
+    assert config_path.read_bytes()==before and materialized=={p:p.read_bytes() for p in (home/'secrets').rglob('*') if p.is_file()},'Read-only post-discard status changed retained setup/account state'
 
 def finite_setup(binary,root,env):
     """Actual create-only entry point; no server, browser, Slack or model."""
@@ -537,7 +544,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
 
             if verify_setup_tool:
                 prepare_fresh_setup_tool(home,base,{'Cookie':cookie,'X-CSRF-Token':session['csrf']})
-                checks.append('one explicit fresh-home local discard materializes the exact helper without authorization/network or changing existing account/configuration')
+                checks.append('one explicit fresh-home local discard materializes the exact helper; subsequent read-only saved setup succeeds without authorization/network or account/configuration changes')
                 code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
                 vendor_env={**env,'SLACK_SKIP_UPDATE':'true','NO_COLOR':'1'}
                 verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150)
