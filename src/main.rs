@@ -24,6 +24,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Create a new private native installation and exit without starting it.
+    NativeSetup,
     Init {
         #[arg(long, default_value = "Slack connection")]
         label: String,
@@ -156,6 +158,7 @@ async fn run(cli: Cli) -> Result<()> {
         .home
         .context("Supply --home with this adapter installation folder")?;
     match cli.command.expect("Command checked above") {
+        Action::NativeSetup => print(acp_slack_adapter::desktop::setup(&home)?)?,
         Action::Init {
             label,
             owner,

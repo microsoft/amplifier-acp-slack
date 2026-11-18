@@ -102,9 +102,12 @@ def cli(folder, *args, cwd=None, auth_dir=None):
             del env[name]
     env.update({'SLACK_SKIP_UPDATE': 'true', 'NO_COLOR': '1'})
     # Output stays in this private process; errors below use an allowlist.
+    # The official CLI is a contained, noninteractive setup child, not a user
+    # terminal. It continues inheriting the helper's Job Object on Windows.
+    window = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
     result = subprocess.run([str(binary), '--config-dir', str(config), '--no-color',
                              '--skip-update', *args], cwd=cwd or folder, env=env,
-                            input='', text=True, capture_output=True, timeout=120)
+                            input='', text=True, capture_output=True, timeout=120, **window)
     output = result.stdout + result.stderr
     if result.returncode:
         for code, explanation in [

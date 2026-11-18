@@ -19,6 +19,17 @@ pub fn prepare(command: &mut Command) {
     let _ = command;
 }
 
+/// Setup helpers are noninteractive children of the GUI application. Retain
+/// suspension until Job Object attachment while preventing a console window.
+pub fn prepare_hidden(command: &mut Command) {
+    prepare(command);
+    #[cfg(windows)]
+    command.creation_flags(
+        windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+            | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+    );
+}
+
 pub struct ProcessTree {
     #[cfg(unix)]
     pid: i32,

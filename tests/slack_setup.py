@@ -28,6 +28,21 @@ class InstallerWorkspaceTests(unittest.TestCase):
             with self.assertRaises(ValueError,msg=mistaken):installer.workspace_arguments(mistaken,None)
         with self.assertRaises(ValueError):installer.workspace_arguments(None,'Example Workspace')
 
+class SetupChildTests(unittest.TestCase):
+    def test_vendor_cli_is_hidden_on_windows_without_changing_its_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary)
+            for platform in ['win32','linux','darwin']:
+                with self.subTest(platform=platform), patch.object(s,'ensure_cli',return_value=folder/'slack'), patch.object(s.sys,'platform',platform), patch.object(s.subprocess,'CREATE_NO_WINDOW',0x08000000,create=True), patch.object(s.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='done',stderr='')) as child:
+                    self.assertEqual(s.cli(folder,'auth','login','--no-prompt'),'done')
+                    args,kwargs=child.call_args
+                    self.assertEqual(args[0][-3:],['auth','login','--no-prompt'])
+                    self.assertEqual(kwargs['timeout'],120)
+                    self.assertEqual(kwargs['input'],'')
+                    self.assertTrue(kwargs['capture_output'])
+                    if platform=='win32':self.assertEqual(kwargs['creationflags'],0x08000000)
+                    else:self.assertNotIn('creationflags',kwargs)
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -27,6 +27,35 @@ pub fn default_home() -> Result<PathBuf> {
     platform::default_home(&APPLICATION, "default")
 }
 
+/// Finite native installation for a local owner such as Observatory. This uses
+/// the same create-only bundle path as first launch, without serving or opening
+/// a browser. Keep private first-account/control capabilities out of the result.
+pub fn setup(home: &Path) -> Result<Value> {
+    create(home)?;
+    let home = std::fs::canonicalize(home)?;
+    let config = Config::load(&home)?;
+    let executable = home.join("bin").join(if cfg!(windows) {
+        "acp-slack-adapter.exe"
+    } else {
+        "acp-slack-adapter"
+    });
+    Ok(json!({
+        "schema":"com.microsoft.amplifier.slack-native-setup/1",
+        "created":true,
+        "id":config.id,
+        "home":home,
+        "executable":executable,
+        "version":env!("CARGO_PKG_VERSION"),
+        "serving":false,
+        "management":{
+            "kind":"installation-local-cli",
+            "api_version":"acp-slack-adapter.management/1",
+            "relative_api_paths":true,
+            "requires_running_connector":true
+        }
+    }))
+}
+
 pub fn create(home: &Path) -> Result<()> {
     ensure!(
         !home.exists(),

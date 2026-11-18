@@ -45,7 +45,7 @@ pub async fn helper(home: &Path, action: &str, body: Value) -> anyhow::Result<Va
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    process::prepare(&mut command);
+    process::prepare_hidden(&mut command);
     let mut child = command.spawn()?;
     let _tree = process::ProcessTree::attach(&child)?;
     let input = serde_json::to_vec(&json!({"action":action,"body":body}))?;

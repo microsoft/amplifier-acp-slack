@@ -193,6 +193,38 @@ def request(base,path,body=None,headers=None):
     try:response=urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=20)
     except urllib.error.HTTPError as e:response=e
     with response:return response.status,{k.lower():v for k,v in response.headers.items()},json.load(response)
+
+def finite_setup(binary,root,env):
+    """Actual create-only entry point; no server, browser, Slack or model."""
+    home=root/'finite setup café 子'
+    command=[str(binary),'--home',str(home),'native-setup']
+    created=subprocess.run(command,env=env,capture_output=True,text=True,encoding='utf-8',timeout=60)
+    assert created.returncode==0,created.stderr
+    receipt=json.loads(created.stdout)
+    config=json.loads((home/'adapter.json').read_text(encoding='utf-8'))
+    assert receipt['schema']=='com.microsoft.amplifier.slack-native-setup/1'
+    assert receipt['created'] is True and receipt['serving'] is False
+    assert receipt['id']==config['id'] and Path(receipt['home']).resolve()==home.resolve()
+    assert Path(receipt['executable']).is_file()
+    assert receipt['management']=={'kind':'installation-local-cli','api_version':'acp-slack-adapter.management/1','relative_api_paths':True,'requires_running_connector':True}
+    assert not config['enabled'] and not config['setup_complete'] and not config['acp']['command']
+    assert not (home/'endpoints.json').exists() and not (home/'startup.json').exists()
+    assert not (home/'secrets/local-password').exists()
+    for secret in ['first-account','control-token']:
+        raw=(home/'secrets'/secret).read_text(encoding='utf-8')
+        value=json.loads(raw)['token'] if secret=='first-account' else raw.strip()
+        assert value and value not in created.stdout and value not in created.stderr
+    def snapshot():
+        return {str(p.relative_to(home)):hashlib.sha256(p.read_bytes()).hexdigest() for p in home.rglob('*') if p.is_file()}
+    before=snapshot()
+    refused=subprocess.run(command,env=env,capture_output=True,text=True,encoding='utf-8',timeout=20)
+    assert refused.returncode!=0 and snapshot()==before
+    occupied=root/'existing unrelated folder';occupied.mkdir();(occupied/'owner-data').write_bytes(b'preserve me')
+    refused=subprocess.run([str(binary),'--home',str(occupied),'native-setup'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20)
+    assert refused.returncode!=0 and list(occupied.iterdir())==[occupied/'owner-data']
+    assert (occupied/'owner-data').read_bytes()==b'preserve me'
+    return ['finite native setup exits without starting service or exposing credentials','repeated native setup preserves exact existing installation','native setup refuses unrelated existing folder']
+
 def run(package,result,browser=False,verify_setup_tool=False,verify_startup=False):
     checks=[]
     with tempfile.TemporaryDirectory(prefix='Slack native café 子 ') as temporary:
@@ -200,6 +232,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
         binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file())
         binary.chmod(0o755);home=root/'private connection';env={k:v for k,v in os.environ.items() if not k.upper().startswith(('SLACK_','OPENAI_','ANTHROPIC_','AZURE_','GOOGLE_','AMPLIFIER_'))};env['PATH']=str(root/'no-tools');env['PYTHONDONTWRITEBYTECODE']='1';env['USER']='Native café 子';env['USERNAME']='Native café 子'
         if verify_startup:env['PATH']=str(Path(os.environ['SystemRoot'])/'System32') if os.name=='nt' else '/usr/bin:/bin'
+        checks.extend(finite_setup(binary,root,env))
         def start():
             log=open(root/'server.log','ab');p=subprocess.Popen([str(binary),'--home',str(home),'--no-browser'],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
             for _ in range(400):

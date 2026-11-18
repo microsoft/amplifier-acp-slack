@@ -24,6 +24,38 @@ An installation with externally enrolled saved-connection/update controls keeps 
 
 ## Management surface
 
+### Finite installation for a local setup app
+
+An owner-local setup app such as Observatory can run the verified download's
+`acp-slack-adapter --home NEW_PRIVATE_HOME native-setup`. This creates the same
+private native installation as first launch and then exits. It does not start
+the server, open a browser, register startup, select an agent, authorize Slack,
+or send a message. Every existing destination is refused without replacement.
+The JSON result uses `com.microsoft.amplifier.slack-native-setup/1` and reports
+the installation `id`, canonical `home`, installed `executable`, `version`,
+`created: true`, `serving: false`, and an `installation-local-cli` management
+descriptor. It contains no first-account URL or credential. A lost result is
+not evidence of an absent installation: inspect the saved identity before
+continuing; do not delete and recreate the home.
+
+The local setup app then launches that installation with `--home HOME
+--no-browser`, retaining its normal background lifecycle. It invokes the
+installed executable's `api METHOD PATH --body-file PRIVATE_FILE` for management.
+The existing local API client proves the exact installation and origin on the
+same connection before sending a credential. Keep private request files and
+credentials on the host, out of browser state, command-line arguments and logs.
+This does not relax HTTPS requirements for ordinary remote management providers.
+
+Bind the selected agent through the existing revision-checked configuration API
+and private credential references. Present the normal `setup/slack` next-action
+flow, including Slack's approval/code and explicit confirmation of an undeclared
+workspace. Workspace mismatch and administrator approval remain enforced.
+The connector retains ownership of its credentials, app, renewal and updates;
+Observatory need not be present during later operation. Standalone first-account
+sign-in remains available; a setup client must not invent an owner password.
+An ACP connection check creates a session but sends no prompt. Neither that
+check nor connected Socket Mode proves the first human conversation succeeded.
+
 Existing authenticated management APIs remain available. Native additions are:
 
 - `GET auth/session`: `auth_mode` and `first_account_needed` describe the sign-in screen.
