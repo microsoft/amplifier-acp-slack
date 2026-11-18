@@ -406,6 +406,11 @@ impl Slack {
                 .client
                 .get(url.clone())
                 .bearer_auth(&self.secrets.bot_token)
+                // The client's own limit suits a small file; allow a larger one
+                // three more seconds for each megabyte it may hold.
+                .timeout(std::time::Duration::from_secs(
+                    20 + 3 * (max_bytes / (1024 * 1024)) as u64,
+                ))
                 .send()
                 .await?;
             if response.status().is_redirection() {
