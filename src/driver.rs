@@ -791,7 +791,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     }
     let mut id = client.peer.send_request("session/prompt", params)?;
     let mut output = String::new();
-    let mut media = Vec::new();
+    let mut media: Vec<crate::media::OutputFile> = Vec::new();
     let mut media_omitted = false;
     let mut answer = crate::answer::Answer::default();
     let mut permissions = 0;
@@ -1140,6 +1140,22 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
                 media_omitted = false;
                 id = client.peer.send_request("session/prompt", json!({"sessionId":sid,"prompt":[{"type":"text","text":"This is a direct conversation or explicit address. Provide a brief final reply to the latest user message; do not silently apply a previous group participation rule. Do not repeat any work or tools already performed. If and only if the user explicitly asked for no response, return the explicit_silence_request pass described above."}]}))?;
                 continue;
+            }
+            if c.media.outgoing {
+                for file in
+                    crate::file_reply::for_reply(&store, input["job_id"].as_str().unwrap_or(""))?
+                {
+                    if media.iter().any(|m| {
+                        m.name == file.name && m.mime_type == file.mime_type && m.data == file.data
+                    }) {
+                        continue;
+                    }
+                    if media.len() < c.media.max_files {
+                        media.push(file);
+                    } else {
+                        media_omitted = true;
+                    }
+                }
             }
             if output.trim().is_empty() && !media.is_empty() && !ambient {
                 output = "Shared an attachment.".into();

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 
+pub const MAX_FILES: usize = 8;
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,18 +312,63 @@ fn pdf_text(
     };
     vec![json!({"type":"text","text":note}), text]
 }
+/// A resource identifier can carry a display name. Never dereference it.
+fn document_name(resource: &Value, mime: &str, index: usize) -> String {
+    let extension = match mime {
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "application/json" => "json",
+        _ => "txt",
+    };
+    let name = resource["uri"]
+        .as_str()
+        .and_then(|uri| reqwest::Url::parse(uri).ok())
+        .filter(|url| {
+            url.scheme() == "attachment" && url.host_str().is_none() && url.path() == "/document"
+        })
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.into_owned())
+        });
+    if let Some(name) = name
+        && filename(&name) == name
+        && !name.starts_with('.')
+        && !name.contains([
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}',
+        ])
+        && name.rsplit_once('.').is_some_and(|(_, ext)| {
+            ext.eq_ignore_ascii_case(extension)
+                || (mime == "text/markdown" && ext.eq_ignore_ascii_case("markdown"))
+        })
+    {
+        return name;
+    }
+    format!("agent-document-{}.{}", index + 1, extension)
+}
+
 pub fn output(block: &Value, index: usize) -> Result<Option<OutputFile>> {
     let (mime, data, name) = match block["type"].as_str() {
         Some("image" | "audio") => (block["mimeType"].as_str(), block["data"].as_str(), None),
         Some("resource") => {
             let resource = &block["resource"];
             if let Some(text) = resource["text"].as_str() {
-                ensure!(text.len() <= 200_000, "Output document too large");
-                return Ok(Some(OutputFile {
-                    name: format!("agent-document-{}.txt", index + 1),
-                    mime_type: "text/plain".into(),
+                ensure!(
+                    text.len() <= crate::pdf_text::MAX_TEXT_BYTES,
+                    "Output document too large"
+                );
+                let mime = resource["mimeType"]
+                    .as_str()
+                    .filter(|v| is_text(v))
+                    .unwrap_or("text/plain");
+                let file = OutputFile {
+                    name: document_name(resource, mime, index),
+                    mime_type: mime.to_owned(),
                     data: STANDARD.encode(text),
-                }));
+                };
+                file.bytes()?;
+                return Ok(Some(file));
             }
             (
                 resource["mimeType"].as_str(),
@@ -399,6 +445,30 @@ mod tests {
             assert!(content(&file, b"not a wav", &json!({"audio":true})).is_err());
         }
     }
+    #[test]
+    fn named_documents_preserve_filename_mime_and_every_byte() {
+        let text = "## Contracts\r\nLast paragraph — intact.\n";
+        let block = |query: &str| json!({"type":"resource","resource":{"uri":format!("attachment:///document?name={query}"),"mimeType":"text/markdown","text":text}});
+        let file = output(&block("05-%C3%A9vidence+%26+acceptance.md"), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.name, "05-évidence & acceptance.md");
+        assert_eq!(file.mime_type, "text/markdown");
+        assert_eq!(file.bytes().unwrap(), text.as_bytes());
+        for unsafe_name in [
+            "..%2Fsecret.md",
+            "path%5Cname.md",
+            "a.exe",
+            ".hidden.md",
+            "a%0Ab.md",
+        ] {
+            assert_eq!(
+                output(&block(unsafe_name), 0).unwrap().unwrap().name,
+                "agent-document-1.md"
+            );
+        }
+    }
+
     #[test]
     fn strict_hosts_and_media_boundaries() {
         for bad in [

@@ -10,6 +10,9 @@ for line in sys.stdin:
   blocks=params['prompt'];(home/'prompt.json').write_text(json.dumps(blocks));projection=json.loads(blocks[0]['text'].split('Latest conversation projection:\n',1)[1]);text=projection['trigger']['text'];content=[{'type':'text','text':'Media handled: '+text}]
   if text.startswith('native-output'):content.append({'type':'image','mimeType':'image/png','data':PNG})
   if text.startswith('remote-output'):content.append({'type':'resource_link','uri':'file:///etc/passwd','name':'private'})
+  if text=='named document set':
+   for name,body in json.loads((home/'documents.json').read_text()).items():
+    content.append({'type':'resource','resource':{'uri':'attachment:///document?name='+name,'mimeType':'text/markdown','text':body}})
   for block in content:print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session,'update':{'sessionUpdate':'agent_message_chunk','content':block}}}),flush=True)
   result={'stopReason':'end_turn'}
  else:continue
