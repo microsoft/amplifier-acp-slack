@@ -190,3 +190,20 @@ Slack does not provide an all-recent-thread-replies endpoint: a new reply on an
 old root that this installation has never observed may remain undiscoverable.
 This is bounded recovery, not a guarantee that every offline event is delivered.
 See [Slack's thread history API](https://docs.slack.dev/reference/methods/conversations.replies/).
+
+## Prompt projection composition
+
+Context message excerpts include their Slack message ID, channel and source
+revision. Within a prompt, an orientation excerpt whose ID, revision, actor and
+text match the fuller `history` entry uses `text_in_history` to reference it.
+Truncated excerpts can reference a matching full prefix; changed, unverified or
+deleted messages are never elided. Coverage and source links remain present.
+This only changes prompt presentation, not durable messages or retrieval tools.
+
+An Instance advertising `continuity.connectorProjectionVersion: 1` may receive
+`_meta["com.microsoft.amplifier.conversation-projection"]` with `version: 1`,
+`provider_id`, `conversation_id` and `thread_id` (null for the main conversation).
+Slack supplies this only when its authorized orientation is present. Instance
+validates the existing lease and exact binding before omitting its second
+provider orientation fetch; its own memory, responsibilities and authorized
+activity remain. Older endpoints receive the ordinary self-contained projection.

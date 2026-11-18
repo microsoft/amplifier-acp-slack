@@ -30,7 +30,7 @@ for line in sys.stdin:
    err={'code':-32002,'message':'PRIVATE provider or host text'}
    if case!='generic':err['data']={'com.microsoft.amplifier.attention':evidence}
    out({'id':i,'error':err});continue
-  if case in ['limit','unsettled']:
+  if case in ['limit','unsettled','quiet_unsettled']:
    for status in ['in_progress']+(['completed'] if case=='limit' else []):
     out({'method':'session/update','params':{'sessionId':p['sessionId'],'update':{'sessionUpdate':'tool_call','toolCallId':'effect','kind':'execute','title':'Inspect existing result','status':status}}})
   result={'stopReason':{'limit':'max_turn_requests','unsettled':'max_turn_requests','cancel':'cancelled','refuse':'refusal'}.get(case,'end_turn')}
@@ -150,4 +150,21 @@ async fn cancellation_and_refusal_never_schedule_another_turn() {
             0
         );
     }
+}
+
+#[tokio::test]
+async fn quiet_completed_turn_is_silence_but_unsettled_effects_remain_unknown() {
+    let (_, r) = run("quiet").await;
+    assert_eq!(r.unwrap().decision, "pass");
+    let (t, r) = run("quiet_unsettled").await;
+    assert_eq!(
+        diagnostics::details(&r.unwrap_err()).1,
+        "unsettled_operations"
+    );
+    let s = Store::open(t.path()).unwrap();
+    assert_eq!(
+        s.db.query_row("SELECT count(*) FROM followups", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
