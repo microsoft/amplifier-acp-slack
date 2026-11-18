@@ -40,9 +40,10 @@ A PDF is untrusted input, and reading it means parsing it. The parsing runs in a
 short-lived child of the connector's own executable (`acp-slack-adapter pdf-text`),
 which receives the file on its input and nothing else: no installation folder,
 environment or credentials. The child accepts at most 32MiB, lets no single
-compressed stream inflate past 64MiB, and prints one bounded line. On Unix it
-also limits its own address space (1GiB) and processor time (30 seconds) before
-reading; elsewhere the stream bound and the parent's 45-second wait apply. A
+compressed stream inflate past 64MiB, and prints one bounded line. Before
+reading, it limits its own processor time (30 seconds) on Unix and its address
+space (1GiB) on Linux; elsewhere the stream bound and the parent's 45-second
+wait apply. A
 child that fails, is killed or answers anything unexpected means only that the
 file was not read. Text is extracted with [lopdf](https://crates.io/crates/lopdf);
 documents whose words are placed one by one, as some typesetting tools do, can

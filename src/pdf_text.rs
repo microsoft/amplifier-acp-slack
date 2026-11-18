@@ -5,8 +5,8 @@
 //! is given the file's bytes on its input and nothing else: no installation
 //! folder, no environment, no credentials. The parent bounds how long it waits
 //! and how much it reads back. The child bounds how far any stream may inflate,
-//! and on Unix also its own address space and processor time, before it looks
-//! at the file. A child that fails, is killed or says something unexpected
+//! and on Unix its own processor time (on Linux its address space too), before
+//! it looks at the file. A child that fails, is killed or says something unexpected
 //! means only that the file was not read.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,12 @@ pub const MAX_PDF_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 200_000;
 /// How far one compressed stream may inflate while the file is loaded or a page read.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// What the child allows itself where a process can limit itself. The
+/// address-space limit is used on Linux only, where it was measured; on other
+/// systems the mappings a process starts with can already be larger.
+#[cfg(target_os = "linux")]
 const MAX_CHILD_MEMORY: u64 = 1024 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_CHILD_CPU_SECONDS: u64 = 30;
 const WAIT: Duration = Duration::from_secs(45);
 /// Fewer letters and digits than this in a whole document is a document of pictures.
@@ -150,21 +155,19 @@ pub fn read(bytes: &[u8], budget: usize) -> std::result::Result<Extract, Refusal
 
 #[cfg(unix)]
 fn limit_self() {
-    // SAFETY: plain calls with valid pointers to initialized structures. A limit
-    // the system refuses is left as it was; the stream bound still applies.
-    unsafe {
-        for (resource, value) in [
-            (libc::RLIMIT_AS, MAX_CHILD_MEMORY),
-            (libc::RLIMIT_CPU, MAX_CHILD_CPU_SECONDS),
-            (libc::RLIMIT_CORE, 0),
-        ] {
-            let limit = libc::rlimit {
-                rlim_cur: value as libc::rlim_t,
-                rlim_max: value as libc::rlim_t,
-            };
-            libc::setrlimit(resource, &limit);
-        }
-    }
+    // SAFETY: a plain call with a valid pointer to an initialized structure. A
+    // limit the system refuses is left as it was; the stream bound still applies.
+    let set = |resource, value: u64| unsafe {
+        let limit = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+        libc::setrlimit(resource, &limit);
+    };
+    set(libc::RLIMIT_CPU, MAX_CHILD_CPU_SECONDS);
+    set(libc::RLIMIT_CORE, 0);
+    #[cfg(target_os = "linux")]
+    set(libc::RLIMIT_AS, MAX_CHILD_MEMORY);
 }
 #[cfg(not(unix))]
 fn limit_self() {}
