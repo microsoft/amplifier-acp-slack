@@ -4,6 +4,7 @@ No model, production credential, external network, or fake adapter grant is used
 The parent fixture controls only Slack's loopback service and human input.
 """
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -49,8 +50,12 @@ def rpc(method, args):
     return value.get("result", {"rpc_error": value.get("error")})
 
 
-def listed():
-    return TOOL in [tool["name"] for tool in rpc("tools/list", {}).get("tools", [])]
+def tool_list():
+    """The names this response was offered, and one hash of every definition, so that
+    two responses can be compared for the same list exactly."""
+    tools = rpc("tools/list", {}).get("tools", [])
+    return {"names": sorted(tool["name"] for tool in tools),
+            "sha256": hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()}
 
 
 def call(**args):
@@ -89,12 +94,17 @@ def prompt(params):
     trigger = view["trigger"]
     record("prompt", session_id=params["sessionId"], trigger=trigger)
     match = re.search(r"OWNER_NOTE ([a-z]+)", trigger["text"])
-    if not match or f"<@U{NAME}>" not in trigger["text"] or trigger.get("bot") != (match.group(1) == "agent"):
+    if not match or f"<@U{NAME}>" not in trigger["text"] or trigger.get("bot") != match.group(1).startswith("agent"):
         return {"decision": "pass", "reason": "explicit_silence_request"}
     case = match.group(1)
-    offered = listed()
-    if case == "agent":
-        mark(case, listed=offered, attempt=call(request_id=request_id(case), text="MUST_NOT_SEND agent"))
+    tools = tool_list()
+    offered = TOOL in tools["names"]
+    if case.startswith("agent"):
+        # Another agent's message started this response.
+        mark(case, listed=offered, tools=tools, attempt=call(request_id=request_id(case), text="MUST_NOT_SEND agent"))
+    elif case.startswith("seen"):
+        # A person's message, used only to compare the tool list with other responses.
+        mark(case, listed=offered, tools=tools)
     elif case == "direct":
         mark(case, listed=offered, attempt=call(request_id=request_id(case), text="MUST_NOT_SEND direct"),
              history=[{"sender": m["sender"], "bot": m["bot"], "text": m["text"][:60]} for m in view["history"]])
