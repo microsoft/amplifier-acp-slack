@@ -83,11 +83,24 @@ pub fn tool() -> Value {
         "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}})
 }
 
-/// Whether the tool belongs in this response's tool list: a response to a
-/// person in a group conversation, for a connection with an owner to reach.
-/// Membership of the owner is checked on each call, where a refusal can say why.
-pub fn offered(c: &Config, group_origin: bool, from_person: bool) -> bool {
-    group_origin && from_person && !c.context.owner_slack_user_id.is_empty() && c.slack.allow_dms
+/// Whether the tool belongs in a response's tool list: a response in a group
+/// conversation, for a connection with an owner to reach. It depends on nothing
+/// that differs between two responses in one conversation. A runtime keeps its
+/// compacted history for one exact tool list, so a tool that came and went with
+/// whoever spoke last would cost a long conversation that history on every change.
+/// Who asked, and whether the owner is a member, are checked on each call, where
+/// a refusal can say why.
+pub fn listed(c: &Config, group_origin: bool) -> bool {
+    group_origin && !c.context.owner_slack_user_id.is_empty() && c.slack.allow_dms
+}
+
+/// The answer to a call from a response to another agent's message. Only a
+/// person's request can lead to a private message to the owner, so this is
+/// decided before anything is opened, saved or queued.
+pub fn refused_for_an_agent() -> Value {
+    refusal(
+        "This response answers another agent's message. Only a person's request in this conversation can lead to a private message to your owner, so nothing was sent.",
+    )
 }
 
 fn refusal(reason: &str) -> Value {
@@ -831,15 +844,22 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_is_offered_only_to_answer_a_person_in_a_group_with_an_owner_to_reach() {
+    fn the_tool_is_listed_for_a_group_with_an_owner_to_reach_whoever_spoke_last() {
         let (_home, _store, mut config, _job) = fixture();
-        assert!(offered(&config, true, true));
-        assert!(!offered(&config, false, true));
-        assert!(!offered(&config, true, false));
+        assert!(listed(&config, true));
+        assert!(!listed(&config, false));
         config.slack.allow_dms = false;
-        assert!(!offered(&config, true, true));
+        assert!(!listed(&config, true));
         config.slack.allow_dms = true;
         config.context.owner_slack_user_id.clear();
-        assert!(!offered(&config, true, true));
+        assert!(!listed(&config, true));
+    }
+
+    #[test]
+    fn a_response_to_another_agent_is_refused_in_words() {
+        let value = refused_for_an_agent();
+        assert_eq!(value["accepted"], false);
+        assert!(value["reason"].as_str().unwrap().contains("another agent"));
+        assert!(value.get("receipts").is_none() && value.get("status").is_none());
     }
 }

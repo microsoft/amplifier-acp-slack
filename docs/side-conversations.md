@@ -83,9 +83,13 @@ connector opens if it does not exist. No argument names a person or conversation
 and a call carrying any other argument is refused. Each message ends with a link
 to the message that prompted it.
 
-The tool is listed only for a response to a person in a group conversation, when
-an owner is configured and direct messages are enabled for the connection. A
-response to another agent's message does not have it. Each call checks
+The tool is listed for every response in a group conversation, when an owner is
+configured and direct messages are enabled for the connection. The list does not
+depend on who spoke last: a runtime keeps its compacted history for one exact
+tool list, so a tool that came and went between a person's message and another
+agent's would cost a long conversation that history each time. Only a person's
+request can use it. A call from a response to another agent's message is refused
+in words, before anything is opened, saved or queued. Each call checks
 with Slack that the source message is unchanged and that the owner is a member
 of the source conversation, so a private message tells the owner nothing they
 could not already read there. In a direct conversation with someone else, or in

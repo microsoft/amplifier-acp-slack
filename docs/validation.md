@@ -36,6 +36,9 @@ recipient is the configured owner's direct conversation, that nothing is sent
 about a conversation the owner is not in, from a direct conversation or in
 answer to another agent, the
 bound per response, and recovery of a send whose acknowledgment was lost. It
+compares the tools offered to a person's message, then another agent's, then a
+person's again in one conversation, definition for definition, and checks that
+the other agent's call is refused with nothing opened, saved or queued. It
 also holds accepted messages in the journal and changes the answer Slack gives
 before they are sent: the owner leaves the source before the first send, or
 between a rate-limited send and its retry, whether a colleague or the owner
