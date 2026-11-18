@@ -14,6 +14,7 @@ pub mod identity;
 pub mod media;
 mod message_content;
 pub mod model;
+pub mod pdf_text;
 pub mod permissions;
 pub mod process;
 pub mod provisioning;
