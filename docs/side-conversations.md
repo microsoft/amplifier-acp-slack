@@ -100,6 +100,30 @@ uncertain until Slack's history confirms it. A changed or deleted source cancels
 what has not been sent. A refusal says why in words meant for the agent, for
 example that the app was not granted `im:write`.
 
+The journal can hold an accepted message, for reply pacing or a Slack rate
+limit, so acceptance does not decide delivery. The connector saves what the
+message was accepted for: this installation, the configured owner, that owner's
+direct conversation and the source message. Immediately before every send,
+including the retry of a rate-limited one, it checks that record against the
+current configuration and the queued destination, and asks Slack again whether
+the owner is a member of the source conversation and the source is unchanged.
+It does not open the direct conversation again, and it never repeats a send
+whose outcome is uncertain.
+
+| What the check finds | What happens |
+| --- | --- |
+| The owner is no longer a member of the source conversation | The message is cancelled and not sent. |
+| The configured owner, the installation, the direct-message setting, the listed conversations or the queued destination no longer match | The message is cancelled and not sent. |
+| Slack cannot confirm the members or the source | The message is not sent and is checked again every 15 seconds. After two minutes without confirmation, counted from its first claim for sending, it is cancelled. |
+
+Only the owner message is cancelled; the response's reply in the room is
+unaffected. Messages of one response are sent in order, so an owner message that
+is waiting for confirmation holds back what the response says after it for at
+most those two minutes. The receipt's note says why a message was not sent.
+When the person who asked is no longer in the conversation, the connector stops
+serving that response's tools, so the agent cannot read the receipt; the message
+is withheld all the same.
+
 A message Slack accepted is not proof that the owner read it. The message appears
 in the owner's direct conversation as the agent's own; a later reply there starts
 that conversation's ordinary turn with its own session.

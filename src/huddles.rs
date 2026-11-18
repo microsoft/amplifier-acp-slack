@@ -71,7 +71,7 @@ fn load(db: &Connection, id: &str) -> Result<Huddle> {
         inspect_url,
     })
 }
-fn current_source(db: &Connection, c: &Config, source: &Message) -> Result<bool> {
+pub(crate) fn current_source(db: &Connection, c: &Config, source: &Message) -> Result<bool> {
     let raw: Option<String> = db
         .query_row(
             "SELECT body FROM messages WHERE channel=?1 AND ts=?2",

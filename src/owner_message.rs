@@ -7,14 +7,19 @@
 //! owner is a member of that conversation. The
 //! message therefore tells the owner nothing they could not already read at its
 //! source, and it carries a link back to that source.
+//!
+//! The journal can hold a message for pacing or a Slack rate limit. What the
+//! message was accepted for is saved with it, and both that record and the
+//! owner's membership of the source are checked again before every send.
 use crate::{
     config::Config,
     model::{Message, now_ms},
-    slack::Slack,
+    slack::{Presence, Slack},
     store::Store,
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 use uuid::Uuid;
@@ -23,6 +28,50 @@ pub const TOOL: &str = "slack_owner_message";
 const MAX_CHARS: usize = 8_000;
 const MAX_PER_RESPONSE: i64 = 3;
 const PREFIX: &str = "owner-message:";
+/// How long a message may wait for Slack to confirm its audience, counted from
+/// its first claim for sending. One response's messages are sent in order, so
+/// this also bounds how long an unconfirmed one can hold back what follows it.
+const UNCONFIRMED_FOR_MS: i64 = 120_000;
+const RECHECK_MS: i64 = 15_000;
+// Receipt notes, written for the agent that reads the receipt.
+const CHANGED: &str = "Not sent: the source message, the configured owner or this connection changed after the message was accepted";
+const OWNER_LEFT: &str = "Not sent: your owner is no longer a member of the source conversation";
+const UNCONFIRMED: &str = "Not sent: Slack could not confirm who can read the source conversation";
+const WAITING: &str = "Not sent yet: Slack could not confirm who can read the source conversation";
+
+/// What a saved message was accepted for: this installation, this owner, the
+/// owner's direct conversation and the message that asked.
+#[derive(Clone, Serialize, Deserialize)]
+struct Binding {
+    adapter_id: String,
+    team: String,
+    bot_user: String,
+    owner: String,
+    direct: String,
+    source: Message,
+}
+
+impl Binding {
+    fn new(c: &Config, direct: &str, source: &Message) -> Self {
+        Self {
+            adapter_id: c.id.clone(),
+            team: c.slack.team_id.clone(),
+            bot_user: c.slack.bot_user_id.clone(),
+            owner: c.context.owner_slack_user_id.clone(),
+            direct: direct.to_owned(),
+            source: source.clone(),
+        }
+    }
+}
+
+pub fn initialize(s: &Store) -> Result<()> {
+    s.db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS slack_owner_messages(
+        job_id TEXT NOT NULL,message_id TEXT NOT NULL,binding TEXT NOT NULL,
+        PRIMARY KEY(job_id,message_id));",
+    )?;
+    Ok(())
+}
 
 pub fn tool() -> Value {
     json!({"name":TOOL,
@@ -88,7 +137,7 @@ fn receipt(db: &Connection, job: &str, request: &str) -> Result<Option<Value>> {
     let message = format!("{PREFIX}{request}");
     let receipts = db
         .prepare(
-            "SELECT id,status,slack_ts,note,channel FROM public_speech WHERE job_id=?1 AND message_id=?2 ORDER BY part",
+            "SELECT p.id,p.status,p.slack_ts,p.note,p.channel FROM public_speech p JOIN slack_owner_messages b ON b.job_id=p.job_id AND b.message_id=p.message_id WHERE p.job_id=?1 AND p.message_id=?2 ORDER BY p.part",
         )?
         .query_map(params![job, message], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,
@@ -110,19 +159,148 @@ fn receipt(db: &Connection, job: &str, request: &str) -> Result<Option<Value>> {
     } else {
         "pending"
     };
+    let delivery = match status {
+        "sent" => "Delivered to your owner's direct conversation.",
+        "failed" | "cancelled" => {
+            "Not delivered, and it will not be sent later: your owner has not been told. The receipt notes say why."
+        }
+        _ => {
+            "A pending or uncertain receipt is not delivery. Check it with this request_id; do not send it again under another."
+        }
+    };
     Ok(Some(
         json!({"accepted":true,"request_id":request,"recipient":"owner",
         "conversation_id":receipts[0]["conversation_id"],"status":status,"receipts":receipts,
-        "delivery":"A pending or uncertain receipt is not delivery. Check it with this request_id; do not send it again under another."}),
+        "delivery":delivery}),
     ))
 }
 
 fn sent_for(db: &Connection, job: &str) -> Result<i64> {
     Ok(db.query_row(
-        "SELECT COUNT(DISTINCT message_id) FROM public_speech WHERE job_id=?1 AND message_id LIKE ?2",
-        params![job, format!("{PREFIX}%")],
+        "SELECT COUNT(*) FROM slack_owner_messages WHERE job_id=?1",
+        [job],
         |r| r.get(0),
     )?)
+}
+
+fn binding(db: &Connection, delivery: &str) -> Result<Option<Binding>> {
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT b.binding FROM public_speech p JOIN slack_owner_messages b ON b.job_id=p.job_id AND b.message_id=p.message_id WHERE p.id=?1",
+            [delivery],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.map(|raw| serde_json::from_str(&raw)).transpose()?)
+}
+
+/// Whether everything a message was accepted for is still so in this
+/// installation's own record. Slack is asked separately, in `authorize_delivery`.
+fn holds(db: &Connection, c: &Config, delivery: &str, bound: &Binding) -> Result<bool> {
+    let (channel, thread): (String, String) = db.query_row(
+        "SELECT channel,thread FROM public_speech WHERE id=?1",
+        [delivery],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(bound.adapter_id == c.id
+        && bound.team == c.slack.team_id
+        && bound.bot_user == c.slack.bot_user_id
+        && !bound.owner.is_empty()
+        && bound.owner == c.context.owner_slack_user_id
+        && c.allows(&bound.direct, "im")
+        && channel == bound.direct
+        && thread.is_empty()
+        && !bound.source.bot
+        && crate::huddles::current_source(db, c, &bound.source)?)
+}
+
+/// Cancel every unsent part of the message `delivery` belongs to, and only
+/// that message: the response's other speech does not depend on it.
+fn withdraw(db: &Connection, delivery: &str, note: &str) -> Result<()> {
+    let (job, message): (String, String) = db.query_row(
+        "SELECT job_id,message_id FROM public_speech WHERE id=?1",
+        [delivery],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    db.execute(
+        "UPDATE public_speech SET status='cancelled',note=?3 WHERE job_id=?1 AND message_id=?2 AND status IN ('ready','sending')",
+        params![job, message, note],
+    )?;
+    db.execute(
+        "INSERT INTO audit(time,kind,data) VALUES(?1,'owner_message_withheld',?2)",
+        params![
+            now_ms(),
+            json!({"job_id":job,"id":delivery,"reason":note}).to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Called while the journal chooses its next delivery. `false` means it was an
+/// owner message whose record no longer holds; it has been withdrawn.
+pub(crate) fn claimable(db: &Connection, c: &Config, delivery: &str) -> Result<bool> {
+    let Some(bound) = binding(db, delivery)? else {
+        return Ok(true);
+    };
+    if holds(db, c, delivery, &bound)? {
+        return Ok(true);
+    }
+    withdraw(db, delivery, CHANGED)?;
+    Ok(false)
+}
+
+/// Called with a claimed delivery, immediately before each send, so also before
+/// the retry of a rate-limited one. For an owner message it asks Slack again
+/// whether the source stands and the owner can read it; `false` means the
+/// delivery was settled here and nothing may be sent now. It never opens the
+/// direct conversation again: the destination is the one saved with the message.
+pub(crate) async fn authorize_delivery(
+    home: &Path,
+    c: &Config,
+    delivery: &str,
+    client: &Slack,
+) -> Result<bool> {
+    let (bound, first) = {
+        let s = Store::open(home)?;
+        let Some(bound) = binding(&s.db, delivery)? else {
+            return Ok(true);
+        };
+        if !holds(&s.db, c, delivery, &bound)? {
+            withdraw(&s.db, delivery, CHANGED)?;
+            return Ok(false);
+        }
+        let first: i64 = s.db.query_row(
+            "SELECT attempted FROM public_speech WHERE id=?1",
+            [delivery],
+            |r| r.get(0),
+        )?;
+        (bound, first)
+    };
+    // The owner first: their absence is an answer, and the source check below
+    // cannot tell an answer from a failure to get one.
+    let mut presence = client.owner_presence(c, &bound.source.channel).await;
+    if presence == Presence::Member
+        && client
+            .authorize_continuation(c, &bound.source)
+            .await
+            .is_err()
+    {
+        presence = Presence::Unknown;
+    }
+    let s = Store::open(home)?;
+    match presence {
+        // The local record may have changed while Slack answered.
+        Presence::Member if holds(&s.db, c, delivery, &bound)? => return Ok(true),
+        Presence::Member => withdraw(&s.db, delivery, CHANGED)?,
+        Presence::Absent => withdraw(&s.db, delivery, OWNER_LEFT)?,
+        Presence::Unknown if now_ms() - first > UNCONFIRMED_FOR_MS => {
+            withdraw(&s.db, delivery, UNCONFIRMED)?
+        }
+        Presence::Unknown => {
+            crate::public_speech::settle(&s, delivery, "ready", None, WAITING, RECHECK_MS)?
+        }
+    }
+    Ok(false)
 }
 
 fn body(text: &str, source: &Message, link: Option<&str>) -> String {
@@ -138,27 +316,32 @@ fn save(
     c: &Config,
     job: &str,
     request: &Request,
-    direct: &str,
+    bound: &Binding,
     text: &str,
 ) -> Result<Value> {
     let tx = crate::huddles::source_transaction(s, c, job)?;
     if let Some(existing) = receipt(&tx, job, &request.id)? {
         return Ok(existing);
     }
+    // Slack was asked about `bound.source`; save only if that is still the
+    // message this response answers.
+    let current = crate::huddles::job_source(&tx, c, job)?;
+    ensure!(
+        serde_json::to_value(&current)? == serde_json::to_value(&bound.source)?,
+        "The source changed while the owner message was checked"
+    );
     if sent_for(&tx, job)? >= MAX_PER_RESPONSE {
         return Ok(refusal(
             "This response has already sent its owner three messages. Put what remains in one of them next time, or say it in this conversation.",
         ));
     }
-    let ids = crate::public_speech::enqueue_routed(
-        &tx,
-        job,
-        &format!("{PREFIX}{}", request.id),
-        text,
-        direct,
-        "",
-    )?;
+    let message = format!("{PREFIX}{}", request.id);
+    let ids = crate::public_speech::enqueue_routed(&tx, job, &message, text, &bound.direct, "")?;
     ensure!(!ids.is_empty(), "An owner message cannot be empty");
+    tx.execute(
+        "INSERT INTO slack_owner_messages(job_id,message_id,binding) VALUES(?1,?2,?3)",
+        params![job, message, serde_json::to_string(bound)?],
+    )?;
     tx.execute(
         "INSERT INTO audit(time,kind,data) VALUES(?1,'owner_message_ready',?2)",
         params![
@@ -215,7 +398,8 @@ pub async fn call(c: &Config, home: &Path, job: &str, args: &Value) -> Result<Va
     }
     let link = client.permalink(&source.channel, &source.ts).await.ok();
     let text = body(&request.text, &source, link.as_deref());
-    save(&mut s, c, job, &request, &direct, &text)
+    let bound = Binding::new(c, &direct, &source);
+    save(&mut s, c, job, &request, &bound, &text)
 }
 
 #[cfg(test)]
@@ -254,6 +438,22 @@ mod tests {
         parse(&json!({"request_id":id,"text":text})).unwrap()
     }
 
+    fn bound(store: &Store, config: &Config, job: &Job) -> Binding {
+        let source = crate::huddles::job_source(&store.db, config, &job.id).unwrap();
+        Binding::new(config, "DOWNER", &source)
+    }
+
+    fn rows(store: &Store) -> Vec<(String, String, String)> {
+        store
+            .db
+            .prepare("SELECT channel,thread,text FROM public_speech")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     const FIRST: &str = "11111111-1111-4111-8111-111111111111";
 
     #[test]
@@ -285,12 +485,13 @@ mod tests {
             text,
             "The review needs your decision.\n\n[From this conversation](https://example-team.slack.com/archives/C1/p10000001)"
         );
+        let bound = Binding::new(&config, "DOWNER", &source);
         let first = save(
             &mut store,
             &config,
             &job.id,
             &request(FIRST, "The review needs your decision."),
-            "DOWNER",
+            &bound,
             &text,
         )
         .unwrap();
@@ -303,20 +504,12 @@ mod tests {
             &config,
             &job.id,
             &request(FIRST, "Different words"),
-            "DOWNER",
+            &bound,
             "Different words",
         )
         .unwrap();
         assert_eq!(again["receipts"], first["receipts"]);
-        let rows: Vec<(String, String, String)> = store
-            .db
-            .prepare("SELECT channel,thread,text FROM public_speech")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(rows, vec![("DOWNER".into(), String::new(), text)]);
+        assert_eq!(rows(&store), vec![("DOWNER".into(), String::new(), text)]);
         assert_eq!(
             body("Plain", &source, None),
             "Plain\n\nFrom conversation C1 message 10.000001"
@@ -326,6 +519,7 @@ mod tests {
     #[test]
     fn a_response_sends_its_owner_at_most_three_messages() {
         let (_home, mut store, config, job) = fixture();
+        let bound = bound(&store, &config, &job);
         for n in 1..=3 {
             let id = format!("{n}1111111-1111-4111-8111-111111111111");
             let saved = save(
@@ -333,7 +527,7 @@ mod tests {
                 &config,
                 &job.id,
                 &request(&id, "Note"),
-                "DOWNER",
+                &bound,
                 &format!("Note {n}"),
             )
             .unwrap();
@@ -344,7 +538,7 @@ mod tests {
             &config,
             &job.id,
             &request("41111111-1111-4111-8111-111111111111", "Note"),
-            "DOWNER",
+            &bound,
             "Note 4",
         )
         .unwrap();
@@ -355,6 +549,21 @@ mod tests {
     #[test]
     fn a_changed_source_saves_nothing() {
         let (_home, mut store, config, job) = fixture();
+        let bound = bound(&store, &config, &job);
+        // Slack was asked about another message than the one this response answers.
+        let mut other = bound.clone();
+        other.source.ts = "9.000001".into();
+        assert!(
+            save(
+                &mut store,
+                &config,
+                &job.id,
+                &request(FIRST, "Note"),
+                &other,
+                "Note"
+            )
+            .is_err()
+        );
         store
             .db
             .execute("UPDATE jobs SET status='superseded' WHERE id=?1", [&job.id])
@@ -365,12 +574,260 @@ mod tests {
                 &config,
                 &job.id,
                 &request(FIRST, "Note"),
-                "DOWNER",
+                &bound,
                 "Note",
             )
             .is_err()
         );
         assert_eq!(sent_for(&store.db, &job.id).unwrap(), 0);
+        assert_eq!(rows(&store), vec![]);
+    }
+
+    /// One owner message, then the response's ordinary reply, both waiting.
+    fn queued() -> (tempfile::TempDir, Store, Config, Job, String) {
+        let (home, mut store, config, job) = fixture();
+        let bound = bound(&store, &config, &job);
+        let saved = save(
+            &mut store,
+            &config,
+            &job.id,
+            &request(FIRST, "Note"),
+            &bound,
+            "Note for the owner",
+        )
+        .unwrap();
+        let id = saved["receipts"][0]["id"].as_str().unwrap().to_owned();
+        crate::public_speech::enqueue(
+            &store,
+            &job.id,
+            &amplifier_acp_connection::speech::Utterance {
+                id: "reply".into(),
+                text: "Reply in the channel".into(),
+            },
+        )
+        .unwrap();
+        (home, store, config, job, id)
+    }
+
+    #[test]
+    fn an_unchanged_message_is_claimed_for_the_owners_conversation() {
+        let (_home, mut store, config, _job, id) = queued();
+        let out = crate::public_speech::claim(&mut store, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (out.id, out.channel, out.thread),
+            (id, "DOWNER".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn a_message_is_withdrawn_alone_when_what_it_was_accepted_for_no_longer_holds() {
+        type Drift = fn(&mut Config, &Store);
+        let drifts: [(&str, Drift); 7] = [
+            ("another owner is configured", |c, _| {
+                c.context.owner_slack_user_id = "UOTHER".into()
+            }),
+            ("no owner is configured", |c, _| {
+                c.context.owner_slack_user_id.clear()
+            }),
+            ("direct messages are turned off", |c, _| {
+                c.slack.allow_dms = false
+            }),
+            ("the owner's conversation is not a listed one", |c, _| {
+                c.slack.channels = vec!["C1".into()]
+            }),
+            ("the saved record is another installation's", |c, _| {
+                c.id = "another-installation".into()
+            }),
+            ("the queued destination is not the saved one", |_, s| {
+                s.db.execute(
+                    "UPDATE public_speech SET channel='DOTHER' WHERE channel='DOWNER'",
+                    [],
+                )
+                .unwrap();
+            }),
+            ("the queued message was moved into a thread", |_, s| {
+                s.db.execute(
+                    "UPDATE public_speech SET thread='10.000001' WHERE channel='DOWNER'",
+                    [],
+                )
+                .unwrap();
+            }),
+        ];
+        for (name, drift) in drifts {
+            let (_home, mut store, mut config, job, id) = queued();
+            drift(&mut config, &store);
+            assert!(
+                crate::public_speech::claim(&mut store, &config)
+                    .unwrap()
+                    .is_none(),
+                "{name}"
+            );
+            let (status, note): (String, String) = store
+                .db
+                .query_row(
+                    "SELECT status,note FROM public_speech WHERE id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (status.as_str(), note.as_str()),
+                ("cancelled", CHANGED),
+                "{name}"
+            );
+            let receipt = receipt(&store.db, &job.id, FIRST).unwrap().unwrap();
+            assert_eq!(receipt["status"], "cancelled", "{name}");
+            assert!(
+                receipt["delivery"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Not delivered"),
+                "{name}"
+            );
+            // The response's own reply is untouched and is the next to go.
+            let next = crate::public_speech::claim(&mut store, &config)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: the reply was lost"));
+            assert_eq!(
+                (next.channel.as_str(), next.text.as_str()),
+                ("C1", "Reply in the channel"),
+                "{name}"
+            );
+            assert_eq!(
+                store
+                    .db
+                    .query_row(
+                        "SELECT COUNT(*) FROM audit WHERE kind='owner_message_withheld'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_source_withdraws_the_message_before_any_send() {
+        for change in [
+            "UPDATE messages SET body=json_set(body,'$.deleted',json('true'))",
+            "UPDATE messages SET body=json_set(body,'$.revision','11.000001','$.text','<@UBOT> something else')",
+        ] {
+            let (_home, mut store, config, _job, id) = queued();
+            store.db.execute(change, []).unwrap();
+            assert!(
+                crate::public_speech::claim(&mut store, &config)
+                    .unwrap()
+                    .is_none()
+            );
+            let status: String = store
+                .db
+                .query_row("SELECT status FROM public_speech WHERE id=?1", [&id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "cancelled", "{change}");
+        }
+    }
+
+    #[test]
+    fn only_a_message_saved_by_this_tool_is_treated_as_an_owner_message() {
+        let (_home, mut store, config, job) = fixture();
+        // The agent's own speech may carry any identifier, this prefix included.
+        crate::public_speech::enqueue(
+            &store,
+            &job.id,
+            &amplifier_acp_connection::speech::Utterance {
+                id: format!("{PREFIX}{FIRST}"),
+                text: "Reply in the channel".into(),
+            },
+        )
+        .unwrap();
+        assert!(receipt(&store.db, &job.id, FIRST).unwrap().is_none());
+        assert_eq!(sent_for(&store.db, &job.id).unwrap(), 0);
+        let out = crate::public_speech::claim(&mut store, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.channel, "C1");
+        assert!(claimable(&store.db, &config, &out.id).unwrap());
+    }
+
+    /// A client whose every call fails without an answer from Slack.
+    fn unreachable(config: &mut Config) -> Slack {
+        config.slack.loopback_test = true;
+        config.slack.api_base = "http://127.0.0.1:1/api/".into();
+        Slack::new(
+            config,
+            crate::config::Secrets {
+                app_token: "test-app".into(),
+                bot_token: "test".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn state(store: &Store, id: &str) -> (String, String) {
+        store
+            .db
+            .query_row(
+                "SELECT status,note FROM public_speech WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_message_whose_audience_slack_cannot_confirm_waits_and_is_then_given_up() {
+        let (home, mut store, mut config, _job, id) = queued();
+        let client = unreachable(&mut config);
+        let out = crate::public_speech::claim(&mut store, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.id, id);
+        assert!(
+            !authorize_delivery(home.path(), &config, &id, &client)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state(&store, &id), ("ready".into(), WAITING.into()));
+        // It is not offered again until the recheck is due.
+        assert!(
+            crate::public_speech::claim(&mut store, &config)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .db
+            .execute(
+                "UPDATE public_speech SET available=0,attempted=attempted-?2 WHERE id=?1",
+                params![id, UNCONFIRMED_FOR_MS + 1],
+            )
+            .unwrap();
+        let out = crate::public_speech::claim(&mut store, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.id, id);
+        assert!(
+            !authorize_delivery(home.path(), &config, &id, &client)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state(&store, &id), ("cancelled".into(), UNCONFIRMED.into()));
+        // What follows it in the response is no longer held back.
+        let next = crate::public_speech::claim(&mut store, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.channel, "C1");
+        // Speech that is not an owner message is never asked about here.
+        assert!(
+            authorize_delivery(home.path(), &config, &next.id, &client)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

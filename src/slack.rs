@@ -28,6 +28,13 @@ pub enum ApiError {
     Rejected(String),
     Uncertain,
 }
+/// What Slack says about one person's membership of a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Member,
+    Absent,
+    Unknown,
+}
 
 impl Slack {
     pub fn new(c: &Config, s: Secrets) -> Result<Self> {
@@ -582,8 +589,51 @@ impl Slack {
         // The prompt states that this bounded view is not the full room archive.
         Ok(out)
     }
-    /// Verify the requested peers rather than treating the bounded prompt roster
-    /// as the complete channel membership list.
+    /// Whether the configured owner is a member of `channel` now. `Unknown`
+    /// means Slack gave no usable answer; it is never read as membership.
+    pub async fn owner_presence(&self, c: &Config, channel: &str) -> Presence {
+        let owner = c.context.owner_slack_user_id.as_str();
+        if owner.is_empty() {
+            return Presence::Unknown;
+        }
+        let lookup = async {
+            let mut cursor = String::new();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let Ok(page) = self
+                    .call(
+                        "conversations.members",
+                        json!({"channel":channel,"limit":200,"cursor":cursor}),
+                        false,
+                    )
+                    .await
+                else {
+                    return Presence::Unknown;
+                };
+                let Some(members) = page["members"].as_array() else {
+                    return Presence::Unknown;
+                };
+                if members.iter().any(|member| member == owner) {
+                    return Presence::Member;
+                }
+                cursor = page["response_metadata"]["next_cursor"]
+                    .as_str()
+                    .unwrap_or("")
+                    .into();
+                if cursor.is_empty() {
+                    return Presence::Absent;
+                }
+                // A list that does not advance, or is longer than this reads,
+                // has not shown that the owner is absent.
+                if !seen.insert(cursor.clone()) || seen.len() > 50 {
+                    return Presence::Unknown;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), lookup)
+            .await
+            .unwrap_or(Presence::Unknown)
+    }
     /// The configured owner's direct conversation with this agent, for a message
     /// that starts in `channel`. The owner must be a member of that conversation;
     /// the refusal text is written for the agent that asked.
@@ -593,37 +643,11 @@ impl Slack {
         channel: &str,
     ) -> std::result::Result<String, String> {
         let owner = c.context.owner_slack_user_id.as_str();
-        let unavailable = || {
-            "Slack could not confirm who is in this conversation, so nothing was sent.".to_owned()
-        };
-        let lookup = async {
-            let mut cursor = String::new();
-            let mut seen = std::collections::HashSet::new();
-            loop {
-                let page = self
-                    .call(
-                        "conversations.members",
-                        json!({"channel":channel,"limit":200,"cursor":cursor}),
-                        false,
-                    )
-                    .await
-                    .map_err(|_| unavailable())?;
-                let members = page["members"].as_array().ok_or_else(unavailable)?;
-                if members.iter().any(|member| member == owner) {
-                    return Ok(());
-                }
-                cursor = page["response_metadata"]["next_cursor"]
-                    .as_str()
-                    .unwrap_or("")
-                    .into();
-                if cursor.is_empty() || !seen.insert(cursor.clone()) || seen.len() > 50 {
-                    return Err("Your owner is not a member of this conversation, so a private message about it would tell them what they cannot read here. Nothing was sent.".to_owned());
-                }
-            }
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(20), lookup)
-            .await
-            .map_err(|_| unavailable())??;
+        match self.owner_presence(c, channel).await {
+            Presence::Member => {}
+            Presence::Absent => return Err("Your owner is not a member of this conversation, so a private message about it would tell them what they cannot read here. Nothing was sent.".to_owned()),
+            Presence::Unknown => return Err("Slack could not confirm who is in this conversation, so nothing was sent.".to_owned()),
+        }
         let opened = self
             .call(
                 "conversations.open",
@@ -652,6 +676,8 @@ impl Slack {
             ),
         }
     }
+    /// Verify the requested peers rather than treating the bounded prompt roster
+    /// as the complete channel membership list.
     pub async fn authorize_bot_members(&self, channel: &str, ids: &[String]) -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             let mut pending: std::collections::HashSet<&str> =

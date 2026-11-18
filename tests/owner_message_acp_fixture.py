@@ -65,14 +65,20 @@ def request_id(case, number=0):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"owner-message-fixture:{case}:{number}"))
 
 
-def confirmed(args, timeout=45):
+def settled(args, timeout=60):
+    """The receipt once it can no longer change: sent, or withheld for good.
+
+    A refused call is returned as it is: the connector stops serving a response
+    whose asker can no longer read the conversation. A call that fails because
+    Slack is unavailable is asked again.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = call(**args)
-        if value.get("structuredContent", {}).get("status") == "sent":
+        if value == {"http": 403} or value.get("structuredContent", {}).get("status") in ("sent", "cancelled", "failed"):
             return value
         time.sleep(0.1)
-    raise AssertionError("Timed out: confirmed owner message")
+    raise AssertionError("Timed out: settled owner message")
 
 
 def prompt(params):
@@ -103,7 +109,7 @@ def prompt(params):
         changed = call(request_id=args["request_id"], text="CHANGED " + case)
         final = None
         if first.get("structuredContent", {}).get("accepted") and case != "lost":
-            final = confirmed(args)
+            final = settled(args)
         mark(case, listed=offered, first=first, second=second, changed=changed, final=final)
     return "DONE " + case
 

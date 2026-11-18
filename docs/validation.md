@@ -36,6 +36,14 @@ recipient is the configured owner's direct conversation, that nothing is sent
 about a conversation the owner is not in, from a direct conversation or in
 answer to another agent, the
 bound per response, and recovery of a send whose acknowledgment was lost. It
+also holds accepted messages in the journal and changes the answer Slack gives
+before they are sent: the owner leaves the source before the first send, or
+between a rate-limited send and its retry, whether a colleague or the owner
+asked; and Slack cannot give the members, then can. Nothing may be sent in the
+first three, and exactly one message in the last. Unit tests cover what needs no
+Slack answer: a changed owner, installation, direct-message setting, listed
+conversations or queued destination cancels the owner message alone, and a
+message that stays unconfirmed is given up after its bound. The fixture
 does not establish that a real workspace lets a given app open that
 conversation, or a real model's judgment about what deserves its owner's
 attention.

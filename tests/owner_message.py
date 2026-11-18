@@ -27,6 +27,10 @@ class Fixture(SlackFixture):
         super().__init__()
         self.opened = []
         self.lost = False
+        self.held = set()
+        self.departed = set()  # source conversations the owner has been removed from
+        self.unavailable = set()  # source conversations whose members Slack cannot give
+        self.after_open = None  # runs once, after the call-time checks have passed
 
     async def api(self, request):
         method = request.match_info["method"]
@@ -36,7 +40,11 @@ class Fixture(SlackFixture):
         if method == "conversations.info":
             return web.json_response({"ok": True, "channel": {"id": channel, "name": channel, "is_im": channel.startswith("D"), "is_mpim": False, "is_private": False, "is_member": True, "user": "UHUMAN"}})
         if method == "conversations.members":
+            if channel in self.unavailable:
+                return web.json_response({"ok": False, "error": "internal_error"})
             members = ["Ualpha", "UHUMAN"] if channel.startswith("D") else ["Ualpha", "Ubeta", "UPEER"] if channel == "Cabsent" else ["Ualpha", "Ubeta", "UHUMAN", "UPEER"]
+            if channel in self.departed:
+                members.remove("UHUMAN")
             return web.json_response({"ok": True, "members": members})
         if method == "users.info":
             return web.json_response({"ok": True, "user": {"id": body["user"], "is_bot": body["user"] in ("Ualpha", "Ubeta"), "profile": {"display_name": body["user"][1:]}}})
@@ -47,7 +55,18 @@ class Fixture(SlackFixture):
             if name == "beta":
                 return web.json_response({"ok": False, "error": "missing_scope", "needed": "im:write"})
             assert body == {"users": "UHUMAN", "return_im": True}, body
+            if self.after_open:
+                self.after_open()
+                self.after_open = None
             return web.json_response({"ok": True, "channel": {"id": "D" + name + "owner", "is_im": True, "user": "UHUMAN"}})
+        held = next((case for case in ("held", "asker") if body.get("markdown_text", "").startswith("PRIVATE " + case)), None)
+        if method == "chat.postMessage" and held and held not in self.held:
+            # Slack rate-limits the first send, which was allowed. The owner is
+            # removed from the source conversation before the retry.
+            self.held.add(held)
+            self.attempts[body["client_msg_id"]] = self.attempts.get(body["client_msg_id"], 0) + 1
+            self.departed.add("C" + held)
+            return web.Response(status=429, headers={"Retry-After": "1"})
         if method == "chat.postMessage" and body.get("markdown_text", "").startswith("PRIVATE lost") and not self.lost:
             # Slack committed the message; both its HTTP acknowledgment and the
             # socket echo are lost. Recovery must use the original client_msg_id.
@@ -190,6 +209,54 @@ async def main():
             assert len([m for m in fixture.messages if m["text"].startswith("PRIVATE lost")]) == 1
             assert rows(homes["alpha"], "SELECT COUNT(*) FROM audit WHERE kind='owner_message_ready'") == [(6,)]
             passed("A lost acknowledgment is reconciled from Slack by its original identity, not sent again")
+
+            # The journal can hold an accepted message. Who may read its source is
+            # asked again before every send, and the answer then is the one that counts.
+            def withheld(result, note):
+                first, final = result["first"]["structuredContent"], result["final"]["structuredContent"]
+                assert first["accepted"] and final["status"] == "cancelled", result
+                assert [r["note"] for r in final["receipts"]] == [note] and final["delivery"].startswith("Not delivered"), final
+                return final["receipts"][0]["id"]
+
+            opened = len(fixture.opened)
+            fixture.after_open = lambda: fixture.departed.add("Cleft")
+            _, left = await ask("left", user="UPEER")
+            identity = withheld(left, "Not sent: your owner is no longer a member of the source conversation")
+            assert not private("PRIVATE left") and identity not in fixture.attempts
+            passed("An accepted message is not sent when the owner has left its source conversation before the first send")
+
+            _, held = await ask("held", user="UPEER")
+            identity = withheld(held, "Not sent: your owner is no longer a member of the source conversation")
+            assert "held" in fixture.held and fixture.attempts[identity] == 1 and not private("PRIVATE held")
+            passed("A rate-limited message is not sent on its retry when the owner has left its source conversation in between")
+
+            # The owner asks and is then removed. The connector stops serving that
+            # response's tools, so the agent cannot read the receipt; the journal
+            # still must not send.
+            _, asker = await ask("asker")
+            assert asker["first"]["structuredContent"]["accepted"] and asker["final"] == {"http": 403}, asker
+            identity = asker["first"]["structuredContent"]["receipts"][0]["id"]
+            await until(lambda: rows(homes["alpha"], "SELECT status,note FROM public_speech WHERE id=?", (identity,)) == [("cancelled", "Not sent: your owner is no longer a member of the source conversation")], "message withheld after its asker, the owner, left")
+            assert "asker" in fixture.held and fixture.attempts[identity] == 1 and not private("PRIVATE asker")
+            passed("The same holds when the owner is the one who asked: nothing is sent to them about a conversation they were removed from")
+
+            fixture.after_open = lambda: fixture.unavailable.add("Cunknown")
+            asking = asyncio.create_task(ask("unknown", user="UPEER"))
+            waiting = "SELECT status,note FROM public_speech WHERE channel='Dalphaowner' AND text LIKE 'PRIVATE unknown%'"
+            await until(lambda: rows(homes["alpha"], waiting) == [("ready", "Not sent yet: Slack could not confirm who can read the source conversation")] or asking.done(), "message held while its audience cannot be confirmed", timeout=60)
+            assert not asking.done() and not private("PRIVATE unknown")
+            fixture.unavailable.clear()
+            _, unknown = await asking
+            assert unknown["final"]["structuredContent"]["status"] == "sent"
+            sent = private("PRIVATE unknown")
+            assert len(sent) == 1 and sent[0]["channel"] == "Dalphaowner" and fixture.attempts[sent[0]["client_msg_id"]] == 1
+            passed("A message whose audience Slack cannot confirm is not sent, and is sent once when Slack can confirm it")
+
+            # None of the rechecks opened the direct conversation again, and each
+            # withheld message is on record.
+            assert len(fixture.opened) == opened + 4, fixture.opened[opened:]
+            assert rows(homes["alpha"], "SELECT COUNT(*) FROM audit WHERE kind='owner_message_withheld'") == [(3,)]
+            passed("No recheck opened the direct conversation again, and each withheld message is on record")
         finally:
             for name, process in processes.items():
                 if process.returncode is None:
