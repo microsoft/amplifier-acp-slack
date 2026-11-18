@@ -28,6 +28,13 @@ pub enum ApiError {
     Rejected(String),
     Uncertain,
 }
+/// What Slack says about one person's membership of a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Member,
+    Absent,
+    Unknown,
+}
 
 impl Slack {
     pub fn new(c: &Config, s: Secrets) -> Result<Self> {
@@ -581,6 +588,93 @@ impl Slack {
         }
         // The prompt states that this bounded view is not the full room archive.
         Ok(out)
+    }
+    /// Whether the configured owner is a member of `channel` now. `Unknown`
+    /// means Slack gave no usable answer; it is never read as membership.
+    pub async fn owner_presence(&self, c: &Config, channel: &str) -> Presence {
+        let owner = c.context.owner_slack_user_id.as_str();
+        if owner.is_empty() {
+            return Presence::Unknown;
+        }
+        let lookup = async {
+            let mut cursor = String::new();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let Ok(page) = self
+                    .call(
+                        "conversations.members",
+                        json!({"channel":channel,"limit":200,"cursor":cursor}),
+                        false,
+                    )
+                    .await
+                else {
+                    return Presence::Unknown;
+                };
+                let Some(members) = page["members"].as_array() else {
+                    return Presence::Unknown;
+                };
+                if members.iter().any(|member| member == owner) {
+                    return Presence::Member;
+                }
+                cursor = page["response_metadata"]["next_cursor"]
+                    .as_str()
+                    .unwrap_or("")
+                    .into();
+                if cursor.is_empty() {
+                    return Presence::Absent;
+                }
+                // A list that does not advance, or is longer than this reads,
+                // has not shown that the owner is absent.
+                if !seen.insert(cursor.clone()) || seen.len() > 50 {
+                    return Presence::Unknown;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), lookup)
+            .await
+            .unwrap_or(Presence::Unknown)
+    }
+    /// The configured owner's direct conversation with this agent, for a message
+    /// that starts in `channel`. The owner must be a member of that conversation;
+    /// the refusal text is written for the agent that asked.
+    pub async fn owner_direct(
+        &self,
+        c: &Config,
+        channel: &str,
+    ) -> std::result::Result<String, String> {
+        let owner = c.context.owner_slack_user_id.as_str();
+        match self.owner_presence(c, channel).await {
+            Presence::Member => {}
+            Presence::Absent => return Err("Your owner is not a member of this conversation, so a private message about it would tell them what they cannot read here. Nothing was sent.".to_owned()),
+            Presence::Unknown => return Err("Slack could not confirm who is in this conversation, so nothing was sent.".to_owned()),
+        }
+        let opened = self
+            .call(
+                "conversations.open",
+                json!({"users":owner,"return_im":true}),
+                false,
+            )
+            .await
+            .map_err(|error| match error {
+                ApiError::Rejected(code) if code == "missing_scope" => "This Slack app was not granted permission to start a direct message (im:write). Your owner can message you first, or the app's permissions can be updated.".to_owned(),
+                ApiError::Rejected(_) => "Slack refused to open a direct conversation with your owner. Nothing was sent.".to_owned(),
+                ApiError::RateLimited(_) | ApiError::Uncertain => "Slack did not answer when opening the direct conversation with your owner. Nothing was sent; try once more later in this response.".to_owned(),
+            })?;
+        let direct = &opened["channel"];
+        match direct["id"].as_str() {
+            Some(id)
+                if direct["is_im"] == true
+                    && direct["user"] == owner
+                    && id.len() <= 80
+                    && id.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+            {
+                Ok(id.to_owned())
+            }
+            _ => Err(
+                "Slack did not return your owner's direct conversation. Nothing was sent."
+                    .to_owned(),
+            ),
+        }
     }
     /// Verify the requested peers rather than treating the bounded prompt roster
     /// as the complete channel membership list.

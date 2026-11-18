@@ -1069,6 +1069,18 @@ pub async fn mcp(
                     .unwrap()
                     .extend(crate::huddles::tools());
             }
+            if grant.job_id.is_some()
+                && crate::owner_message::offered(
+                    &config,
+                    authority.origin.as_ref().is_some_and(|c| !c.direct),
+                    !grant.actor_bot,
+                )
+            {
+                result["tools"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(crate::owner_message::tool());
+            }
             if grant.job_id.is_some() {
                 result["tools"].as_array_mut().unwrap().push(json!({
                     "name":"slack_follow_up",
@@ -1143,6 +1155,29 @@ pub async fn mcp(
                 return Ok(rpc(
                     id,
                     json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
+                ));
+            }
+            if body["params"]["name"] == crate::owner_message::TOOL {
+                let Some(job) = grant.job_id.as_deref() else {
+                    return Err(ApiError::forbidden());
+                };
+                if !crate::owner_message::offered(
+                    &config,
+                    authority.origin.as_ref().is_some_and(|c| !c.direct),
+                    !grant.actor_bot,
+                ) {
+                    return Err(ApiError::forbidden());
+                }
+                let value = crate::owner_message::call(
+                    &config,
+                    &state.home,
+                    job,
+                    &body["params"]["arguments"],
+                )
+                .await?;
+                return Ok(rpc(
+                    id,
+                    json!({"content":[{"type":"text","text":value.to_string()}],"isError":value["accepted"]!=true,"structuredContent":value}),
                 ));
             }
             if body["params"]["name"] == "slack_follow_up" {

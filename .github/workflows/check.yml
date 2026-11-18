@@ -35,6 +35,7 @@ jobs:
       - run: /tmp/adapter-tests/bin/python tests/scoped_work.py
       - run: /tmp/adapter-tests/bin/python tests/followthrough.py
       - run: /tmp/adapter-tests/bin/python tests/slack_huddles.py
+      - run: /tmp/adapter-tests/bin/python tests/owner_message.py
       - run: /tmp/adapter-tests/bin/python tests/morning_reliability.py
       - run: /tmp/adapter-tests/bin/python tests/steering.py
       - run: /tmp/adapter-tests/bin/python tests/peer_awareness.py

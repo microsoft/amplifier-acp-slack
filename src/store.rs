@@ -99,6 +99,7 @@ impl Store {
         crate::steering::initialize(&store)?;
         crate::public_speech::initialize(&store)?;
         crate::huddles::initialize(&store)?;
+        crate::owner_message::initialize(&store)?;
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
