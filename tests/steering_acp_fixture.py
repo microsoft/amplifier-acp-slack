@@ -32,10 +32,11 @@ def run(req,data):
    assert time.monotonic()<deadline
    time.sleep(.01)
   permission(sid,'second');log('effect',{'name':'second'});text='Finished original work'+(' with '+','.join(u['text'] for u in updates) if updates else '')
- if mode=='peerRevision':
+ if mode in ('peerRevision','peerNullPass'):
   update(sid,sessionUpdate='agent_message_chunk',messageId='old',content={'type':'text','text':json.dumps({'decision':'speak','text':'Old answer','reason':'before peer update'})})
-  update(sid,sessionUpdate='agent_message_chunk',messageId='final',content={'type':'text','text':json.dumps({'decision':'pass','reason':'peer already answered'})})
+  update(sid,sessionUpdate='agent_message_chunk',messageId='final',content={'type':'text','text':json.dumps({'decision':'pass',**({'text':None} if mode=='peerNullPass' else {}),'reason':'peer already answered'})})
   update(sid,sessionUpdate='agent_message_chunk',messageId='old',content={'type':'text','text':' '})
+ elif mode=='peerQuiet':pass
  else:update(sid,sessionUpdate='agent_message_chunk',messageId='final' ,content={'type':'text','text':json.dumps({'decision':'speak','text':text,'reason':'fixture'}) if (mode in ambient_modes or peer_mode) else text})
  receipts=[{'inputId':u['id'],'state':'incorporated','turnId':'fixture-turn','sequence':n}for n,u in enumerate(updates)] if is_root and mode!='peerRemoteQueued' else []
  send({'id':req['id'],'result':{'stopReason':'end_turn','_meta':{'io.github.bkrabach.agent-runtime':{'inputReceipts':receipts}}}});active=None
