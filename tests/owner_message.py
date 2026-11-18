@@ -190,10 +190,27 @@ async def main():
             assert len(earlier) == 5 and all(m["sender"] == "Ualpha" and m["bot"] for m in earlier), direct["history"]
             passed("In the owner's own direct conversation the tool is neither listed nor callable, and the earlier private messages are in that conversation's history as the agent's own")
 
+            saved = rows(homes["alpha"], "SELECT COUNT(*) FROM slack_owner_messages")
+            opened = len(fixture.opened)
             _, other = await ask("agent", user="Ubeta", bot_id="Bbeta")
-            assert other["listed"] is False and other["attempt"] == {"http": 403}
-            assert not private("MUST_NOT_SEND")
-            passed("Another agent's message cannot lead to a private message to the owner")
+            refused = other["attempt"]
+            assert other["listed"] is True, other
+            assert refused["isError"] and refused["structuredContent"]["accepted"] is False, refused
+            assert "another agent" in refused["structuredContent"]["reason"]
+            assert not private("MUST_NOT_SEND") and len(fixture.opened) == opened
+            assert rows(homes["alpha"], "SELECT COUNT(*) FROM slack_owner_messages") == saved
+            assert rows(homes["alpha"], "SELECT COUNT(*) FROM public_speech WHERE text LIKE 'MUST_NOT_SEND%'") == [(0,)]
+            passed("Another agent's message cannot lead to a private message to the owner: the call is refused in words, and nothing is opened, saved or queued")
+
+            # One conversation, a person, then another agent, then a person again: the
+            # list a response is offered must not change with whoever spoke last.
+            _, before = await ask("seenfirst", channel="Corder")
+            _, between = await ask("agentorder", channel="Corder", user="Ubeta", bot_id="Bbeta")
+            _, after = await ask("seenlast", channel="Corder")
+            assert before["listed"] and between["listed"] and after["listed"], (before, between, after)
+            assert before["tools"] == between["tools"] == after["tools"], (before["tools"], between["tools"], after["tools"])
+            assert between["attempt"]["structuredContent"]["accepted"] is False and not private("MUST_NOT_SEND")
+            passed("A person, another agent and a person again in one conversation are offered exactly the same tools, definition for definition")
 
             _, scope = await ask("scope", agent="beta")
             refused = scope["first"]["structuredContent"]
