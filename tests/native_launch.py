@@ -206,6 +206,37 @@ def request(base,path,body=None,headers=None):
     except urllib.error.HTTPError as e:response=e
     with response:return response.status,{k.lower():v for k,v in response.headers.items()},json.load(response)
 
+def fresh_setup_status(home,base,headers):
+    """Status must not launch or materialize the setup helper."""
+    script=home/'secrets/slack-setup-helper.py';folder=home/'secrets/slack-setup'
+    assert not os.path.lexists(script) and not os.path.lexists(folder),'Expected untouched fresh setup'
+    status,_,value=request(base,'/api/v1/setup/slack',headers=headers)
+    assert status==200 and value['authorized'] is False and value['authorization_pending'] is False
+    assert value['setup_complete'] is False and value['connection_running'] is False
+    assert not os.path.lexists(script) and not os.path.lexists(folder),'Read-only setup GET materialized a helper or directory'
+    return value
+
+def prepare_fresh_setup_tool(home,base,headers):
+    """One explicit local discard on this empty fixture materializes its helper.
+
+    There is no approval, ticket, project or app to discard. The production
+    action starts no Slack authorization, CLI download or external request.
+    An uncertain reply is fatal; no fallback helper copy or action replay.
+    """
+    script=home/'secrets/slack-setup-helper.py';folder=home/'secrets/slack-setup'
+    assert not os.path.lexists(script) and not os.path.lexists(folder),'Setup tool preparation requires untouched fixture state'
+    config_path=home/'adapter.json';before=config_path.read_bytes();config=json.loads(before)
+    assert config['enabled'] is False and config['setup_complete'] is False and not config['slack']['app_id']
+    protected={p:p.read_bytes() for p in (home/'secrets').rglob('*') if p.is_file()}
+    status,_,value=request(base,'/api/v1/setup/slack',{'action':'discard'},headers=headers)
+    assert status==200 and value['authorized'] is False and value['authorization']=='missing'
+    assert value['setup_complete'] is False and value['connection_running'] is False
+    assert config_path.read_bytes()==before and all(p.read_bytes()==saved for p,saved in protected.items()),'Local fixture preparation changed existing configuration/account state'
+    assert script.is_file() and not script.is_symlink()
+    assert script.read_bytes()==(Path(__file__).resolve().parents[1]/'scripts/slack_setup.py').read_bytes(),'Materialized helper differs from exact compiled source'
+    assert folder.is_dir() and not folder.is_symlink()
+    assert not any(os.path.lexists(folder/name) for name in ('auth','pending-auth','pending.json','project','issued.json','bin','cli.json')),'Fresh local discard created authorization or external-tool state'
+
 def finite_setup(binary,root,env):
     """Actual create-only entry point; no server, browser, Slack or model."""
     home=root/'finite setup café 子'
@@ -368,7 +399,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             status_run=subprocess.run([str(binary),'--home',str(home),'api','GET','status'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert status_run.returncode==0,status_run.stderr;assert json.loads(status_run.stdout)['id']==config['id'];checks.append('same-connection listener proof before CLI authorization')
             private_python=home/'runtime/python'/('python.exe' if os.name=='nt' else 'bin/python3')
             py=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c','import ssl,sqlite3,json; print(json.dumps({"isolated":__import__("sys").flags.isolated,"ssl":bool(ssl.OPENSSL_VERSION)}))'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20);assert py.returncode==0,py.stderr;assert json.loads(py.stdout)=={'isolated':1,'ssl':True};checks.append('private Python starts without system tools')
-            cookie=headers['set-cookie'].split(';',1)[0];status,_,_=request(base,'/api/v1/setup/slack',headers={'Cookie':cookie});assert status==200;checks.append('guided Slack setup status uses bundled runtime without network or credentials')
+            cookie=headers['set-cookie'].split(';',1)[0];fresh_setup_status(home,base,{'Cookie':cookie});checks.append('guided Slack setup GET reads saved state without creating a helper, directory or credentials')
             if verify_startup:
                 if os.name!='nt' and __import__('sys').platform!='darwin':raise AssertionError('Startup fixture is limited to native Windows/Mac CI')
                 startup_headers={'Cookie':cookie,'X-CSRF-Token':session['csrf']};label='acp-slack-adapter-'+config['id']
@@ -397,6 +428,8 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                 checks.append('independent native absence confirms startup removal preserves installation and account')
 
             if verify_setup_tool:
+                prepare_fresh_setup_tool(home,base,{'Cookie':cookie,'X-CSRF-Token':session['csrf']})
+                checks.append('one explicit fresh-home local discard materializes the exact helper without authorization/network or changing existing account/configuration')
                 code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
                 vendor_env={**env,'SLACK_SKIP_UPDATE':'true','NO_COLOR':'1'}
                 verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150)

@@ -25,6 +25,105 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 
+class SetupToolFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory();self.addCleanup(self.temporary.cleanup)
+        self.home=Path(self.temporary.name)/'fresh';(self.home/'secrets').mkdir(parents=True)
+        self.config={'enabled':False,'setup_complete':False,'slack':{'app_id':''}}
+        (self.home/'adapter.json').write_text(json.dumps(self.config))
+        (self.home/'secrets/local-password').write_bytes(b'unchanged private fixture')
+        self.headers={'Cookie':'fixture=session','X-CSRF-Token':'fixture-csrf'}
+        self.helper_source=ROOT.parent/'scripts/slack_setup.py'
+        spec=importlib.util.spec_from_file_location('fresh_fixture_setup_helper',self.helper_source)
+        self.helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.helper)
+        self.empty={'authorized':False,'authorization':'missing','authorization_pending':False,
+                    'setup_complete':False,'connection_running':False}
+
+    def local_action(self,base,path,body=None,headers=None):
+        self.assertEqual((base,path,headers),('http://fixture.invalid','/api/v1/setup/slack',self.headers))
+        if body is None:return 200,{},dict(self.empty)
+        self.assertEqual(body,{'action':'discard'})
+        # The HTTP boundary is fake; the helper bytes and discard implementation
+        # are the real exact source. No service, authorization or external call.
+        (self.home/'secrets/slack-setup-helper.py').write_bytes(self.helper_source.read_bytes())
+        result=self.helper.execute(self.home,'discard',{})
+        return 200,{},dict(result,setup_complete=False,connection_running=False)
+
+    def test_readonly_get_then_one_explicit_local_discard_materializes_exact_helper(self):
+        with patch.object(m,'request',side_effect=self.local_action) as request, \
+             patch.object(self.helper,'cli',side_effect=AssertionError('No Slack CLI action')) as cli, \
+             patch.object(self.helper,'ensure_cli',side_effect=AssertionError('No CLI download')) as ensure, \
+             patch.object(self.helper.urllib.request,'urlopen',side_effect=AssertionError('No network')) as network:
+            m.fresh_setup_status(self.home,'http://fixture.invalid',self.headers)
+            self.assertFalse((self.home/'secrets/slack-setup-helper.py').exists())
+            m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+            self.assertEqual(request.call_count,2)
+            self.assertEqual(request.call_args.args[2],{'action':'discard'})
+            cli.assert_not_called();ensure.assert_not_called();network.assert_not_called()
+        self.assertEqual((self.home/'secrets/local-password').read_bytes(),b'unchanged private fixture')
+
+    def test_readonly_get_refuses_helper_or_directory_side_effect(self):
+        for member in ['slack-setup-helper.py','slack-setup']:
+            path=self.home/'secrets'/member
+            def changed(*args,**kwargs):
+                path.mkdir() if member=='slack-setup' else path.write_bytes(b'unexpected')
+                return 200,{},dict(self.empty)
+            with patch.object(m,'request',side_effect=changed) as request,self.assertRaisesRegex(AssertionError,'Read-only'):
+                m.fresh_setup_status(self.home,'http://fixture.invalid',self.headers)
+            request.assert_called_once()
+            path.rmdir() if path.is_dir() else path.unlink()
+
+    def test_existing_setup_or_pending_authorization_refuses_before_request(self):
+        folder=self.home/'secrets/slack-setup';(folder/'pending-auth').mkdir(parents=True)
+        credentials=folder/'pending-auth/credentials.json';credentials.write_bytes(b'keep unknown authorization')
+        with patch.object(m,'request') as request:
+            for action in [m.fresh_setup_status,m.prepare_fresh_setup_tool]:
+                with self.assertRaises(AssertionError):action(self.home,'http://fixture.invalid',self.headers)
+            request.assert_not_called()
+        self.assertEqual(credentials.read_bytes(),b'keep unknown authorization')
+
+    def test_configured_home_refuses_before_request(self):
+        for change in [{'enabled':True},{'setup_complete':True},{'slack':{'app_id':'AEXISTING'}}]:
+            (self.home/'adapter.json').write_text(json.dumps({**self.config,**change}))
+            with patch.object(m,'request') as request,self.assertRaises(AssertionError):
+                m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+            request.assert_not_called()
+
+    def test_lost_or_refused_action_is_not_replayed_or_replaced_by_source_copy(self):
+        original=TimeoutError('unobserved local action')
+        with patch.object(m,'request',side_effect=original) as request,self.assertRaises(TimeoutError) as caught:
+            m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+        self.assertIs(caught.exception,original);request.assert_called_once()
+        self.assertFalse((self.home/'secrets/slack-setup-helper.py').exists())
+        with patch.object(m,'request',return_value=(403,{},{})) as request,self.assertRaises(AssertionError):
+            m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+        request.assert_called_once()
+
+    def test_lost_committed_action_retains_materialized_state_without_replay(self):
+        original=TimeoutError('committed local action reply lost')
+        def lost(*args,**kwargs):
+            self.local_action(*args,**kwargs)
+            raise original
+        with patch.object(m,'request',side_effect=lost) as request,self.assertRaises(TimeoutError) as caught:
+            m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+        self.assertIs(caught.exception,original);request.assert_called_once()
+        self.assertEqual((self.home/'secrets/slack-setup-helper.py').read_bytes(),self.helper_source.read_bytes())
+        self.assertTrue((self.home/'secrets/slack-setup/owner.lock').is_file())
+        self.assertEqual((self.home/'secrets/local-password').read_bytes(),b'unchanged private fixture')
+
+    def test_changed_helper_or_existing_state_is_refused_after_single_action(self):
+        for member in ['slack-setup-helper.py','local-password']:
+            def changed(*args,**kwargs):
+                result=self.local_action(*args,**kwargs)
+                (self.home/'secrets'/member).write_bytes(b'changed')
+                return result
+            with patch.object(m,'request',side_effect=changed) as request,self.assertRaises(AssertionError):
+                m.prepare_fresh_setup_tool(self.home,'http://fixture.invalid',self.headers)
+            request.assert_called_once()
+            (self.home/'secrets/slack-setup-helper.py').unlink()
+            (self.home/'secrets/slack-setup/owner.lock').unlink();(self.home/'secrets/slack-setup').rmdir()
+
+
 class FixtureTests(unittest.TestCase):
     def test_exact_path_identity_refuses_copy_hardlink_and_missing_path(self):
         with tempfile.TemporaryDirectory() as folder:
