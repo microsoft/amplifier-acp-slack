@@ -268,6 +268,112 @@ def finite_setup(binary,root,env):
     assert (occupied/'owner-data').read_bytes()==b'preserve me'
     return ['finite native setup exits without starting service or exposing credentials','repeated native setup preserves exact existing installation','native setup refuses unrelated existing folder']
 
+def manager_record_projection(value):
+    """Content-free identity/phase evidence; never copy arbitrary record fields."""
+    def digest(item):return hashlib.sha256(json.dumps(item,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    def canonical_id(value):
+        try:return isinstance(value,str) and str(uuid.UUID(value))==value
+        except ValueError:return False
+    result={}
+    for key in ('id','request_id','start_request_id','update_plan'):
+        if canonical_id(value.get(key)):result[key]=value[key]
+    for key in ('schema','process_absent'):
+        if type(value.get(key)) in (int,bool):result[key]=value[key]
+    enums={'phase':{'registering','registered','registration_refused','start_intent','accepted','refused','unknown','ready','observing_existing','intent','inactive','retired'},
+           'action':{'stop','retire'},'dispatch_outcome':{'unconfirmed','accepted','refused','unknown'}}
+    for key,allowed in enums.items():
+        if isinstance(value.get(key),str):result[key]=value[key] if value[key] in allowed else 'unrecognized'
+    for key in ('binding','profile','service','before','outcome','observation'):
+        if key in value:result[key+'_sha256']=digest(value[key])
+    binding=value.get('binding')
+    if isinstance(binding,dict):
+        result['binding_id']=binding['id'] if canonical_id(binding.get('id')) else None
+        sha=binding.get('binary_sha256')
+        if isinstance(sha,str) and re.fullmatch('[0-9a-f]{64}',sha):result['binary_sha256']=sha
+    for key in ('process','process_identity'):
+        process=value.get(key)
+        if process is None and key in value:result[key]=None
+        if not isinstance(process,dict):continue
+        observed={}
+        for field in ('pid','session_id'):
+            if type(process.get(field)) is int and 0<=process[field]<=2**32-1:observed[field]=process[field]
+        for field in ('start_ticks','creation_time_100ns','start_seconds','start_microseconds','boot_seconds','boot_microseconds'):
+            raw=process.get(field)
+            if isinstance(raw,str) and re.fullmatch('[0-9]{1,24}',raw):observed[field]=raw
+        if process.get('platform') in ('windows','macos'):observed['platform']=process['platform']
+        if canonical_id(process.get('boot_id')):observed['boot_id']=process['boot_id']
+        result[key]=observed
+    return result
+
+def managed_failure_records(home,expected_home,events):
+    """One read-only snapshot of this fixture's issued fixed manager records.
+
+    This is not a fresh process/manager query or a settlement observation. Reads
+    are not retried. Missing, unsafe, changing and unreadable records stay distinct.
+    """
+    result={'schema':1,'read_only':True,'scope':'saved records only; not atomic or current process liveness','observation_monotonic':time.monotonic(),'records':{}}
+    def identity(info):return (info.st_dev,info.st_ino)
+    def ordinary(info,folder=False):
+        return (stat.S_ISDIR(info.st_mode) if folder else stat.S_ISREG(info.st_mode)) and not getattr(info,'st_file_attributes',0)&getattr(stat,'FILE_ATTRIBUTE_REPARSE_POINT',0x400)
+    if expected_home is None:
+        result['unavailable']='fresh_home_identity_not_recorded';return result
+    try:
+        current=home.lstat()
+        if not ordinary(current,True) or identity(current)!=expected_home:
+            result['unavailable']='fresh_home_identity_changed';return result
+    except OSError as error:
+        result['unavailable']='home_read_error';result['errno']=error.errno;return result
+    paths=['native-manager/active.json','native-manager/enrollment.json','native-manager/control.json']
+    # These IDs come only from commands already issued by the fixture. Neither
+    # pointers nor directory enumeration can expand the collection scope.
+    for event in events[:16]:
+        action,args=event.get('action'),event.get('args',[])
+        if action not in ('native-start','native-stop','native-retire') or len(args)!=2 or args[0]!='--request-id':continue
+        try:
+            if str(uuid.UUID(args[1]))!=args[1]:continue
+        except (ValueError,TypeError,AttributeError):continue
+        if action=='native-start':paths.extend([f'native-manager/requests/{args[1]}.json',f'native-manager/requests/{args[1]}.launched.json'])
+        else:paths.append(f'native-manager/controls/{args[1]}.json')
+    result['truncated']=len(events)>16 or len(paths)>16
+    for relative in dict.fromkeys(paths[:16]):
+        row={};result['records'][relative]=row
+        try:
+            if identity(home.lstat())!=expected_home:raise ValueError('home changed')
+            path=home
+            for component in Path(relative).parts[:-1]:
+                path=path/component
+                if not ordinary(path.lstat(),True):raise ValueError('unsafe directory')
+            path=home/relative;before=path.lstat()
+            if not ordinary(before) or before.st_nlink!=1:raise ValueError('unsafe file')
+            if before.st_size>65536:
+                row.update(state='oversize',size=before.st_size);continue
+            flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)
+            with os.fdopen(os.open(path,flags),'rb') as stream:
+                opened=os.fstat(stream.fileno())
+                if not ordinary(opened) or identity(opened)!=identity(before):raise ValueError('opened identity changed')
+                raw=stream.read(65537);after=os.fstat(stream.fileno())
+            row['size']=len(raw)
+            if len(raw)>65536:row['state']='oversize';continue
+            row['sha256']=hashlib.sha256(raw).hexdigest()
+            if identity(path.lstat())!=identity(before) or identity(home.lstat())!=expected_home or (after.st_size,after.st_mtime_ns)!=(before.st_size,before.st_mtime_ns):
+                row['state']='changed_during_read';continue
+            try:value=json.loads(raw)
+            except (ValueError,UnicodeError):row['state']='malformed';continue
+            if not isinstance(value,dict):row['state']='invalid_record';continue
+            row.update(state='observed',projection=manager_record_projection(value))
+        except FileNotFoundError:row['state']='absent_at_read'
+        except OSError as error:row.update(state='read_error',error_type=type(error).__name__,errno=error.errno)
+        except ValueError:row['state']='unsafe_or_changed'
+    return result
+
+def retain_managed_failure(receipt,home,expected_home,events,save):
+    # Diagnostics and receipt persistence must never replace the original
+    # action exception, including interruption while collecting evidence.
+    try:receipt['manager_records']=managed_failure_records(home,expected_home,events)
+    except BaseException as error:receipt['manager_records']={'unavailable':'diagnostic_error','error_type':type(error).__name__}
+    try:save()
+    except BaseException as error:receipt['diagnostic_save_error']=type(error).__name__
+
 def managed_lifecycle(binary,env,result=None):
     """Actual fixed OS profile, separate from the legacy startup-toggle proof.
 
@@ -276,7 +382,7 @@ def managed_lifecycle(binary,env,result=None):
     result retains this fresh home and any registration for inspection.
     """
     root=Path(tempfile.mkdtemp(prefix='Slack managed café 子 ')).resolve()
-    home=root/'installation';events=[]
+    home=root/'installation';events=[];home_identity=None
     receipt={'schema':1,'scope':'actual fresh fixed-manager lifecycle','home':str(home),'passed':False,'events':events,'external_authorization':False,'model_calls':0,'action_retry':False}
     target=result.with_name(result.name.replace('-native-launch-result.json','-native-manager-result.json')) if result else root/'manager-result.json'
     def save():
@@ -330,6 +436,8 @@ print(json.dumps({'attached':ok,'error':error}))
         return proof
     try:
         setup=call(binary,'native-setup',timeout=60);assert setup['created'] is True and setup['serving'] is False
+        home_entry=home.lstat();assert stat.S_ISDIR(home_entry.st_mode) and not home.is_symlink()
+        home_identity=(home_entry.st_dev,home_entry.st_ino)
         installed=Path(setup['executable']);assert installed.is_file()
         initial_config=json.loads((home/'adapter.json').read_text(encoding='utf-8'));assert initial_config['enabled'] is False and initial_config['setup_complete'] is False and not initial_config['acp']['command']
         first=str(uuid.uuid4());receipt['first_request_id']=first
@@ -357,7 +465,7 @@ print(json.dumps({'attached':ok,'error':error}))
         save();shutil.rmtree(root);receipt['cleanup']='checked profile retired; exact fresh home removed';save()
     except BaseException as error:
         receipt.update(passed=False,error_type=type(error).__name__,error=str(error)[:2048],retained_home=home.exists(),cleanup='not attempted after failed or unknown action')
-        save();raise
+        retain_managed_failure(receipt,home,home_identity,events,save);raise
     return receipt
 
 def run(package,result,browser=False,verify_setup_tool=False,verify_startup=False):

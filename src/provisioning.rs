@@ -563,6 +563,12 @@ mod tests {
         configure: impl FnOnce(&mut Config),
     ) -> (tempfile::TempDir, Arc<AppState>, HeaderMap) {
         let home = tempfile::tempdir().unwrap();
+        // AppState::open can restrict an existing directory's DACL but must
+        // not repair its owner. Seed this fresh fixture's secrets directory
+        // with current-user ownership before opening the application state.
+        let secrets = home.path().join("secrets");
+        amplifier_native_platform::private_create_dir(&secrets).unwrap();
+        amplifier_native_platform::validate_private_directory(&secrets).unwrap();
         Config::new(label.into(), "owner".into())
             .save(home.path())
             .unwrap();

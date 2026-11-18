@@ -998,9 +998,16 @@ mod tests {
     use super::*;
     fn fixture(phase: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("native-updates");
+        let id = fixture_files(dir.path(), phase);
+        (dir, id)
+    }
+    fn fixture_files(home: &Path, phase: &str) -> String {
+        let root = home.join("native-updates");
         let id = uuid::Uuid::new_v4().to_string();
-        config::private_dir(&root.join(&id)).unwrap();
+        amplifier_native_platform::private_create_dir(&root).unwrap();
+        amplifier_native_platform::private_create_dir(&root.join(&id)).unwrap();
+        amplifier_native_platform::validate_private_directory(&root).unwrap();
+        amplifier_native_platform::validate_private_directory(&root.join(&id)).unwrap();
         config::private_write(
             &root.join("active.json"),
             json!({"id":id}).to_string().as_bytes(),
@@ -1013,7 +1020,7 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
-        (dir, id)
+        id
     }
     #[test]
     fn invalid_existing_journal_preserves_closed_admission() {
@@ -1341,40 +1348,42 @@ mod tests {
     #[test]
     fn one_shot_worker_profile_is_fixed_and_unknown_dispatch_cannot_repeat() {
         use sha2::{Digest, Sha256};
-        let (dir, plan) = fixture("queued");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("installation");
+        amplifier_native_platform::private_create_dir(&home).unwrap();
+        amplifier_native_platform::validate_private_directory(&home).unwrap();
+        let plan = fixture_files(&home, "queued");
         let request = uuid::Uuid::new_v4().to_string();
         let mut c = Config::new("Fixture".into(), "owner".into());
         c.server.auth_mode = AuthMode::LocalPassword;
         c.server.web_transport = WebTransport::LocalHttp;
-        c.save(dir.path()).unwrap();
-        amplifier_native_platform::private_dir(dir.path()).unwrap();
-        config::private_write(&dir.path().join("native-installation.json"),serde_json::to_vec(&json!({"id":c.id,"update_owner":"installation","manager_owner":crate::native_manager::OWNER})).unwrap().as_slice()).unwrap();
-        let folder = dir.path().join("native-updates").join(&plan);
+        c.save(&home).unwrap();
+        config::private_write(&home.join("native-installation.json"),serde_json::to_vec(&json!({"id":c.id,"update_owner":"installation","manager_owner":crate::native_manager::OWNER})).unwrap().as_slice()).unwrap();
+        let folder = home.join("native-updates").join(&plan);
         let entry = if cfg!(windows) {
             "pythonw.exe"
         } else {
             "bin/python3"
         };
         let python = folder.join("worker-runtime/python").join(entry);
-        config::private_dir(python.parent().unwrap()).unwrap();
         config::private_write(&python, b"fixed inert interpreter").unwrap();
         config::private_write(&folder.join("worker-runtime/native-bundle.json"),&serde_json::to_vec(&json!({"python_files":{entry:format!("{:x}",Sha256::digest(b"fixed inert interpreter"))}})).unwrap()).unwrap();
         let helper = folder.join(format!("worker-{request}.py"));
         config::private_write(&helper, SCRIPT).unwrap();
-        let binding = managed_worker(dir.path(), &plan, &request).unwrap();
+        let binding = managed_worker(&home, &plan, &request).unwrap();
         assert!(!binding.profile.autostart);
         assert_eq!(binding.profile.executable, python.canonicalize().unwrap());
         assert_eq!(binding.profile.args[6], plan);
         assert_eq!(binding.profile.args[7], request);
         assert_eq!(binding.profile.cwd, folder.canonicalize().unwrap());
         let record = json!({"schema":1,"plan_id":plan,"request_id":request,"binding":binding,"phase":"unknown","outcome":"unknown"});
-        worker_record_write(&worker_dispatch_path(dir.path(), &plan, &request), &record).unwrap();
+        worker_record_write(&worker_dispatch_path(&home, &plan, &request), &record).unwrap();
         assert_eq!(
-            dispatch_managed_worker(dir.path(), &plan, &request).unwrap(),
+            dispatch_managed_worker(&home, &plan, &request).unwrap(),
             record
         );
         // The retained unknown request is not reinterpreted as fresh admission.
         config::private_write(&helper, b"changed helper").unwrap();
-        assert!(dispatch_managed_worker(dir.path(), &plan, &request).is_err());
+        assert!(dispatch_managed_worker(&home, &plan, &request).is_err());
     }
 }

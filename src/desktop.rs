@@ -67,10 +67,12 @@ fn create_inner(home: &Path, managed: bool) -> Result<()> {
     let parent = home.parent().context("Missing installation parent")?;
     std::fs::create_dir_all(parent)?;
     let stage = parent.join(format!(".slack-setup-{}", uuid::Uuid::new_v4()));
+    let mut stage_created = false;
     let result = (|| {
-        platform::private_dir(&stage)?;
+        platform::private_create_dir(&stage)?;
+        stage_created = true;
         for dir in ["bin", "secrets", "client"] {
-            platform::private_dir(&stage.join(dir))?;
+            platform::private_create_dir(&stage.join(dir))?;
         }
         let owner = std::env::var("USERNAME")
             .or_else(|_| std::env::var("USER"))
@@ -105,7 +107,7 @@ fn create_inner(home: &Path, managed: bool) -> Result<()> {
         drop(crate::state::AppState::open(stage.clone())?);
         platform::publish_directory_if_absent(&stage, home)
     })();
-    if result.is_err() && stage.exists() {
+    if result.is_err() && stage_created && stage.exists() {
         let _ = std::fs::remove_dir_all(&stage);
     }
     result

@@ -124,6 +124,95 @@ class SetupToolFixtureTests(unittest.TestCase):
             (self.home/'secrets/slack-setup/owner.lock').unlink();(self.home/'secrets/slack-setup').rmdir()
 
 
+class ManagedFailureRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.home=Path(self.temp.name)/'installation';(self.home/'native-manager/requests').mkdir(parents=True)
+        (self.home/'native-manager/controls').mkdir()
+        info=self.home.lstat();self.identity=(info.st_dev,info.st_ino)
+        self.request=str(uuid.uuid4());self.control=str(uuid.uuid4())
+        self.events=[{'action':'native-start','args':['--request-id',self.request]},
+                     {'action':'native-stop','args':['--request-id',self.control]}]
+        self.canary='private-canary-must-never-appear'
+
+    def write(self,name,value):
+        path=self.home/'native-manager'/name;path.write_text(json.dumps(value));return path
+
+    def observe(self):return m.managed_failure_records(self.home,self.identity,self.events)
+
+    def test_fixed_issued_records_retain_hash_identity_phase_without_secret_fields_or_commands(self):
+        active=self.write('active.json',{'request_id':self.request})
+        binding={'id':str(uuid.uuid4()),'binary_sha256':'a'*64,'profile':{'args':[self.canary]}}
+        request=self.write(f'requests/{self.request}.json',{'schema':1,'request_id':self.request,'phase':'accepted','binding':binding,'outcome':{'detail':self.canary},'credential':self.canary})
+        witness=self.write(f'requests/{self.request}.launched.json',{'request_id':self.request,'binding':binding,'process':{'platform':'windows','pid':123,'creation_time_100ns':'456','session_id':1,'unrecognized':self.canary}})
+        self.write(f'controls/{self.control}.json',{'request_id':self.control,'start_request_id':self.request,'phase':'unknown','process_absent':False})
+        self.write('enrollment.json',{'id':binding['id'],'profile':{'args':[self.canary]}})
+        before={p:p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        with patch.object(m.subprocess,'Popen',side_effect=AssertionError('No command')) as command,patch.object(m,'request',side_effect=AssertionError('No API')) as api:
+            result=self.observe();command.assert_not_called();api.assert_not_called()
+        self.assertTrue(result['read_only']);self.assertNotIn(self.canary,json.dumps(result))
+        self.assertEqual(len(result['records']),6)
+        for path in (active,request,witness):
+            row=result['records'][str(path.relative_to(self.home))]
+            self.assertEqual(row['state'],'observed');self.assertEqual(row['sha256'],hashlib.sha256(before[path]).hexdigest())
+        observed=result['records'][str(witness.relative_to(self.home))]['projection']
+        self.assertEqual(observed['process'],{'platform':'windows','pid':123,'creation_time_100ns':'456','session_id':1})
+        self.assertEqual(observed['binding_sha256'],result['records'][str(request.relative_to(self.home))]['projection']['binding_sha256'])
+        self.assertEqual(before,{p:p.read_bytes() for p in self.home.rglob('*') if p.is_file()})
+
+    def test_missing_witness_and_unissued_pointer_remain_readonly_absence(self):
+        foreign=str(uuid.uuid4());self.write('active.json',{'request_id':foreign})
+        self.write(f'requests/{foreign}.json',{'credential':self.canary})
+        result=self.observe()
+        self.assertEqual(result['records'][f'native-manager/requests/{self.request}.launched.json']['state'],'absent_at_read')
+        self.assertNotIn(f'native-manager/requests/{foreign}.json',result['records'])
+        self.assertNotIn(self.canary,json.dumps(result))
+
+    def test_oversize_malformed_nonobject_and_directory_are_distinct(self):
+        path=self.home/'native-manager/active.json'
+        for data,state in [(b'x'*65537,'oversize'),(b'{','malformed'),(b'[]','invalid_record')]:
+            path.write_bytes(data);row=self.observe()['records']['native-manager/active.json'];self.assertEqual(row['state'],state)
+            self.assertNotIn('projection',row)
+        path.unlink();path.mkdir()
+        self.assertEqual(self.observe()['records']['native-manager/active.json']['state'],'unsafe_or_changed')
+
+    def test_hardlink_record_is_not_read(self):
+        outside=Path(self.temp.name)/'outside.json';outside.write_text(json.dumps({'credential':self.canary}))
+        path=self.home/'native-manager/active.json';os.link(outside,path)
+        self.assertEqual(self.observe()['records']['native-manager/active.json']['state'],'unsafe_or_changed')
+
+    def test_symlink_and_parent_redirect_are_not_followed(self):
+        outside=Path(self.temp.name)/'outside.json';outside.write_text(json.dumps({'credential':self.canary}))
+        path=self.home/'native-manager/active.json'
+        try:path.symlink_to(outside)
+        except OSError as error:
+            if os.name=='nt' and getattr(error,'winerror',None)==1314:self.skipTest('Windows account lacks symlink creation privilege')
+            raise
+        self.assertEqual(self.observe()['records']['native-manager/active.json']['state'],'unsafe_or_changed')
+        path.unlink();folder=self.home/'native-manager/requests';folder.rmdir();folder.symlink_to(outside.parent,target_is_directory=True)
+        self.assertEqual(self.observe()['records'][f'native-manager/requests/{self.request}.json']['state'],'unsafe_or_changed')
+
+    def test_unknown_or_changed_home_never_reads_records(self):
+        with patch.object(m.os,'open',side_effect=AssertionError('No record read')) as opened:
+            self.assertEqual(m.managed_failure_records(self.home,None,self.events)['unavailable'],'fresh_home_identity_not_recorded')
+            self.assertEqual(m.managed_failure_records(self.home,(self.identity[0],self.identity[1]+1),self.events)['unavailable'],'fresh_home_identity_changed')
+            opened.assert_not_called()
+
+    def test_read_error_is_not_absence_and_original_exception_survives_diagnostic_failure(self):
+        self.write('active.json',{'request_id':self.request})
+        with patch.object(m.os,'open',side_effect=PermissionError(13,'denied')):
+            row=self.observe()['records']['native-manager/active.json'];self.assertEqual((row['state'],row['errno']),('read_error',13))
+        original=TimeoutError('original unknown action');receipt={}
+        with patch.object(m,'managed_failure_records',side_effect=KeyboardInterrupt()) as observe, self.assertRaises(TimeoutError) as caught:
+            try:raise original
+            except BaseException:
+                m.retain_managed_failure(receipt,self.home,self.identity,self.events,lambda:(_ for _ in ()).throw(OSError('failed receipt save')))
+                raise
+        self.assertIs(caught.exception,original);observe.assert_called_once()
+        self.assertEqual(receipt['manager_records'],{'unavailable':'diagnostic_error','error_type':'KeyboardInterrupt'})
+        self.assertEqual(receipt['diagnostic_save_error'],'OSError')
+
+
 class FixtureTests(unittest.TestCase):
     def test_exact_path_identity_refuses_copy_hardlink_and_missing_path(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -335,5 +424,29 @@ class FixtureTests(unittest.TestCase):
             launch.assert_called_once();remove.assert_not_called()
         self.assertTrue(process.killed);self.assertEqual(process.calls,2);self.assertEqual((home/'partial').read_bytes(),b'keep')
         saved=json.loads(result.with_name('unknown-native-manager-result.json').read_text());self.assertEqual(saved['events'][0]['outcome'],'unknown');self.assertFalse(saved['action_retry'])
+
+    def test_managed_inactive_start_retains_exact_request_and_absent_witness_without_another_action(self):
+        root=self.root/'managed-inactive';home=root/'installation';(home/'bin').mkdir(parents=True)
+        installed=home/'bin/acp-slack-adapter';installed.write_bytes(b'fixed fixture')
+        (home/'adapter.json').write_text(json.dumps({'enabled':False,'setup_complete':False,'acp':{'command':None}}))
+        (home/'native-manager/requests').mkdir(parents=True)
+        ident=str(uuid.uuid4());setup={'created':True,'serving':False,'executable':str(installed),'id':ident}
+        def process(argv,**kwargs):
+            if argv[3]=='native-setup':value=setup
+            else:
+                self.assertEqual(argv[3],'native-start');request=argv[-1]
+                (home/'native-manager/active.json').write_text(json.dumps({'request_id':request}))
+                (home/'native-manager/requests'/f'{request}.json').write_text(json.dumps({'request_id':request,'phase':'accepted','binding':{'id':ident}}))
+                value={'schema':'com.microsoft.amplifier.slack-native-status/1','id':ident,'home':str(home),'executable':str(installed),'autostart':False,'startup_change_supported':False,'state':'inactive','profile_matches':True,'request_current':True,'launch_observed':False}
+            return types.SimpleNamespace(pid=993,returncode=0,communicate=lambda timeout:(json.dumps(value).encode(),b''))
+        result=self.root/'inactive-native-launch-result.json'
+        with patch.object(m.tempfile,'mkdtemp',return_value=str(root)),patch.object(m.subprocess,'Popen',side_effect=process) as launch,patch.object(m.shutil,'rmtree') as remove:
+            with self.assertRaises(AssertionError):m.managed_lifecycle(installed,{},result)
+            self.assertEqual(launch.call_count,2);remove.assert_not_called()
+        saved=json.loads(result.with_name('inactive-native-manager-result.json').read_text());request=saved['first_request_id']
+        records=saved['manager_records']['records'];self.assertFalse(saved['passed']);self.assertTrue(saved['retained_home'])
+        self.assertEqual(records[f'native-manager/requests/{request}.json']['projection']['phase'],'accepted')
+        self.assertEqual(records[f'native-manager/requests/{request}.launched.json']['state'],'absent_at_read')
+        self.assertEqual(saved['events'][-1]['result']['state'],'inactive')
 
 if __name__ == '__main__':unittest.main()

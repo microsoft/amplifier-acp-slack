@@ -796,6 +796,41 @@ fn update_guard(b: &Binding) -> Result<Option<InstallationLock>> {
         Ok(None)
     }
 }
+fn launch_request_is_current(initial: &Value, current: &Value) -> bool {
+    if initial == current {
+        return true;
+    }
+    // The child can enter while its parent's one Start is still returning.
+    // That parent may publish only its accepted/unknown acknowledgement here;
+    // it has not yet seen the child's create-only generation witness. Preserve
+    // every identity, binding and pre-dispatch snapshot field exactly. A new
+    // request, a control fence or any other phase change is not this handoff.
+    if initial["phase"] != "start_intent"
+        || initial.get("outcome").is_some()
+        || initial.get("ready_process").is_some()
+    {
+        return false;
+    }
+    let mut expected = initial.clone();
+    match current["phase"].as_str() {
+        Some("accepted") => expected["phase"] = json!("accepted"),
+        Some("unknown") => {
+            let Some(outcome) = current["outcome"].as_object() else {
+                return false;
+            };
+            if outcome.len() != 2
+                || outcome.get("boundary") != Some(&json!("start"))
+                || !outcome.get("detail").is_some_and(Value::is_string)
+            {
+                return false;
+            }
+            expected["phase"] = json!("unknown");
+            expected["outcome"] = current["outcome"].clone();
+        }
+        _ => return false,
+    }
+    expected == *current
+}
 /// Called after the server acquires service.lock, before opening mutable state.
 pub fn validate_launch(home: &Path) -> Result<bool> {
     let r = active_request(home)?.context("No native manager launch owns this service")?;
@@ -828,7 +863,10 @@ pub fn validate_launch(home: &Path) -> Result<bool> {
         native_update::validate_launch_intent(home, None, None)?
     };
     ensure!(
-        active_request(home)?.as_ref() == Some(&r) && active_control(home)? == control_before,
+        active_request(home)?
+            .as_ref()
+            .is_some_and(|current| launch_request_is_current(&r, current))
+            && active_control(home)? == control_before,
         "Native manager launch was superseded"
     );
     let process =
@@ -847,6 +885,76 @@ pub fn validate_launch(home: &Path) -> Result<bool> {
         platform::private_create(&path, &serde_json::to_vec_pretty(&receipt)?)?;
     }
     Ok(allowed)
+}
+
+#[cfg(test)]
+mod launch_phase_tests {
+    use super::*;
+
+    fn intent() -> Value {
+        json!({"schema":1,"request_id":"same-request","phase":"start_intent",
+            "binding":{"id":"same-installation","home":"same-home","profile":{"args":["native-serve"]},"binary_sha256":"same-bytes","update":null},
+            "before":{"active":false,"processes":[]}})
+    }
+
+    #[test]
+    fn same_start_acceptance_during_child_validation_is_current() {
+        let initial = intent();
+        let mut accepted = initial.clone();
+        accepted["phase"] = json!("accepted");
+        assert!(launch_request_is_current(&initial, &accepted));
+    }
+
+    #[test]
+    fn same_start_unknown_reply_during_child_validation_is_current() {
+        let initial = intent();
+        let mut unknown = initial.clone();
+        unknown["phase"] = json!("unknown");
+        unknown["outcome"] = json!({"boundary":"start","detail":"lost manager acknowledgement"});
+        assert!(launch_request_is_current(&initial, &unknown));
+    }
+
+    #[test]
+    fn changed_launch_authority_and_other_transitions_stay_refused() {
+        let initial = intent();
+        assert!(launch_request_is_current(&initial, &initial));
+        let mut accepted = initial.clone();
+        accepted["phase"] = json!("accepted");
+        for field in ["request_id", "binding", "before", "schema"] {
+            let mut changed = accepted.clone();
+            changed[field] = json!("different");
+            assert!(!launch_request_is_current(&initial, &changed), "{field}");
+        }
+        for phase in [
+            "registering",
+            "registration_refused",
+            "registered",
+            "refused",
+            "ready",
+            "observing_existing",
+        ] {
+            let mut changed = initial.clone();
+            changed["phase"] = json!(phase);
+            assert!(!launch_request_is_current(&initial, &changed), "{phase}");
+        }
+        let mut unknown = initial.clone();
+        unknown["phase"] = json!("unknown");
+        for outcome in [
+            json!(null),
+            json!({"boundary":"registration","detail":"unknown"}),
+            json!({"boundary":"start","detail":null}),
+            json!({"boundary":"start","detail":"unknown","extra":true}),
+        ] {
+            unknown["outcome"] = outcome;
+            assert!(!launch_request_is_current(&initial, &unknown));
+        }
+        let mut extra = accepted.clone();
+        extra["unexpected"] = json!(true);
+        assert!(!launch_request_is_current(&initial, &extra));
+        assert!(!launch_request_is_current(&accepted, &initial));
+        assert!(!launch_request_is_current(&accepted, &unknown));
+        assert!(launch_request_is_current(&accepted, &accepted));
+    }
 }
 
 fn control_path(home: &Path, id: &str) -> Result<PathBuf> {
@@ -1217,21 +1325,28 @@ mod tests {
     }
     fn fixture() -> (tempfile::TempDir, Binding, Fake) {
         let t = tempfile::tempdir().unwrap();
-        platform::private_dir(t.path()).unwrap();
-        platform::private_dir(&t.path().join("bin")).unwrap();
-        platform::private_dir(&t.path().join("native-manager/requests")).unwrap();
+        // A TempDir may inherit an administrator-group owner on Windows.
+        // Use it only as the cleanup envelope; create the installation with
+        // the same explicit current-user owner as a fresh native artifact.
+        let home = t.path().join("installation");
+        platform::private_create_dir(&home).unwrap();
+        for relative in ["bin", "native-manager", "native-manager/requests"] {
+            platform::private_create_dir(&home.join(relative)).unwrap();
+            platform::validate_private_directory(&home.join(relative)).unwrap();
+        }
+        platform::validate_private_directory(&home).unwrap();
         let mut c = Config::new("Fixture".into(), "fixture".into());
         c.server.auth_mode = AuthMode::LocalPassword;
         c.server.web_transport = WebTransport::LocalHttp;
-        c.save(t.path()).unwrap();
+        c.save(&home).unwrap();
         write(
-            &t.path().join("native-installation.json"),
+            &home.join("native-installation.json"),
             &json!({"schema":1,"id":c.id,"update_owner":"installation","manager_owner":OWNER}),
         )
         .unwrap();
-        let exe = platform::installed_binary(&desktop::APPLICATION, t.path());
+        let exe = platform::installed_binary(&desktop::APPLICATION, &home);
         platform::private_create(&exe, b"exact fixture executable").unwrap();
-        let b = binding(t.path(), None).unwrap();
+        let b = binding(&home, None).unwrap();
         (t, b, Fake::new())
     }
     fn started(b: &Binding, m: &Fake) -> Value {
