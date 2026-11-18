@@ -9,6 +9,7 @@ use crate::{
     auth,
     config::Config,
     error::{ApiError, ApiResult},
+    links::Links,
     state::{AppState, now_ms},
     store::Store,
 };
@@ -204,6 +205,7 @@ struct SlackReader {
     base: String,
     token: String,
     home: std::path::PathBuf,
+    links: Links,
 }
 
 impl SlackReader {
@@ -221,6 +223,9 @@ impl SlackReader {
             base: c.slack.api_base.clone(),
             token: secrets.bot_token,
             home: home.into(),
+            links: Store::open(home)
+                .map(|store| Links::load(&store.db, &c.slack.team_id))
+                .map_err(|_| unavailable())?,
         })
     }
 
@@ -414,19 +419,11 @@ fn next_cursor(value: &Value) -> String {
         .collect()
 }
 
-fn source_url(c: &Config, channel: &str, message: Option<&str>) -> String {
-    let mut url = format!("https://app.slack.com/client/{}/{channel}", c.slack.team_id);
-    if let Some(ts) = message {
-        url.push_str(&format!("?message_ts={ts}"));
-    }
-    url
-}
-
-fn summary(c: &Config, conversation: &Conversation) -> Value {
+fn summary(c: &Config, links: &Links, conversation: &Conversation) -> Value {
     json!({
         "id":conversation.id,"conversation_id":conversation.id,"label":conversation.label,
         "surface":"slack","conversation_kind":if conversation.direct {"direct"} else {"group"},
-        "url":source_url(c,&conversation.id,None),"provider_id":format!("slack:{}",c.id)
+        "url":links.conversation(&conversation.id),"provider_id":format!("slack:{}",c.id)
     })
 }
 
@@ -496,7 +493,7 @@ async fn list(
     if !auth.owner {
         let origin = auth.origin.as_ref().ok_or_else(ApiError::forbidden)?;
         return Ok(
-            json!({"items":[summary(c,origin)],"complete":true,"next_cursor":null,
+            json!({"items":[summary(c,&slack.links,origin)],"complete":true,"next_cursor":null,
             "coverage":{"scope":"grant_conversation","checked":1},"observed_at":now_ms()}),
         );
     }
@@ -526,7 +523,7 @@ async fn list(
             }
             checked += 1;
             match slack.conversation(c, id, &auth.actor, true).await {
-                Ok(conversation) => items.push(summary(c, &conversation)),
+                Ok(conversation) => items.push(summary(c, &slack.links, &conversation)),
                 Err(error) if error.0 == StatusCode::FORBIDDEN => {}
                 Err(error) => return Err(error),
             }
@@ -548,7 +545,7 @@ async fn list(
 }
 
 fn messages(
-    c: &Config,
+    links: &Links,
     channel: &str,
     page: &Value,
     limit: usize,
@@ -572,7 +569,7 @@ fn messages(
             .unwrap_or("unknown");
         let thread = message["thread_ts"].as_str().filter(|s| timestamp(s));
         result.push(json!({"id":ts,"message_id":ts,"conversation_id":channel,"text":text,
-            "actor":actor,"actor_id":actor,"at":ts,"url":source_url(c,channel,Some(ts)),
+            "actor":actor,"actor_id":actor,"at":ts,"url":links.message(channel,ts,thread),
             "thread_id":thread,"reply_count":message["reply_count"].as_u64().unwrap_or(0),
             "latest_reply":message["latest_reply"].as_str().filter(|s|timestamp(s)),"truncated":text_truncated,
             "reactions":crate::reactions::projection(message),"connector_notice":crate::slack::control_message(message)}));
@@ -583,7 +580,6 @@ fn messages(
 }
 
 async fn read_page(
-    c: &Config,
     slack: &SlackReader,
     conversation: &Conversation,
     thread: Option<&str>,
@@ -610,13 +606,13 @@ async fn read_page(
         args["inclusive"] = true.into();
     }
     let page = slack.get(method, args).await?;
-    let (messages, truncated) = messages(c, &conversation.id, &page, limit)?;
+    let (messages, truncated) = messages(&slack.links, &conversation.id, &page, limit)?;
     let cursor = next_cursor(&page);
     let root = if let Some(thread) = thread {
         if let Some(root) = messages.iter().find(|m| m["id"] == thread) {
             root.clone()
         } else {
-            thread_root(c, slack, &conversation.id, thread).await
+            thread_root(slack, &conversation.id, thread).await
         }
     } else {
         Value::Null
@@ -630,7 +626,7 @@ async fn read_page(
     )
 }
 
-async fn thread_root(c: &Config, slack: &SlackReader, channel: &str, thread: &str) -> Value {
+async fn thread_root(slack: &SlackReader, channel: &str, thread: &str) -> Value {
     let result = slack
         .get(
             "conversations.replies",
@@ -638,12 +634,12 @@ async fn thread_root(c: &Config, slack: &SlackReader, channel: &str, thread: &st
         )
         .await;
     if let Ok(page) = result
-        && let Ok((items, _)) = messages(c, channel, &page, 1)
+        && let Ok((items, _)) = messages(&slack.links, channel, &page, 1)
         && let Some(item) = items.into_iter().find(|m| m["id"] == thread)
     {
         return item;
     }
-    json!({"id":thread,"available":false,"url":source_url(c,channel,Some(thread)),"notice":"Thread root unavailable; no text was assumed."})
+    json!({"id":thread,"available":false,"url":slack.links.message(channel,thread,Some(thread)),"notice":"Thread root unavailable; no text was assumed."})
 }
 
 fn thread_index(pages: &[&Value]) -> Vec<Value> {
@@ -736,7 +732,7 @@ async fn recent_thread_activity(
     let mut budget: usize = 6000;
     for (thread, oldest, _) in hints {
         let page = tokio::time::timeout(Duration::from_secs(2), slack.get("conversations.replies", json!({"channel":conversation.id,"ts":thread,"oldest":oldest,"inclusive":true,"limit":4}))).await.unwrap_or_else(|_| Err(unavailable()));
-        let root = thread_root(c, slack, &conversation.id, &thread).await;
+        let root = thread_root(slack, &conversation.id, &thread).await;
         let window = match page {
             Ok(mut page) => {
                 // Slack can include the parent in addition to the requested reply
@@ -749,7 +745,8 @@ async fn recent_thread_activity(
                             .is_some_and(|ts| ts != thread && ts >= oldest.as_str())
                     });
                 }
-                let (mut items, mut truncated) = messages(c, &conversation.id, &page, 4)?;
+                let (mut items, mut truncated) =
+                    messages(&slack.links, &conversation.id, &page, 4)?;
                 for item in &mut items {
                     let original = item["text"].as_str().unwrap_or("");
                     let text: String = original.chars().take(budget.min(1000)).collect();
@@ -760,7 +757,7 @@ async fn recent_thread_activity(
                     budget -= text.chars().count();
                     item["text"] = text.into();
                 }
-                json!({"root":root,"thread_id":thread,"url":source_url(c,&conversation.id,Some(&thread)),"messages":items,
+                json!({"root":root,"thread_id":thread,"url":slack.links.message(&conversation.id,&thread,Some(&thread)),"messages":items,
                     "complete":false,"next_cursor":next_cursor(&page),"available":true,
                     "coverage":{"scope":"recent_thread_window","oldest":oldest,"has_more":page["has_more"]==true,"text_truncated":truncated}})
             }
@@ -783,8 +780,8 @@ async fn orientation(
     conversation: &Conversation,
     thread: Option<&str>,
 ) -> ApiResult<Value> {
-    let recent = read_page(c, slack, conversation, None, 10, None, None).await?;
-    let mut value = summary(c, conversation);
+    let recent = read_page(slack, conversation, None, 10, None, None).await?;
+    let mut value = summary(c, &slack.links, conversation);
     value["actor_id"] = auth.actor.clone().into();
     value["owner"] = auth.owner.into();
     value["thread_id"] = json!(thread);
@@ -797,8 +794,8 @@ async fn orientation(
     value["recent_next_cursor"] = recent["next_cursor"].clone();
     value["threads"] = json!(thread_index(&[&recent]));
     if let Some(thread) = thread {
-        let around = read_page(c, slack, conversation, None, 6, None, Some(thread)).await?;
-        let replies = read_page(c, slack, conversation, Some(thread), 12, None, None).await?;
+        let around = read_page(slack, conversation, None, 6, None, Some(thread)).await?;
+        let replies = read_page(slack, conversation, Some(thread), 12, None, None).await?;
         value["parent_context"] = json!({"conversation_id":conversation.id,"label":conversation.label,
             "before_and_at_root":around["messages"],"before_root_next_cursor":around["next_cursor"],
             "recent_messages":recent["messages"],"recent_next_cursor":recent["next_cursor"],"complete":false});
@@ -867,7 +864,6 @@ async fn dispatch(
                 orientation(c, home, slack, auth, &conversation, thread).await
             } else {
                 let mut page = read_page(
-                    c,
                     slack,
                     &conversation,
                     thread,
@@ -936,7 +932,7 @@ pub async fn orientation_for(c: &Config, home: &Path, input: &Value) -> Result<V
         let auth = slack.authorize_grant(c, &grant).await?;
         let conversation = auth.origin.as_ref().ok_or_else(ApiError::forbidden)?;
         if c.context.thread_only_grants && !auth.owner && !grant.thread.is_empty() {
-            return read_page(c, &slack, conversation, Some(&grant.thread), 12, None, None).await;
+            return read_page(&slack, conversation, Some(&grant.thread), 12, None, None).await;
         }
         orientation(
             c,

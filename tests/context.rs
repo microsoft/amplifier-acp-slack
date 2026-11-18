@@ -709,6 +709,65 @@ async fn thread_orientation_contains_parent_predecessor_latest_parent_and_thread
 }
 
 #[tokio::test]
+async fn results_carry_the_address_slack_gives_out_once_the_workspace_is_known() {
+    let f = Fixture::new().await;
+    {
+        let mut fake = f.fake.lock().unwrap();
+        let mut root = message("1000.000002", "UBOT", "The answer that opened this thread");
+        root["thread_ts"] = "1000.000002".into();
+        root["reply_count"] = 1.into();
+        let mut reply = message("1000.000004", "UOWNER", "A reply in the thread");
+        reply["thread_ts"] = "1000.000002".into();
+        fake.history.insert(
+            "CSHARED".into(),
+            vec![
+                message("1000.000001", "UOWNER", "A message in the channel"),
+                root.clone(),
+            ],
+        );
+        fake.replies
+            .insert(("CSHARED".into(), "1000.000002".into()), vec![root, reply]);
+    }
+    let read = json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED"});
+    let (_, before) = f.query(read.clone()).await;
+    assert_eq!(
+        before["messages"][0]["url"],
+        "https://app.slack.com/client/TTEST/CSHARED?message_ts=1000.000001"
+    );
+    acp_slack_adapter::links::remember(
+        &Store::open(f.home.path()).unwrap(),
+        Some("https://example-team.slack.com/"),
+    )
+    .unwrap();
+    let (_, channel) = f.query(read).await;
+    assert_eq!(
+        channel["messages"][0]["url"],
+        "https://example-team.slack.com/archives/CSHARED/p1000000001"
+    );
+    assert_eq!(
+        channel["messages"][1]["url"],
+        "https://example-team.slack.com/archives/CSHARED/p1000000002?thread_ts=1000.000002&cid=CSHARED"
+    );
+    let (_, thread) = f
+        .query(json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED","thread_id":"1000.000002"}))
+        .await;
+    assert_eq!(
+        thread["messages"][1]["url"],
+        "https://example-team.slack.com/archives/CSHARED/p1000000004?thread_ts=1000.000002&cid=CSHARED"
+    );
+    let (_, list) = f
+        .query(json!({"operation":"list","access":{"mode":"owner"}}))
+        .await;
+    assert!(
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["url"] == "https://example-team.slack.com/archives/CSHARED" })
+    );
+}
+
+#[tokio::test]
 async fn mcp_requires_grant_and_exposes_scoped_tools_with_current_permissions() {
     let f = Fixture::new().await;
     let request = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}});

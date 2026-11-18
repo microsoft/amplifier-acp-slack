@@ -121,8 +121,16 @@ enum ConfigAction {
     },
 }
 
+fn main() {
+    // The PDF text child reads one file from its input and exits. It builds no
+    // runtime, parses no other arguments and opens no installation.
+    if std::env::args().nth(1).as_deref() == Some(acp_slack_adapter::pdf_text::COMMAND) {
+        std::process::exit(acp_slack_adapter::pdf_text::child());
+    }
+    start();
+}
 #[tokio::main]
-async fn main() {
+async fn start() {
     let cli = Cli::parse();
     let show_error = cli.command.is_none() && !cli.no_browser;
     if let Err(error) = run(cli).await {
