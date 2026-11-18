@@ -43,7 +43,10 @@ pub struct Decision {
 }
 impl Decision {
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.media.len() <= 4, "Too many output files");
+        anyhow::ensure!(
+            self.media.len() <= crate::media::MAX_FILES,
+            "Too many output files"
+        );
         for file in &self.media {
             file.bytes()?;
         }

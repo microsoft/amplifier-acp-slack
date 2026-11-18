@@ -61,13 +61,29 @@ Output file bytes are stored in the private durable outbox so pending replies su
 
 ## Controls and tests
 
-Configuration and dashboard offer `media.incoming`, `media.outgoing`, `media.max_files` (1–4), and `media.max_file_bytes` (1–2097152). UI controls use the same configuration API and semantic view drafts as other settings. The defaults enable supported files within these bounds.
+Configuration and dashboard offer `media.incoming`, `media.outgoing`, `media.max_files` (1–8), and `media.max_file_bytes` (1–2097152). UI controls use the same configuration API and semantic view drafts as other settings. The defaults enable supported files within these bounds.
 
 `python3 tests/media.py` uses actual connector/ACP processes and a local Slack fixture. It checks image negotiation, text/resource fallback, external-file refusal, redirect and actual-byte bounds, private URL exclusion, output file upload, destination threads, unsupported resource fallback and uncertain partial delivery without duplicate sends. It also checks a PDF over the file limit read as page-numbered text, the same for an agent without embedded-file support, a PDF of pictures, and the size-stating refusals. `cargo test --test pdf_text` runs the extraction child itself, including a file built to inflate far past its size. No real Slack messages are posted. Rust tests additionally reject deceptive hostnames, non-TLS URLs, alternate ports, local paths and invalid content signatures.
 
 Primary references: [Slack file handling](https://docs.slack.dev/messaging/working-with-files/), [file object authentication](https://docs.slack.dev/reference/objects/file-object/), [external upload URL](https://docs.slack.dev/reference/methods/files.getUploadURLExternal), [complete upload](https://docs.slack.dev/reference/methods/files.completeUploadExternal).
 
 The optional browser regression (`tests/media_browser.mjs`, with `PLAYWRIGHT_MODULE` and `CHROMIUM_PATH`) verifies media and continuity settings save through the UI/API and fit desktop and phone layouts. Version 0.4.1 corrects those form field mappings.
+
+## Sending a saved document
+
+On Constellation Runtime, ask the agent to attach a saved Markdown, plain text,
+CSV or JSON file from its workspace. The agent uses `workspace_attach_file`.
+The connector receives a named embedded document and keeps its original text and
+line endings. For agents with Slack conversation tools, `slack_attach_file`
+can stage explicitly supplied contents for the current reply. An optional SHA-256
+checks those contents against an original. Staging the same name and bytes twice
+adds the file once. Slack shares the files when the agent sends its reply.
+
+A Slack message with files exposes their IDs alongside the message ID in
+conversation history. Use `slack_read_document` for a Slack-hosted text file.
+Follow the returned byte offsets and SHA-256 until `complete` is true. The
+reader verifies the source message and file within the conversation on every
+call. File contents are untrusted text.
 
 ## Check installed permissions
 
