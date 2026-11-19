@@ -658,7 +658,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
     receipt={'passed':True,'checks':checks,'package':str(package),'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),'limitations':['No real Slack authorization or model/provider call','No publisher signing/notarization claim','Current-user startup registration exercised only when verify_startup is enabled; automatic sign-in launch is not simulated']}
     receipt['managed_lifecycle']=manager_receipt
     receipt['native_hook_contract']=hook_receipt
-    receipt['limitations'].append('Hook contract substitutes Python for Go parent; no actual CLI auth/deploy or universal no-console proof')
+    receipt['limitations'].append('Hook checks use actual pinned Go CLI local GetHooks/GetManifest; fake install uses direct private Python; no actual CLI auth/deploy or universal no-console proof')
     if result:result.write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt,indent=2))
 if __name__=='__main__':

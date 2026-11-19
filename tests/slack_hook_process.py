@@ -3,7 +3,8 @@
 
 The caller uses CREATE_NO_WINDOW on Windows, just like the production CLI
 parent. The shell receives no hiding flag: upstream 91df uses plain exec.Command.
-The CLI receives a fresh empty config, telemetry/update disabled and no tokens.
+The CLI receives a fresh empty config, Slack telemetry-disable/update-skip
+environment flags and no tokens. This does not prove all vendor tracing is off.
 No authorization, app deployment or actual workspace connection is exercised.
 """
 import argparse
@@ -369,24 +370,69 @@ def cli_hook_proof(stdout, stderr, commands, manifest, project):
     return {'actual_go_cli_hooks': completed, 'file_fallback_accepted': False}
 
 
-def cli_output_snapshot(paths, evidence, *, joined, returncode, cli_sha256):
+def cli_config_checkpoint(config):
+    """Observe only this invocation's fresh config/log directory; never auth."""
+    result = {'scope': 'Own fresh configuration only; log snapshots are not EOF proof',
+              'config_exists': False, 'logs_exists': False, 'logs': []}
+    for key, path in (('config_exists', config), ('logs_exists', config / 'logs')):
+        if not os.path.lexists(path):
+            return result
+        for part in (path, *path.parents):
+            info = part.lstat()
+            if not stat.S_ISDIR(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                raise AssertionError('Linked or non-directory CLI checkpoint')
+        result[key] = True
+    # At most two date-named files from this one fresh configuration.
+    # Refuse unexpected entries instead of scanning another path or log store.
+    with os.scandir(config / 'logs') as entries:
+        for entry in entries:
+            if len(result['logs']) >= 2 or not re.fullmatch(r'slack-debug-[0-9]{8}\.log', entry.name):
+                raise AssertionError('CLI checkpoint log inventory differs')
+            path = ordinary(Path(entry.path)); before = path.lstat()
+            flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+            fd = os.open(path, flags)
+            with os.fdopen(fd, 'rb') as stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise AssertionError('CLI checkpoint log changed before read')
+                data = stream.read(CLI_OUTPUT_LIMIT + 1)
+            overflow = len(data) > CLI_OUTPUT_LIMIT or opened.st_size > CLI_OUTPUT_LIMIT
+            data = data[:CLI_OUTPUT_LIMIT]
+            result['logs'].append({'name': entry.name, 'observed_size': opened.st_size,
+                                   'overflow': overflow, 'snapshot_sha256': sha(data),
+                                   'base64': base64.b64encode(data).decode('ascii')})
+    result['logs'].sort(key=lambda row: row['name'])
+    return result
+
+
+def cli_output_snapshot(outputs, evidence, *, joined, returncode, cli_sha256, config_checkpoint=None):
     records, captured = [], []
-    for path in paths:
-        ordinary(path)
-        # Separate read descriptors do not change possibly-live child offsets.
-        with path.open('rb') as stream: data = stream.read(CLI_OUTPUT_LIMIT + 1)
-        size = path.stat().st_size
-        overflow = len(data) > CLI_OUTPUT_LIMIT or size > CLI_OUTPUT_LIMIT
+    for output in outputs:
+        if output is not None and not isinstance(output, bytes):
+            raise AssertionError('CLI output must be bytes')
+        data = output or b''
+        size = len(data)
+        overflow = size > CLI_OUTPUT_LIMIT
         data = data[:CLI_OUTPUT_LIMIT]; captured.append(data)
-        records.append({'observed_size': size, 'overflow': overflow, 'snapshot_sha256': sha(data),
-                        'base64': base64.b64encode(data).decode('ascii')})
+        records.append({'available': output is not None, 'observed_size': size if output is not None else None,
+                        'overflow': overflow if output is not None else None,
+                        'snapshot_sha256': sha(data) if output is not None else None,
+                        'base64': base64.b64encode(data).decode('ascii') if output is not None else None})
     artifact = {'schema': 1, 'scope': 'Fresh empty config, no supplied tokens; actual pinned CLI local command only',
                 'joined': joined, 'returncode': returncode if joined else None, 'cli_sha256': cli_sha256,
+                'capture_limit_scope': 'Saved prefixes only; communicate memory is not bounded by this limit',
                 'stdout': records[0], 'stderr': records[1]}
-    with evidence.open('x', encoding='utf-8') as output: json.dump(artifact, output, indent=2)
+    if config_checkpoint is not None:
+        artifact['own_config_checkpoint'] = config_checkpoint
+    encoded = json.dumps(artifact, indent=2).encode('utf-8')
+    if len(encoded) > LIMIT:
+        raise AssertionError('Combined CLI evidence exceeds bound')
+    with evidence.open('xb') as output: output.write(encoded)
     summary = {'raw_evidence_sha256': file_sha(evidence), 'raw_evidence_bytes': evidence.stat().st_size,
                'stdout_size': records[0]['observed_size'], 'stderr_size': records[1]['observed_size'],
-               'output_overflow': any(row['overflow'] for row in records), 'output_complete': joined}
+               'output_overflow': (True if any(row['overflow'] for row in records) else
+                                   False if all(row['available'] for row in records) else None),
+               'output_complete': joined}
     return captured, summary
 
 
@@ -402,24 +448,32 @@ def actual_cli_local_phase(binary, identity, folder, project, commands, manifest
     argv = [str(binary), '--config-dir', str(config), '--no-color', '--skip-update', '--verbose',
             'manifest', 'info', '--source', 'local']
     phase = {'action': 'actual_cli_local_manifest', 'status': 'dispatching',
-             'cli_sha256': identity['sha256'], 'telemetry_disabled': True, 'fresh_empty_config': True}
+             'cli_sha256': identity['sha256'], 'slack_disable_telemetry_env': True, 'fresh_empty_config': True,
+             'stdio': 'pipe_stdin_stdout_stderr', 'capture_limit_scope': 'Saved prefixes only; live communicate memory is not capped'}
     receipt['phases'].append(phase); save()
-    paths = [folder / 'actual-cli-stdout', folder / 'actual-cli-stderr']
     try:
-        with paths[0].open('xb') as out, paths[1].open('xb') as err:
-            child = subprocess.Popen(argv, cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            phase.update(child_identity(child)); save()
-            child.wait(timeout=20)
+        child = subprocess.Popen(argv, cwd=project, env=env, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        phase.update(child_identity(child)); save()
+        # Match production's empty-input/piped-output boundary. Unlike run(),
+        # communicate() leaves a timed-out child untouched; do not retry or kill.
+        outputs = child.communicate(input=b'', timeout=20)
     except BaseException as error:
         phase.update(status='unknown_no_retry_no_kill', error_type=type(error).__name__)
         try:
-            _, summary = cli_output_snapshot(paths, evidence, joined=False, returncode=None, cli_sha256=identity['sha256'])
+            checkpoint = cli_config_checkpoint(config)
+        except BaseException as capture_error:
+            checkpoint = {'status': 'unavailable', 'error_type': type(capture_error).__name__}
+        try:
+            partial = (getattr(error, 'output', None), getattr(error, 'stderr', None))
+            _, summary = cli_output_snapshot(partial, evidence, joined=False, returncode=None,
+                                             cli_sha256=identity['sha256'], config_checkpoint=checkpoint)
             phase.update(summary); save()
         except BaseException as capture_error:
             phase['capture_error_type'] = type(capture_error).__name__
         raise
-    captured, summary = cli_output_snapshot(paths, evidence, joined=True, returncode=child.returncode, cli_sha256=identity['sha256'])
+    captured, summary = cli_output_snapshot(outputs, evidence, joined=True, returncode=child.returncode, cli_sha256=identity['sha256'])
     phase.update(summary, status='returned', returncode=child.returncode); save()
     if child.returncode or summary['output_overflow']:
         raise AssertionError('Actual CLI failed or output exceeded bound')
@@ -572,15 +626,14 @@ class PureContractTests(unittest.TestCase):
 
     def test_actual_cli_raw_snapshot_is_bounded_and_never_overwrites_original(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve(); paths = [root/'out', root/'err']; evidence = root/'evidence.json'
-            paths[0].write_bytes(b'x' * (CLI_OUTPUT_LIMIT + 1)); paths[1].write_bytes(b'')
-            captured, summary = cli_output_snapshot(paths, evidence, joined=False, returncode=None, cli_sha256='a'*64)
+            root = Path(temporary).resolve(); outputs = [b'x' * (CLI_OUTPUT_LIMIT + 1), b'']; evidence = root/'evidence.json'
+            captured, summary = cli_output_snapshot(outputs, evidence, joined=False, returncode=None, cli_sha256='a'*64)
             self.assertEqual(len(captured[0]), CLI_OUTPUT_LIMIT); self.assertTrue(summary['output_overflow'])
             self.assertFalse(summary['output_complete']); original = evidence.read_bytes()
             saved = json.loads(original); self.assertEqual(base64.b64decode(saved['stdout']['base64']), captured[0])
             self.assertIsNone(saved['returncode']); self.assertLess(len(original), LIMIT)
             with self.assertRaises(FileExistsError):
-                cli_output_snapshot(paths, evidence, joined=True, returncode=0, cli_sha256='a'*64)
+                cli_output_snapshot(outputs, evidence, joined=True, returncode=0, cli_sha256='a'*64)
             self.assertEqual(evidence.read_bytes(), original)
 
     def test_actual_cli_fresh_config_clean_environment_and_one_dispatch(self):
@@ -589,6 +642,7 @@ class PureContractTests(unittest.TestCase):
             root=Path(temporary).resolve(); project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
             commands, manifest, output = self.cli_transcript(project)
             child=Mock(returncode=0, pid=42)
+            child.communicate.return_value=(output,b'')
             def launch(argv, **kwargs):
                 self.assertEqual(argv[-4:], ['manifest','info','--source','local'])
                 self.assertEqual(kwargs['cwd'], project)
@@ -596,7 +650,8 @@ class PureContractTests(unittest.TestCase):
                 self.assertEqual(kwargs['env']['SLACK_SKIP_UPDATE'], 'true')
                 for forbidden in ('SLACK_TOKEN','SLACK_CONFIG_DIR','OPENAI_API_KEY','DENO_AUTH_TOKENS'):
                     self.assertNotIn(forbidden, kwargs['env'])
-                kwargs['stdout'].write(output); kwargs['stderr'].write(b'')
+                for name in ('stdin','stdout','stderr'):
+                    self.assertEqual(kwargs[name], subprocess.PIPE)
                 (Path(argv[2])/'credentials.json').write_text('{}')
                 return child
             receipt={'phases':[]};save=Mock()
@@ -604,7 +659,7 @@ class PureContractTests(unittest.TestCase):
                     patch.object(subprocess,'Popen',side_effect=launch) as popen, \
                     patch(__name__+'.child_identity',return_value={'pid':42}):
                 actual_cli_local_phase(binary, {'sha256':file_sha(binary)}, root, project, commands, manifest, receipt, save, root/'evidence.json')
-            self.assertEqual(popen.call_count,1);child.wait.assert_called_once_with(timeout=20)
+            self.assertEqual(popen.call_count,1);child.communicate.assert_called_once_with(input=b'',timeout=20)
             child.kill.assert_not_called();child.terminate.assert_not_called()
             self.assertTrue(receipt['phases'][0]['empty_auth_preserved'])
 
@@ -613,17 +668,100 @@ class PureContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
             commands,manifest,_=self.cli_transcript(project)
-            original=subprocess.TimeoutExpired('fixed-local-cli',20)
-            child=Mock(returncode=None,pid=42);child.wait.side_effect=original
+            original=subprocess.TimeoutExpired('fixed-local-cli',20,output=b'partial',stderr=None)
+            child=Mock(returncode=None,pid=42);child.communicate.side_effect=original
             receipt={'phases':[]}
             with patch.object(subprocess,'Popen',return_value=child) as popen, \
                     patch(__name__+'.child_identity',return_value={'pid':42}):
                 with self.assertRaises(subprocess.TimeoutExpired) as caught:
                     actual_cli_local_phase(binary, {'sha256':file_sha(binary)}, root, project, commands, manifest, receipt, lambda:None, root/'evidence.json')
             self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1)
+            child.communicate.assert_called_once_with(input=b'',timeout=20)
+            child.wait.assert_not_called()
             child.kill.assert_not_called();child.terminate.assert_not_called()
             self.assertEqual(receipt['phases'][0]['status'],'unknown_no_retry_no_kill')
-            self.assertFalse(json.loads((root/'evidence.json').read_bytes())['joined'])
+            saved=json.loads((root/'evidence.json').read_bytes())
+            self.assertFalse(saved['joined'])
+            self.assertEqual(base64.b64decode(saved['stdout']['base64']),b'partial')
+            self.assertFalse(saved['stderr']['available'])
+            for field in ('observed_size','overflow','snapshot_sha256','base64'):
+                self.assertIsNone(saved['stderr'][field])
+            self.assertIsNone(receipt['phases'][0]['stderr_size'])
+            self.assertEqual(saved['own_config_checkpoint']['logs'],[])
+
+    def test_own_config_checkpoint_bounds_two_logs_and_never_reads_auth(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config=Path(temporary).resolve()/'cli-probe-config';config.mkdir()
+            (config/'credentials.json').write_text('private-content-not-to-read')
+            logs=config/'logs';logs.mkdir()
+            for day in ('20261118','20261119'):
+                (logs/('slack-debug-'+day+'.log')).write_bytes(b'x'*(CLI_OUTPUT_LIMIT+1))
+            original_open=Path.open
+            def guarded_open(path,*args,**kwargs):
+                self.assertNotEqual(path.name,'credentials.json')
+                return original_open(path,*args,**kwargs)
+            with patch.object(Path,'open',guarded_open):
+                checkpoint=cli_config_checkpoint(config)
+            self.assertEqual(len(checkpoint['logs']),2)
+            for row in checkpoint['logs']:
+                self.assertTrue(row['overflow'])
+                self.assertEqual(len(base64.b64decode(row['base64'])),CLI_OUTPUT_LIMIT)
+            evidence=config.parent/'evidence.json'
+            cli_output_snapshot([b'x'*(CLI_OUTPUT_LIMIT+1)]*2,evidence,joined=False,
+                                returncode=None,cli_sha256='a'*64,config_checkpoint=checkpoint)
+            self.assertLess(evidence.stat().st_size,LIMIT)
+            self.assertNotIn('private-content-not-to-read',evidence.read_text())
+            (logs/'slack-debug-20261120.log').write_bytes(b'')
+            with self.assertRaisesRegex(AssertionError,'inventory differs'):
+                cli_config_checkpoint(config)
+
+    def test_own_config_checkpoint_refuses_unexpected_or_linked_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();config=root/'cli-probe-config';config.mkdir();logs=config/'logs';logs.mkdir()
+            unexpected=logs/'credentials.json';unexpected.write_text('must-not-read')
+            with self.assertRaisesRegex(AssertionError,'inventory differs'):
+                cli_config_checkpoint(config)
+            unexpected.unlink()
+            if os.name != 'nt':
+                outside=root/'outside';outside.write_bytes(b'must-not-read')
+                (logs/'slack-debug-20261119.log').symlink_to(outside)
+                with self.assertRaisesRegex(AssertionError,'Linked'):
+                    cli_config_checkpoint(config)
+
+    def test_timeout_checkpoint_failure_preserves_exception_and_unknown(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
+            commands,manifest,_=self.cli_transcript(project)
+            original=subprocess.TimeoutExpired('fixed-local-cli',20)
+            child=Mock(returncode=None,pid=42);child.communicate.side_effect=original
+            receipt={'phases':[]}
+            with patch.object(subprocess,'Popen',return_value=child) as popen, \
+                    patch(__name__+'.child_identity',return_value={'pid':42}), \
+                    patch(__name__+'.cli_config_checkpoint',side_effect=OSError('unavailable')):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    actual_cli_local_phase(binary,{'sha256':file_sha(binary)},root,project,commands,manifest,receipt,lambda:None,root/'evidence.json')
+            self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1)
+            child.communicate.assert_called_once_with(input=b'',timeout=20)
+            child.wait.assert_not_called();child.kill.assert_not_called();child.terminate.assert_not_called()
+            saved=json.loads((root/'evidence.json').read_bytes())
+            self.assertEqual(saved['own_config_checkpoint'],{'status':'unavailable','error_type':'OSError'})
+            self.assertIsNone(saved['stdout']['observed_size']);self.assertIsNone(saved['stderr']['observed_size'])
+
+    def test_joined_overflow_never_becomes_hook_success(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
+            commands,manifest,_=self.cli_transcript(project)
+            child=Mock(returncode=0,pid=42);child.communicate.return_value=(b'x'*(CLI_OUTPUT_LIMIT+1),b'')
+            receipt={'phases':[]}
+            with patch.object(subprocess,'Popen',return_value=child), \
+                    patch(__name__+'.child_identity',return_value={'pid':42}), \
+                    patch(__name__+'.cli_hook_proof') as proof:
+                with self.assertRaisesRegex(AssertionError,'output exceeded'):
+                    actual_cli_local_phase(binary,{'sha256':file_sha(binary)},root,project,commands,manifest,receipt,lambda:None,root/'evidence.json')
+                proof.assert_not_called()
+            self.assertTrue(receipt['phases'][0]['output_overflow'])
 
     def test_console_image_text_bound_retains_exact_digest_and_length(self):
         self.assertEqual(diagnostic_image('x' * 1024)['image'], 'x' * 1024)
