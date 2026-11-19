@@ -123,6 +123,7 @@ jobs:
       - run: python tests/slack_setup.py
       - run: python tests/native_update.py
       - run: python tests/native_startup_observation.py
+      - run: python tests/slack_hook_process.py --self-test
       - run: python tests/native_update_process.py --self-test
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package private runtime and verify platform binary

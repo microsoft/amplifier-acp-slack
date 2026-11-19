@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import stat
 import subprocess
 import shlex
 import zipfile
@@ -198,11 +199,14 @@ def wrong_workspace(auth, body, outcome):
 
 def prepare_project(folder, manifest, app_id, auth):
     project = folder / 'project'
+    # Refuse a mismatched runtime/layout before materializing a project. Hooks
+    # run from this exact cwd; absolute user paths must never enter shell text.
+    commands = {action: hook_command(project, action) for action in ('hooks', 'manifest', 'install')}
     (project / '.slack').mkdir(mode=0o700, parents=True, exist_ok=True)
     write(project / 'manifest.json', manifest)
-    write(project / '.slack/hooks.json', {'hooks': {'get-hooks': hook_command(project, 'hooks')}})
+    write(project / '.slack/hooks.json', {'hooks': {'get-hooks': commands['hooks']}})
     write(project / '.slack/config.json', {'manifest': {'source': 'local'}})
-    (project / 'hooks.py').write_text(HOOK.replace('__MANIFEST_COMMAND__', repr(hook_command(project, 'manifest'))).replace('__INSTALL_COMMAND__', repr(hook_command(project, 'install'))))
+    (project / 'hooks.py').write_text(HOOK.replace('__MANIFEST_COMMAND__', repr(commands['manifest'])).replace('__INSTALL_COMMAND__', repr(commands['install'])))
     apps_path = project / '.slack/apps.json'
     apps = read(apps_path, {'apps': {}})
     existing = apps.get('apps', {}).get(auth['team_id'], {}).get('app_id')
@@ -215,8 +219,59 @@ def prepare_project(folder, manifest, app_id, auth):
 
 
 def hook_command(project, action):
-    args = [sys.executable, '-I', '-B', '-X', 'utf8', str(project / 'hooks.py'), action]
-    return subprocess.list2cmdline(args) if os.name == 'nt' else shlex.join(args)
+    if action not in ('hooks', 'manifest', 'install'):
+        raise SetupError('Invalid private Slack setup action.')
+    project = Path(project)
+    if (not project.is_absolute() or '..' in project.parts or
+            project.parts[-3:] != ('secrets', 'slack-setup', 'project')):
+        raise SetupError('The private Slack setup project does not match this installation.')
+    home = project.parents[2]
+
+    def ordinary(path, directory=False, optional=False):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if optional:
+                return False
+            raise SetupError('The private Slack setup path is missing.') from None
+        valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        if not valid_type or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise SetupError('The private Slack setup path has changed.')
+        return True
+
+    for directory in (home, home / 'secrets', project.parent):
+        ordinary(directory, directory=True)
+    ordinary(project, directory=True, optional=True)
+    ordinary(project / 'hooks.py', optional=True)
+    windows = sys.platform == 'win32'
+    interpreter = home / 'runtime/python' / ('python.exe' if windows else 'bin/python3')
+    if ordinary(interpreter, optional=True):
+        for directory in (home / 'runtime', home / 'runtime/python', interpreter.parent):
+            ordinary(directory, directory=True)
+        try:
+            actual = Path(sys.executable).resolve(strict=True)
+            expected = interpreter.resolve(strict=True)
+            same = (os.path.normcase(str(actual)) == os.path.normcase(str(expected))
+                    and os.path.samefile(actual, expected))
+        except OSError:
+            same = False
+        if not same:
+            raise SetupError('The Slack setup interpreter does not match this installation.')
+        # CLI4.12.0 splits on whitespace before handing hooks to PowerShell or
+        # a POSIX shell. Fixed relative tokens survive that normalization and
+        # do not interpret a username/home as shell syntax. cli() owns cwd.
+        prefix = (r'& ..\..\..\runtime\python\python.exe -I -B -X utf8 .\hooks.py '
+                  if windows else '../../../runtime/python/bin/python3 -I -B -X utf8 ./hooks.py ')
+        return prefix + action
+    server = read(home / 'adapter.json', {}).get('server') if sys.platform == 'linux' else None
+    # Match Rust ServerConfig's serde default for existing PAM configurations,
+    # while refusing a missing configuration or an explicit local-password one.
+    if not isinstance(server, dict) or server.get('auth_mode', 'pam') != 'pam':
+        raise SetupError('The connector private setup runtime is missing. Reopen the complete app bundle.')
+    # The existing Linux PAM installer intentionally uses its system Python.
+    # It must not be redirected to an absent bundled runtime. The project script
+    # is still fixed relative to the same private cwd.
+    return shlex.join([sys.executable, '-I', '-B', '-X', 'utf8', './hooks.py', action])
 
 
 HOOK = '''import json, os, pathlib, sys

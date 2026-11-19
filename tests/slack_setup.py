@@ -76,6 +76,11 @@ class SetupTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.folder = self.home/'secrets/slack-setup'
         self.folder.mkdir(parents=True)
+        # These lifecycle cases replace the CLI boundary; select a fictional
+        # private interpreter rather than borrowing the controller's Python.
+        interpreter=self.home/'runtime/python'/('python.exe' if s.sys.platform=='win32' else 'bin/python3')
+        interpreter.parent.mkdir(parents=True);interpreter.write_bytes(b'private fixture interpreter')
+        runtime=patch.object(s.sys,'executable',str(interpreter));runtime.start();self.addCleanup(runtime.stop)
         self.team = 'TONE'
         self.created = 0
         self.calls = []
@@ -285,11 +290,11 @@ class SetupTests(unittest.TestCase):
         with self.assertRaises(s.SetupError):s.execute(self.home,'token',{'team_id':'TTWO'})
         self.assertEqual(s.execute(self.home,'token',{'team_id':'TONE'})['token'],'private-access')
 
-    def test_hook_uses_current_private_python_and_handles_spaces(self):
-        project=self.folder/'project with spaces'
-        project.mkdir()
+    def test_hook_uses_fixed_private_python_from_the_project_cwd(self):
+        project=self.folder/'project'
         command=s.hook_command(project,'manifest')
-        self.assertIn(s.sys.executable,command)
+        self.assertNotIn(s.sys.executable,command)
+        self.assertIn('runtime',command);self.assertIn('hooks.py',command)
         self.assertIn('-I',command);self.assertIn('-B',command);self.assertIn('-X',command);self.assertIn('utf8',command)
         prepared=s.prepare_project(self.folder,{},'',{'team_id':'TONE'})
         compile((prepared/'hooks.py').read_text(),'hooks.py','exec')
@@ -321,5 +326,99 @@ class SetupTests(unittest.TestCase):
         result=s.execute(self.home,'connect',{'manifest':{},'app_id':'AEXISTING'})
         self.assertEqual(result['app_id'],'AEXISTING')
         self.assertEqual(self.created,0)
+
+class HookPathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='Slack hooks  café $& ')
+        self.addCleanup(self.tmp.cleanup)
+        self.home=Path(self.tmp.name).resolve()
+        self.project=self.home/'secrets/slack-setup/project'
+        self.project.parent.mkdir(parents=True)
+        self.system_python=s.sys.executable
+
+    def interpreter(self, target):
+        binary=self.home/'runtime/python'/('python.exe' if target=='win32' else 'bin/python3')
+        binary.parent.mkdir(parents=True,exist_ok=True)
+        binary.write_bytes(b'private interpreter fixture')
+        return binary
+
+    def test_private_hooks_are_fixed_relative_for_each_native_platform(self):
+        for target in ['win32','darwin','linux']:
+            binary=self.interpreter(target)
+            with self.subTest(target=target),patch.object(s.sys,'platform',target),patch.object(s.sys,'executable',str(binary)):
+                for action in ['hooks','manifest','install']:
+                    command=s.hook_command(self.project,action)
+                    expected=(r'& ..\..\..\runtime\python\python.exe -I -B -X utf8 .\hooks.py ' if target=='win32'
+                              else '../../../runtime/python/bin/python3 -I -B -X utf8 ./hooks.py ')+action
+                    self.assertEqual(command,expected)
+                    self.assertNotIn(str(self.home),command)
+
+    def test_wrong_action_or_project_layout_is_refused_before_project_creation(self):
+        binary=self.interpreter('darwin')
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)):
+            for action in ['manifest;echo unsafe','',None]:
+                with self.subTest(action=action),self.assertRaises(s.SetupError):s.hook_command(self.project,action)
+            for project in [self.home/'project',self.project.parent/'project with spaces',Path('secrets/slack-setup/project')]:
+                with self.subTest(project=project),self.assertRaises(s.SetupError):s.hook_command(project,'hooks')
+            with self.assertRaises(s.SetupError):s.prepare_project(self.home/'wrong-folder',{},'',{'team_id':'TONE'})
+        self.assertFalse((self.home/'wrong-folder/project').exists())
+        self.assertFalse(self.project.exists())
+
+    def test_native_missing_interpreter_never_uses_external_python(self):
+        for target in ['win32','darwin']:
+            with self.subTest(target=target),patch.object(s.sys,'platform',target),patch.object(s.sys,'executable',self.system_python),self.assertRaises(s.SetupError):
+                s.hook_command(self.project,'hooks')
+        self.assertFalse(self.project.exists())
+
+    def test_different_copy_or_hardlink_interpreter_is_not_the_selected_path(self):
+        binary=self.interpreter('darwin')
+        other=self.home/'different-python'
+        other.write_bytes(binary.read_bytes())
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(other)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        other.unlink();os.link(binary,other)
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(other)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertEqual(binary.read_bytes(),b'private interpreter fixture')
+
+    def test_existing_project_links_and_file_conflicts_are_not_adopted(self):
+        binary=self.interpreter('darwin')
+        self.project.write_bytes(b'existing unrelated file')
+        before=self.project.stat()
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertEqual(self.project.read_bytes(),b'existing unrelated file')
+        self.assertEqual(self.project.stat().st_ino,before.st_ino)
+
+    @unittest.skipIf(os.name=='nt','Creating symlinks may require Windows developer policy')
+    def test_symlink_project_and_private_interpreter_refused_without_repair(self):
+        binary=self.interpreter('darwin')
+        other=self.home/'other';other.mkdir();self.project.symlink_to(other,target_is_directory=True)
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertTrue(self.project.is_symlink());self.project.unlink()
+        binary.unlink();binary.symlink_to(self.system_python)
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertTrue(binary.is_symlink())
+
+    def test_linux_pam_external_python_is_explicit_and_private_mismatch_never_falls_back(self):
+        with patch.object(s.sys,'platform','linux'),patch.object(s.sys,'executable',self.system_python):
+            with self.assertRaises(s.SetupError):s.hook_command(self.project,'manifest')
+            s.write(self.home/'adapter.json',{'server':{'auth_mode':'pam'}})
+            self.assertEqual(s.hook_command(self.project,'manifest'),s.shlex.join([
+                self.system_python,'-I','-B','-X','utf8','./hooks.py','manifest']))
+            # Rust ServerConfig defaults an omitted auth_mode to Pam for old
+            # configurations; this is not permission to invent a missing config.
+            s.write(self.home/'adapter.json',{'server':{'owner':'legacy fixture'}})
+            self.assertEqual(s.hook_command(self.project,'manifest'),s.shlex.join([
+                self.system_python,'-I','-B','-X','utf8','./hooks.py','manifest']))
+            s.write(self.home/'adapter.json',{'server':{'auth_mode':'local_password'}})
+            with self.assertRaises(s.SetupError):s.hook_command(self.project,'manifest')
+            s.write(self.home/'adapter.json',{'server':{'auth_mode':'pam'}})
+            binary=self.interpreter('linux')
+            with self.assertRaises(s.SetupError):s.hook_command(self.project,'manifest')
+            self.assertEqual(binary.read_bytes(),b'private interpreter fixture')
+
 
 if __name__=='__main__':unittest.main()
