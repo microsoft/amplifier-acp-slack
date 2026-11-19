@@ -161,6 +161,29 @@ jobs:
           if [[ "${{ matrix.os }}" == windows* || "${{ matrix.os }}" == macos* ]]; then EXTRA="--verify-startup"; fi
           python tests/native_launch.py --package "$ARCHIVE" --verify-setup-tool $EXTRA --result ${{ matrix.target }}-native-launch-result.json
           python tests/native_update_process.py --package "$ARCHIVE" --result ${{ matrix.target }}-native-update-result.json
+      - name: Retain bounded pinned CLI build diagnostics inside artifact root
+        if: ${{ always() && startsWith(matrix.os, 'windows') }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, stat
+          temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
+          output = pathlib.Path('slack-cli-build-diagnostics')
+          output.mkdir()
+          for folder, name in [('slack-cli-build', 'provenance.json'), ('slack-cli-build.work', 'build.stdout'), ('slack-cli-build.work', 'build.stderr')]:
+              source = temporary / folder / name
+              if not os.path.lexists(source):
+                  continue
+              info = source.lstat()
+              if not stat.S_ISREG(info.st_mode) or source.is_symlink() or info.st_size > 4 * 1024 * 1024:
+                  raise ValueError('Unexpected build diagnostic file')
+              with source.open('rb') as src:
+                  data = src.read(4 * 1024 * 1024 + 1)
+              if len(data) > 4 * 1024 * 1024:
+                  raise ValueError('Build diagnostic grew beyond bound')
+              with (output / name).open('xb') as dst:
+                  dst.write(data)
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -173,9 +196,7 @@ jobs:
             *-native-update-result.json
             *-native-update-result-managed.json
             *-native-update-result.phases.json
-            ${{ runner.temp }}/slack-cli-build/provenance.json
-            ${{ runner.temp }}/slack-cli-build.work/build.stdout
-            ${{ runner.temp }}/slack-cli-build.work/build.stderr
+            slack-cli-build-diagnostics/*
           if-no-files-found: error
   publish:
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'microsoft/amplifier-acp-slack'
