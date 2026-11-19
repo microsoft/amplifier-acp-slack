@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.18.2
+
+Wait for readiness on the proved local HTTP connection before each management
+request, preserving the same socket, credential checks and existing time limits.
+See [release notes](docs/releases/0.18.2.md) for scope.
+
 ## 0.18.1
 
 Keep native guided-setup hook paths independent of spaces and shell characters

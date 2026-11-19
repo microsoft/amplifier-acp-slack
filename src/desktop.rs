@@ -421,6 +421,7 @@ async fn proved_local_api(
         .uri(format!("/api/v1/local-proof?nonce={nonce}"))
         .header(header::HOST, host)
         .body(Full::new(Bytes::new()))?;
+    sender.ready().await?;
     let response = sender.send_request(request).await?;
     ensure!(
         response.status().is_success(),
@@ -447,6 +448,9 @@ async fn proved_local_api(
     } else {
         vec![]
     };
+    // Consuming the proof body does not imply the HTTP/1 dispatcher has become
+    // ready. Keep the credential on this proved connection, without reconnecting.
+    sender.ready().await?;
     let response = sender
         .send_request(request.body(Full::new(Bytes::from(bytes)))?)
         .await?;
