@@ -2,6 +2,7 @@
 """Exercise an extracted native download using only its bundled runtime (no Slack/model calls)."""
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -246,7 +247,7 @@ def prepare_fresh_setup_tool(home,base,headers):
 
 def finite_setup(binary,root,env):
     """Actual create-only entry point; no server, browser, Slack or model."""
-    home=root/'finite setup café 子'
+    home=root/'finite  setup café 子'
     command=[str(binary),'--home',str(home),'native-setup']
     created=subprocess.run(command,env=env,capture_output=True,text=True,encoding='utf-8',timeout=60)
     assert created.returncode==0,created.stderr
@@ -274,6 +275,79 @@ def finite_setup(binary,root,env):
     assert refused.returncode!=0 and list(occupied.iterdir())==[occupied/'owner-data']
     assert (occupied/'owner-data').read_bytes()==b'preserve me'
     return ['finite native setup exits without starting service or exposing credentials','repeated native setup preserves exact existing installation','native setup refuses unrelated existing folder']
+
+@contextmanager
+def retained_fixture_root():
+    """A failed/unknown native child must not race automatic temp removal."""
+    root=Path(tempfile.mkdtemp(prefix='Slack native café 子 ')).resolve(strict=True)
+    try:
+        yield root
+    except BaseException:
+        print('Native fixture retained after failure: '+str(root),file=sys.stderr,flush=True)
+        raise
+    else:
+        shutil.rmtree(root)
+
+def verify_packaged_hooks(root,helper,result,env):
+    """Actual CLI local hooks plus fake install body; never deploy/auth."""
+    home=root/'finite  setup café 子'
+    python=home/'runtime/python'/('python.exe' if os.name=='nt' else 'bin/python3')
+    saved=root/'native-hook-result.json'
+    command=[str(python),'-I','-B','-X','utf8',str(Path(__file__).with_name('slack_hook_process.py')),
+             '--home',str(home),'--helper',str(helper),'--helper-sha256',hashlib.sha256(helper.read_bytes()).hexdigest(),
+             '--result',str(saved)]
+    checkpoint={'passed':False,'phase':'packaged_native_hook_contract','retained_fixture_root':str(root),
+                'probe_limit_seconds':180,
+                'limits':['Actual CLI GetHooks/GetManifest only; fake install body is separate, not auth/deploy',
+                          'Windows visible-console sampling is bounded, and new windows are not attributed to the child tree']}
+    def save():
+        if saved.exists():
+            try:
+                if saved.stat().st_size>1024*1024:raise ValueError('Hook receipt bound')
+                checkpoint['native_hook_contract']=json.loads(saved.read_text(encoding='utf-8'))
+            except (OSError,ValueError):checkpoint['native_hook_readback']='unavailable_or_incomplete'
+        raw_cli=root/'native-hook-cli-evidence.json'
+        if result and raw_cli.exists():
+            if raw_cli.is_symlink() or not raw_cli.is_file() or raw_cli.stat().st_size>1024*1024:
+                raise AssertionError('Actual CLI evidence must be a bounded ordinary file')
+            data=raw_cli.read_bytes()
+            if len(data)>1024*1024:raise AssertionError('Actual CLI evidence grew beyond bound')
+            target=result.with_name(result.name.replace('-native-launch-result.json','-native-hook-cli-evidence.json'))
+            if target==result:target=result.with_name(result.stem+'-native-hook-cli-evidence.json')
+            if target.exists():
+                if target.is_symlink() or not target.is_file() or target.stat().st_size>1024*1024 or target.read_bytes()!=data:
+                    raise AssertionError('Actual CLI evidence destination changed')
+            else:
+                with target.open('xb') as output:output.write(data)
+            checkpoint['raw_cli_evidence']={'path':str(target),'sha256':hashlib.sha256(data).hexdigest(),'size':len(data)}
+        if result:result.write_text(json.dumps(checkpoint,indent=2)+'\n',encoding='utf-8')
+    save()
+    try:
+        # Match production's immediate hidden CLI boundary. The probe launches
+        # PowerShell with upstream default flags, without hiding its descendants.
+        with (root/'native-hook-stdout').open('xb') as out,(root/'native-hook-stderr').open('xb') as err:
+            child=subprocess.Popen(command,env=env,stdin=subprocess.DEVNULL,stdout=out,stderr=err,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+            checkpoint['probe_pid']=child.pid;save()
+            # Production-aligned CLI 120s + existing fake install 20s + evidence.
+            try:child.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                checkpoint['outcome']='unknown_timeout_no_retry_no_kill';raise
+        def bounded_output(path):
+            with path.open('rb') as stream:raw=stream.read(1024*1024+1)
+            assert len(raw)<=1024*1024,'Native hook output exceeds bound'
+            return raw
+        stdout,stderr=(bounded_output(root/name) for name in ('native-hook-stdout','native-hook-stderr'))
+        checkpoint.update(probe_returncode=child.returncode,stdout_sha256=hashlib.sha256(stdout).hexdigest(),
+                          stderr_sha256=hashlib.sha256(stderr).hexdigest())
+        save()
+        assert child.returncode==0 and checkpoint.get('native_hook_contract',{}).get('passed') is True,'Native hook contract failed; exact checkpoint retained'
+        return checkpoint['native_hook_contract']
+    finally:
+        if sys.exc_info()[0] is None:save()
+        else:
+            try:save()
+            except BaseException:pass  # Preserve the original failure/unknown.
 
 def manager_record_projection(value):
     """Content-free identity/phase evidence; never copy arbitrary record fields."""
@@ -476,8 +550,8 @@ print(json.dumps({'attached':ok,'error':error}))
     return receipt
 
 def run(package,result,browser=False,verify_setup_tool=False,verify_startup=False):
-    checks=[];manager_receipt=None
-    with tempfile.TemporaryDirectory(prefix='Slack native café 子 ') as temporary:
+    checks=[];manager_receipt=None;hook_receipt=None
+    with retained_fixture_root() as temporary:
         root=Path(temporary);bundle=root/'download';bundle.mkdir();extract(package,bundle)
         binary=next(p for p in bundle.rglob('acp-slack-adapter.exe' if os.name=='nt' else 'acp-slack-adapter') if p.is_file())
         binary.chmod(0o755);home=root/'private connection';env={k:v for k,v in os.environ.items() if not k.upper().startswith(('SLACK_','OPENAI_','ANTHROPIC_','AZURE_','GOOGLE_','AMPLIFIER_'))};env['PATH']=str(root/'no-tools');env['PYTHONDONTWRITEBYTECODE']='1';env['USER']='Native café 子';env['USERNAME']='Native café 子'
@@ -545,11 +619,13 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             if verify_setup_tool:
                 prepare_fresh_setup_tool(home,base,{'Cookie':cookie,'X-CSRF-Token':session['csrf']})
                 checks.append('one explicit fresh-home local discard materializes the exact helper; subsequent read-only saved setup succeeds without authorization/network or account/configuration changes')
-                code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
+                code="import importlib.util,os,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],env=dict(os.environ,NO_COLOR='1',SLACK_SKIP_UPDATE='true'),capture_output=True,text=True,encoding='utf-8',timeout=30,creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Pinned Slack setup CLI starts: '+(m.WINDOWS_CLI_DISTRIBUTION if sys.platform=='win32' else 'official upstream 4.12.0'))"
                 vendor_env={**env,'SLACK_SKIP_UPDATE':'true','NO_COLOR':'1'}
-                verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150)
+                verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
                 assert verified.returncode==0,verified.stderr
-                checks.append('actual checksum-pinned official Slack CLI starts on this platform')
+                checks.append('actual pinned Slack setup CLI starts: bundled Windows derivative or official non-Windows tool; exact identity follows in setup_cli')
+                hook_receipt=verify_packaged_hooks(root,home/'secrets/slack-setup-helper.py',result,env)
+                checks.append('actual pinned Go CLI get-hooks/get-manifest plus separate private-Python fake install body preserve settings with OS-only PATH; no auth/deploy')
 
         finally:p.terminate();p.wait(timeout=20);log.close()
         superseded_launch(binary,home,env);checks.extend(['actual superseded replacement refuses startup before state, listener or Slack runtime','management recovery remains available without Slack runtime; damaged journal is reported and preserved'])
@@ -583,6 +659,8 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             checks.append('actual fixed native manager survives caller exit; exact generation, stop, same-profile restart and checked retirement preserve private state')
     receipt={'passed':True,'checks':checks,'package':str(package),'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),'limitations':['No real Slack authorization or model/provider call','No publisher signing/notarization claim','Current-user startup registration exercised only when verify_startup is enabled; automatic sign-in launch is not simulated']}
     receipt['managed_lifecycle']=manager_receipt
+    receipt['native_hook_contract']=hook_receipt
+    receipt['limitations'].append('Hook checks use actual pinned Go CLI local GetHooks/GetManifest; fake install uses direct private Python; no actual CLI auth/deploy or universal no-console proof')
     if result:result.write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt,indent=2))
 if __name__=='__main__':

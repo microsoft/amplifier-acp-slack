@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 import uuid
 from xml.sax.saxutils import escape
@@ -23,6 +23,89 @@ SOURCE = ROOT / 'native_launch.py'
 spec = importlib.util.spec_from_file_location('slack_native_launch', SOURCE)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+
+
+class HookProbeBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory();self.addCleanup(self.temporary.cleanup)
+        self.root=Path(self.temporary.name).resolve()
+        self.helper=self.root/'helper.py';self.helper.write_bytes(b'# inert fixture input\n')
+        self.result=self.root/'result.json'
+
+    def test_probe_timeout_retains_original_error_and_partial_receipt_without_signal_or_retry(self):
+        error=subprocess.TimeoutExpired(['fixture'],180)
+        child=Mock(pid=42);child.wait.side_effect=error
+        partial={'passed':False,'phases':[{'status':'unknown_timeout_no_retry_no_kill'}]}
+        (self.root/'native-hook-result.json').write_text(json.dumps(partial))
+        with patch.object(m.subprocess,'Popen',return_value=child) as launch,self.assertRaises(subprocess.TimeoutExpired) as caught:
+            m.verify_packaged_hooks(self.root,self.helper,self.result,{})
+        self.assertIs(caught.exception,error)
+        launch.assert_called_once();child.wait.assert_called_once_with(timeout=180)
+        child.kill.assert_not_called();child.terminate.assert_not_called()
+        saved=json.loads(self.result.read_text())
+        self.assertEqual(saved['outcome'],'unknown_timeout_no_retry_no_kill')
+        self.assertEqual(saved['native_hook_contract'],partial)
+        self.assertTrue((self.root/'native-hook-stdout').exists())
+        self.assertFalse(saved['passed'])
+
+    def test_nonzero_probe_never_masks_failure_as_success_or_replays(self):
+        child=Mock(pid=43,returncode=1)
+        (self.root/'native-hook-result.json').write_text(json.dumps({'passed':False,'failure_type':'AssertionError'}))
+        with patch.object(m.subprocess,'Popen',return_value=child) as launch,self.assertRaisesRegex(AssertionError,'Native hook contract failed'):
+            m.verify_packaged_hooks(self.root,self.helper,self.result,{})
+        launch.assert_called_once();child.kill.assert_not_called()
+        saved=json.loads(self.result.read_text())
+        self.assertEqual(saved['probe_returncode'],1)
+        self.assertFalse(saved['native_hook_contract']['passed'])
+
+    def test_probe_checkpoint_write_failure_does_not_replace_original_timeout(self):
+        error=subprocess.TimeoutExpired(['fixture'],180)
+        child=Mock(pid=44);child.wait.side_effect=error
+        writer=Mock();writer.write_text.side_effect=[None,None,OSError('diagnostic write failed')]
+        with patch.object(m.subprocess,'Popen',return_value=child),self.assertRaises(subprocess.TimeoutExpired) as caught:
+            m.verify_packaged_hooks(self.root,self.helper,writer,{})
+        self.assertIs(caught.exception,error)
+
+    def test_actual_cli_raw_evidence_export_survives_success_cleanup_and_failure(self):
+        for passed in (False, True):
+            with self.subTest(passed=passed):
+                root=self.root/('success' if passed else 'failure');root.mkdir()
+                target=self.root/(str(passed)+'-native-launch-result.json')
+                raw=b'{"schema":1,"joined":true,"stdout":{"base64":"e30="}}'
+                child=Mock(pid=45,returncode=0 if passed else 1)
+                def finished(timeout):
+                    self.assertEqual(timeout,180)
+                    (root/'native-hook-result.json').write_text(json.dumps({'passed':passed}))
+                    (root/'native-hook-cli-evidence.json').write_bytes(raw)
+                child.wait.side_effect=finished
+                with patch.object(m.subprocess,'Popen',return_value=child) as launch:
+                    if passed:m.verify_packaged_hooks(root,self.helper,target,{})
+                    else:
+                        with self.assertRaisesRegex(AssertionError,'Native hook contract failed'):
+                            m.verify_packaged_hooks(root,self.helper,target,{})
+                launch.assert_called_once();child.kill.assert_not_called();child.terminate.assert_not_called()
+                saved=json.loads(target.read_text())['raw_cli_evidence']
+                exported=Path(saved['path'])
+                self.assertEqual(saved['sha256'],hashlib.sha256(raw).hexdigest())
+                self.assertEqual(saved['size'],len(raw));self.assertEqual(exported.read_bytes(),raw)
+                if passed:
+                    m.shutil.rmtree(root)
+                    self.assertEqual(exported.read_bytes(),raw)
+                else:self.assertEqual((root/'native-hook-cli-evidence.json').read_bytes(),raw)
+
+    def test_failed_fixture_root_is_retained_and_successful_root_removed(self):
+        kept=self.root/'retained';kept.mkdir()
+        error=TimeoutError('unknown fixture')
+        with patch.object(m.tempfile,'mkdtemp',return_value=str(kept)),self.assertRaises(TimeoutError) as caught:
+            with m.retained_fixture_root() as root:
+                (root/'evidence').write_bytes(b'keep')
+                raise error
+        self.assertIs(caught.exception,error)
+        self.assertEqual((kept/'evidence').read_bytes(),b'keep')
+        removed=self.root/'success';removed.mkdir()
+        with patch.object(m.tempfile,'mkdtemp',return_value=str(removed)):
+            with m.retained_fixture_root():pass
+        self.assertFalse(removed.exists())
 
 
 class SetupToolFixtureTests(unittest.TestCase):

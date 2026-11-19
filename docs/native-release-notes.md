@@ -1,3 +1,5 @@
+Slack 0.18.1 corrects private guided-setup hook paths on Windows, macOS and native Linux without changing authorization, time limits or unknown outcomes. It also carries the accepted named attachment and owner-message eligibility corrections. Exact native qualification is pending at source preparation; local hook fixtures do not prove live Slack consent or ordinary desktop console behavior. See [the 0.18.1 notes](https://github.com/microsoft/amplifier-acp-slack/blob/main/docs/releases/0.18.1.md).
+
 Slack 0.18.0 adds self-contained Observatory setup, explicit saved-connection start and resume, and independent Windows/macOS update workers with checked cleanup. Slack still owns workspace authorization and administrator approval. Existing settings, credentials and conversations are preserved; uncertain outcomes are not retried. Compatible Instances receive Slack context once. See [the 0.18.0 notes](https://github.com/microsoft/amplifier-acp-slack/blob/main/docs/releases/0.18.0.md).
 
 Slack 0.17.13 reduces repeated conversation context and lets an ambient turn finish quietly after a peer update. See [the 0.17.13 notes](https://github.com/microsoft/amplifier-acp-slack/blob/main/docs/releases/0.17.13.md).
@@ -28,7 +30,7 @@ Slack 0.17.4 lets authorized clients inspect the outcome of an exact original Sl
 
 Native Slack Connector downloads include the connector and its own private setup runtime. Open the app, choose a local connector password, and use the existing Slack authorization and agent connection screens. No developer toolchain, system Python or WSL is required.
 
-Windows x64, Windows 11 ARM64, Mac Intel, Apple silicon, and Linux x64/ARM64 are built and tested on their respective platforms. The connector and Python are native for each processor. Slack currently publishes only an x64 Windows CLI; the optional guided Slack setup uses Windows 11's x64 compatibility on ARM. Manual Slack app credentials remain supported.
+Windows x64, Windows 11 ARM64, Mac Intel, Apple silicon, and Linux x64/ARM64 are built and tested on their respective platforms. The connector and Python are native for each processor. Windows guided setup bundles a pinned x64 Slack CLI source build with the explicit no-colour startup guard described above and uses Windows 11's x64 compatibility on ARM. Mac and Linux continue using official checksum-pinned Slack CLI archives. Manual Slack app credentials remain supported.
 
 These preview downloads are not publisher-signed or notarized. Verify the published checksum; do not disable operating-system security protections. Linux existing PAM/HTTPS installations and external update enrollment retain their configuration and ownership.
 
