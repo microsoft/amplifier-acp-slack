@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.18.3
+
+Read macOS native connector status from the service's own launchd properties,
+without confusing nested resource-coalition fields with its state. The native
+platform pin also carries the accepted Windows hostname and hidden utility
+launch corrections. See [release notes](docs/releases/0.18.3.md) for scope.
+
 ## 0.18.2
 
 Wait for readiness on the proved local HTTP connection before each management
