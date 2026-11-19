@@ -297,6 +297,7 @@ def verify_packaged_hooks(root,helper,result,env):
              '--home',str(home),'--helper',str(helper),'--helper-sha256',hashlib.sha256(helper.read_bytes()).hexdigest(),
              '--result',str(saved)]
     checkpoint={'passed':False,'phase':'packaged_native_hook_contract','retained_fixture_root':str(root),
+                'probe_limit_seconds':180,
                 'limits':['Actual CLI GetHooks/GetManifest only; fake install body is separate, not auth/deploy',
                           'Windows visible-console sampling is bounded, and new windows are not attributed to the child tree']}
     def save():
@@ -328,7 +329,8 @@ def verify_packaged_hooks(root,helper,result,env):
             child=subprocess.Popen(command,env=env,stdin=subprocess.DEVNULL,stdout=out,stderr=err,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
             checkpoint['probe_pid']=child.pid;save()
-            try:child.wait(timeout=90)
+            # Production-aligned CLI 120s + existing fake install 20s + evidence.
+            try:child.wait(timeout=180)
             except subprocess.TimeoutExpired:
                 checkpoint['outcome']='unknown_timeout_no_retry_no_kill';raise
         def bounded_output(path):

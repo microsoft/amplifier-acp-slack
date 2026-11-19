@@ -22,12 +22,17 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unicodedata
 import unittest
 from unittest.mock import patch
 
 LIMIT = 1024 * 1024
 CLI_OUTPUT_LIMIT = 128 * 1024
+CLI_CALL_SECONDS = 120  # Existing production helper.cli allowance; fixture only.
+OS_ENVIRONMENT_KEYS = ('SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+                       'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USER', 'USERNAME', 'LANG', 'LC_ALL',
+                       'APPDATA', 'LOCALAPPDATA', 'COMSPEC', 'PATHEXT', 'COMPUTERNAME')
 FAKE = {'app_token': 'fixture-only-app-token', 'bot_token': 'fixture-only-bot-token'}
 
 
@@ -64,9 +69,7 @@ def shell_argv(command, windows=None):
 
 
 def shell_environment():
-    allowed = {'SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
-               'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USER', 'USERNAME', 'LANG', 'LC_ALL'}
-    env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
+    env = {k: v for k, v in os.environ.items() if k.upper() in OS_ENVIRONMENT_KEYS}
     env['PATH'] = (os.pathsep.join([str(Path(os.environ['SystemRoot']) / 'System32'),
                                   str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0')])
                    if os.name == 'nt' else '/usr/bin:/bin')
@@ -371,9 +374,9 @@ def cli_hook_proof(stdout, stderr, commands, manifest, project):
 
 
 def cli_config_checkpoint(config):
-    """Observe only this invocation's fresh config/log directory; never auth."""
+    """Own fresh config: two fixed file metadata rows and bounded log prefixes."""
     result = {'scope': 'Own fresh configuration only; log snapshots are not EOF proof',
-              'config_exists': False, 'logs_exists': False, 'logs': []}
+              'config_exists': False, 'logs_exists': False, 'files': [], 'logs': []}
     for key, path in (('config_exists', config), ('logs_exists', config / 'logs')):
         if not os.path.lexists(path):
             return result
@@ -382,6 +385,22 @@ def cli_config_checkpoint(config):
             if not stat.S_ISDIR(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
                 raise AssertionError('Linked or non-directory CLI checkpoint')
         result[key] = True
+        if key == 'config_exists':
+            for name in ('config.json', 'credentials.json'):
+                # Metadata only, including for a link: never open/hash either file
+                # or follow it to another configuration or credential store.
+                try:
+                    info = (config / name).lstat()
+                except FileNotFoundError:
+                    result['files'].append({'name': name, 'exists': False})
+                    continue
+                kind = ('reparse' if getattr(info, 'st_file_attributes', 0) & 0x400 else
+                        'symlink' if stat.S_ISLNK(info.st_mode) else
+                        'regular' if stat.S_ISREG(info.st_mode) else
+                        'directory' if stat.S_ISDIR(info.st_mode) else 'other')
+                result['files'].append({'name': name, 'exists': True, 'type': kind,
+                                       'size': info.st_size,
+                                       'identity': {'device': info.st_dev, 'inode': info.st_ino}})
     # At most two date-named files from this one fresh configuration.
     # Refuse unexpected entries instead of scanning another path or log store.
     with os.scandir(config / 'logs') as entries:
@@ -403,6 +422,16 @@ def cli_config_checkpoint(config):
                                    'base64': base64.b64encode(data).decode('ascii')})
     result['logs'].sort(key=lambda row: row['name'])
     return result
+
+
+def cli_elapsed(started):
+    # A bounded diagnostic scalar, not an additional wait or success predicate.
+    # The cap is explicit and cannot conceal a late/unjoined outcome.
+    try:
+        elapsed = max(0, round((time.monotonic() - started) * 1000))
+        return {'elapsed_ms': min(elapsed, 86_400_000), 'elapsed_capped': elapsed > 86_400_000}
+    except Exception as error:
+        return {'elapsed_ms': None, 'elapsed_error_type': type(error).__name__}
 
 
 def cli_output_snapshot(outputs, evidence, *, joined, returncode, cli_sha256, config_checkpoint=None):
@@ -449,8 +478,11 @@ def actual_cli_local_phase(binary, identity, folder, project, commands, manifest
             'manifest', 'info', '--source', 'local']
     phase = {'action': 'actual_cli_local_manifest', 'status': 'dispatching',
              'cli_sha256': identity['sha256'], 'slack_disable_telemetry_env': True, 'fresh_empty_config': True,
+             'call_limit_seconds': CLI_CALL_SECONDS,
+             'environment_key_presence': {key: key in {name.upper() for name in env} for key in OS_ENVIRONMENT_KEYS},
              'stdio': 'pipe_stdin_stdout_stderr', 'capture_limit_scope': 'Saved prefixes only; live communicate memory is not capped'}
     receipt['phases'].append(phase); save()
+    started = time.monotonic()
     try:
         child = subprocess.Popen(argv, cwd=project, env=env, stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -458,9 +490,9 @@ def actual_cli_local_phase(binary, identity, folder, project, commands, manifest
         phase.update(child_identity(child)); save()
         # Match production's empty-input/piped-output boundary. Unlike run(),
         # communicate() leaves a timed-out child untouched; do not retry or kill.
-        outputs = child.communicate(input=b'', timeout=20)
+        outputs = child.communicate(input=b'', timeout=CLI_CALL_SECONDS)
     except BaseException as error:
-        phase.update(status='unknown_no_retry_no_kill', error_type=type(error).__name__)
+        phase.update(status='unknown_no_retry_no_kill', error_type=type(error).__name__, **cli_elapsed(started))
         try:
             checkpoint = cli_config_checkpoint(config)
         except BaseException as capture_error:
@@ -473,6 +505,7 @@ def actual_cli_local_phase(binary, identity, folder, project, commands, manifest
         except BaseException as capture_error:
             phase['capture_error_type'] = type(capture_error).__name__
         raise
+    phase.update(cli_elapsed(started))
     captured, summary = cli_output_snapshot(outputs, evidence, joined=True, returncode=child.returncode, cli_sha256=identity['sha256'])
     phase.update(summary, status='returned', returncode=child.returncode); save()
     if child.returncode or summary['output_overflow']:
@@ -657,29 +690,39 @@ class PureContractTests(unittest.TestCase):
             receipt={'phases':[]};save=Mock()
             with patch.dict(os.environ, {'SLACK_TOKEN':'never-use','SLACK_CONFIG_DIR':'never-use','OPENAI_API_KEY':'never-use','DENO_AUTH_TOKENS':'never-use'}), \
                     patch.object(subprocess,'Popen',side_effect=launch) as popen, \
-                    patch(__name__+'.child_identity',return_value={'pid':42}):
+                    patch(__name__+'.child_identity',return_value={'pid':42}), \
+                    patch.object(time,'monotonic',side_effect=[100,100.125]):
                 actual_cli_local_phase(binary, {'sha256':file_sha(binary)}, root, project, commands, manifest, receipt, save, root/'evidence.json')
-            self.assertEqual(popen.call_count,1);child.communicate.assert_called_once_with(input=b'',timeout=20)
+            self.assertEqual(popen.call_count,1);child.communicate.assert_called_once_with(input=b'',timeout=120)
             child.kill.assert_not_called();child.terminate.assert_not_called()
-            self.assertTrue(receipt['phases'][0]['empty_auth_preserved'])
+            phase=receipt['phases'][0]
+            self.assertTrue(phase['empty_auth_preserved'])
+            self.assertEqual(phase['call_limit_seconds'],120)
+            self.assertEqual(phase['elapsed_ms'],125);self.assertFalse(phase['elapsed_capped'])
+            self.assertEqual(set(phase['environment_key_presence']),set(OS_ENVIRONMENT_KEYS))
+            self.assertTrue(all(type(value) is bool for value in phase['environment_key_presence'].values()))
+            self.assertNotIn('never-use',json.dumps(receipt))
 
     def test_actual_cli_unknown_preserves_original_timeout_without_kill_or_retry(self):
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
             commands,manifest,_=self.cli_transcript(project)
-            original=subprocess.TimeoutExpired('fixed-local-cli',20,output=b'partial',stderr=None)
+            original=subprocess.TimeoutExpired('fixed-local-cli',120,output=b'partial',stderr=None)
             child=Mock(returncode=None,pid=42);child.communicate.side_effect=original
             receipt={'phases':[]}
             with patch.object(subprocess,'Popen',return_value=child) as popen, \
-                    patch(__name__+'.child_identity',return_value={'pid':42}):
+                    patch(__name__+'.child_identity',return_value={'pid':42}), \
+                    patch.object(time,'monotonic',side_effect=[100,220.025]):
                 with self.assertRaises(subprocess.TimeoutExpired) as caught:
                     actual_cli_local_phase(binary, {'sha256':file_sha(binary)}, root, project, commands, manifest, receipt, lambda:None, root/'evidence.json')
             self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1)
-            child.communicate.assert_called_once_with(input=b'',timeout=20)
+            child.communicate.assert_called_once_with(input=b'',timeout=120)
             child.wait.assert_not_called()
             child.kill.assert_not_called();child.terminate.assert_not_called()
             self.assertEqual(receipt['phases'][0]['status'],'unknown_no_retry_no_kill')
+            self.assertEqual(receipt['phases'][0]['elapsed_ms'],120025)
+            self.assertEqual(receipt['phases'][0]['call_limit_seconds'],120)
             saved=json.loads((root/'evidence.json').read_bytes())
             self.assertFalse(saved['joined'])
             self.assertEqual(base64.b64decode(saved['stdout']['base64']),b'partial')
@@ -693,15 +736,27 @@ class PureContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config=Path(temporary).resolve()/'cli-probe-config';config.mkdir()
             (config/'credentials.json').write_text('private-content-not-to-read')
+            (config/'config.json').write_text('configuration-content-not-to-read')
             logs=config/'logs';logs.mkdir()
             for day in ('20261118','20261119'):
                 (logs/('slack-debug-'+day+'.log')).write_bytes(b'x'*(CLI_OUTPUT_LIMIT+1))
             original_open=Path.open
+            original_os_open=os.open
             def guarded_open(path,*args,**kwargs):
-                self.assertNotEqual(path.name,'credentials.json')
+                self.assertNotIn(path.name,('config.json','credentials.json'))
                 return original_open(path,*args,**kwargs)
-            with patch.object(Path,'open',guarded_open):
+            def guarded_os_open(path,*args,**kwargs):
+                self.assertNotIn(Path(path).name,('config.json','credentials.json'))
+                return original_os_open(path,*args,**kwargs)
+            with patch.object(Path,'open',guarded_open),patch.object(os,'open',guarded_os_open):
                 checkpoint=cli_config_checkpoint(config)
+            self.assertEqual([row['name'] for row in checkpoint['files']],['config.json','credentials.json'])
+            for row in checkpoint['files']:
+                self.assertEqual(set(row),{'name','exists','type','size','identity'})
+                self.assertTrue(row['exists']);self.assertEqual(row['type'],'regular')
+                info=(config/row['name']).lstat()
+                self.assertEqual(row['size'],info.st_size)
+                self.assertEqual(row['identity'],{'device':info.st_dev,'inode':info.st_ino})
             self.assertEqual(len(checkpoint['logs']),2)
             for row in checkpoint['logs']:
                 self.assertTrue(row['overflow'])
@@ -711,9 +766,33 @@ class PureContractTests(unittest.TestCase):
                                 returncode=None,cli_sha256='a'*64,config_checkpoint=checkpoint)
             self.assertLess(evidence.stat().st_size,LIMIT)
             self.assertNotIn('private-content-not-to-read',evidence.read_text())
+            self.assertNotIn('configuration-content-not-to-read',evidence.read_text())
             (logs/'slack-debug-20261120.log').write_bytes(b'')
             with self.assertRaisesRegex(AssertionError,'inventory differs'):
                 cli_config_checkpoint(config)
+
+    def test_own_config_checkpoint_records_fixed_metadata_before_logs_exist(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config=Path(temporary).resolve()/'cli-probe-config';config.mkdir()
+            checkpoint=cli_config_checkpoint(config)
+            self.assertFalse(checkpoint['logs_exists'])
+            self.assertEqual(checkpoint['files'],[{'name':'config.json','exists':False},
+                                                 {'name':'credentials.json','exists':False}])
+            (config/'config.json').mkdir()
+            if os.name != 'nt':
+                (config/'credentials.json').symlink_to(config.parent/'missing-outside')
+            with patch.object(Path,'open',side_effect=AssertionError('No file reads')), \
+                    patch.object(os,'open',side_effect=AssertionError('No file reads')):
+                checkpoint=cli_config_checkpoint(config)
+            self.assertEqual(checkpoint['files'][0]['type'],'directory')
+            if os.name != 'nt':self.assertEqual(checkpoint['files'][1]['type'],'symlink')
+            self.assertEqual(checkpoint['logs'],[])
+
+    def test_elapsed_diagnostic_is_bounded_and_failure_is_not_a_new_error(self):
+        with patch.object(time,'monotonic',return_value=100_000):
+            self.assertEqual(cli_elapsed(0),{'elapsed_ms':86_400_000,'elapsed_capped':True})
+        with patch.object(time,'monotonic',side_effect=OSError('unavailable')):
+            self.assertEqual(cli_elapsed(0),{'elapsed_ms':None,'elapsed_error_type':'OSError'})
 
     def test_own_config_checkpoint_refuses_unexpected_or_linked_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -733,7 +812,7 @@ class PureContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
             commands,manifest,_=self.cli_transcript(project)
-            original=subprocess.TimeoutExpired('fixed-local-cli',20)
+            original=subprocess.TimeoutExpired('fixed-local-cli',120)
             child=Mock(returncode=None,pid=42);child.communicate.side_effect=original
             receipt={'phases':[]}
             with patch.object(subprocess,'Popen',return_value=child) as popen, \
@@ -742,7 +821,7 @@ class PureContractTests(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired) as caught:
                     actual_cli_local_phase(binary,{'sha256':file_sha(binary)},root,project,commands,manifest,receipt,lambda:None,root/'evidence.json')
             self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1)
-            child.communicate.assert_called_once_with(input=b'',timeout=20)
+            child.communicate.assert_called_once_with(input=b'',timeout=120)
             child.wait.assert_not_called();child.kill.assert_not_called();child.terminate.assert_not_called()
             saved=json.loads((root/'evidence.json').read_bytes())
             self.assertEqual(saved['own_config_checkpoint'],{'status':'unavailable','error_type':'OSError'})
@@ -869,6 +948,20 @@ class PureContractTests(unittest.TestCase):
         self.assertNotIn('OPENAI_API_KEY', env)
         self.assertNotIn('SLACK_TOKEN', env)
         self.assertNotIn('/developer', env['PATH'])
+
+    def test_standard_windows_context_is_retained_without_broad_environment_copy(self):
+        expected={'APPDATA':'fixture-appdata','LOCALAPPDATA':'fixture-localappdata',
+                  'COMSPEC':'fixture-comspec','PATHEXT':'.COM;.EXE','COMPUTERNAME':'fixture-machine'}
+        injected={**expected,'SystemRoot':'C:/Windows','UNKNOWN_CONTEXT':'do-not-copy',
+                  'SLACK_CONFIG_DIR':'do-not-copy','SLACK_TOKEN':'do-not-copy','PATH':'/developer'}
+        with patch.dict(os.environ,injected,clear=True):
+            env=shell_environment()
+        for key,value in expected.items():self.assertEqual(env[key],value)
+        self.assertFalse({'UNKNOWN_CONTEXT','SLACK_CONFIG_DIR','SLACK_TOKEN'} & set(env))
+        self.assertNotIn('/developer',env['PATH'])
+        with patch.dict(os.environ,{'SystemRoot':'C:/Windows'},clear=True):
+            env=shell_environment()
+        self.assertTrue(all(key not in env for key in expected))
 
     def test_ordinary_refuses_link_without_reading_target(self):
         if os.name == 'nt':

@@ -33,14 +33,14 @@ class HookProbeBoundaryTests(unittest.TestCase):
         self.result=self.root/'result.json'
 
     def test_probe_timeout_retains_original_error_and_partial_receipt_without_signal_or_retry(self):
-        error=subprocess.TimeoutExpired(['fixture'],90)
+        error=subprocess.TimeoutExpired(['fixture'],180)
         child=Mock(pid=42);child.wait.side_effect=error
         partial={'passed':False,'phases':[{'status':'unknown_timeout_no_retry_no_kill'}]}
         (self.root/'native-hook-result.json').write_text(json.dumps(partial))
         with patch.object(m.subprocess,'Popen',return_value=child) as launch,self.assertRaises(subprocess.TimeoutExpired) as caught:
             m.verify_packaged_hooks(self.root,self.helper,self.result,{})
         self.assertIs(caught.exception,error)
-        launch.assert_called_once();child.wait.assert_called_once_with(timeout=90)
+        launch.assert_called_once();child.wait.assert_called_once_with(timeout=180)
         child.kill.assert_not_called();child.terminate.assert_not_called()
         saved=json.loads(self.result.read_text())
         self.assertEqual(saved['outcome'],'unknown_timeout_no_retry_no_kill')
@@ -59,7 +59,7 @@ class HookProbeBoundaryTests(unittest.TestCase):
         self.assertFalse(saved['native_hook_contract']['passed'])
 
     def test_probe_checkpoint_write_failure_does_not_replace_original_timeout(self):
-        error=subprocess.TimeoutExpired(['fixture'],90)
+        error=subprocess.TimeoutExpired(['fixture'],180)
         child=Mock(pid=44);child.wait.side_effect=error
         writer=Mock();writer.write_text.side_effect=[None,None,OSError('diagnostic write failed')]
         with patch.object(m.subprocess,'Popen',return_value=child),self.assertRaises(subprocess.TimeoutExpired) as caught:
@@ -74,7 +74,7 @@ class HookProbeBoundaryTests(unittest.TestCase):
                 raw=b'{"schema":1,"joined":true,"stdout":{"base64":"e30="}}'
                 child=Mock(pid=45,returncode=0 if passed else 1)
                 def finished(timeout):
-                    self.assertEqual(timeout,90)
+                    self.assertEqual(timeout,180)
                     (root/'native-hook-result.json').write_text(json.dumps({'passed':passed}))
                     (root/'native-hook-cli-evidence.json').write_bytes(raw)
                 child.wait.side_effect=finished
