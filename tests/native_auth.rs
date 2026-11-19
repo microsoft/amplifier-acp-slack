@@ -371,7 +371,7 @@ async fn local_api_connection_sequence(close_after_proof: bool) {
             4,
             "Each operation has one proof and one request, with no replay"
         );
-        for (pair, method) in rows.chunks_exact(2).zip(["GET", "PUT"]) {
+        for (pair, method) in rows.as_chunks::<2>().0.iter().zip(["GET", "PUT"]) {
             assert_eq!(
                 pair[0].0, pair[1].0,
                 "Credential must stay on the proved TCP connection"
