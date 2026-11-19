@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""Packaged-Python/native-shell hook proof, not a Slack CLI/auth/deploy test.
+"""Pinned CLI local hook chain plus separate fake-only private-Python install body.
 
 The caller uses CREATE_NO_WINDOW on Windows, just like the production CLI
 parent. The shell receives no hiding flag: upstream 91df uses plain exec.Command.
-Only fixture-generated hooks and fake credentials are used. No network call.
+The CLI receives a fresh empty config, telemetry/update disabled and no tokens.
+No authorization, app deployment or actual workspace connection is exercised.
 """
 import argparse
+import base64
 import ctypes
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import unittest
 from unittest.mock import patch
 
 LIMIT = 1024 * 1024
+CLI_OUTPUT_LIMIT = 128 * 1024
 FAKE = {'app_token': 'fixture-only-app-token', 'bot_token': 'fixture-only-bot-token'}
 
 
@@ -103,7 +108,7 @@ def file_sha(path):
 
 
 def official_cli_record(folder, windows=None):
-    """Read the existing, already version-checked CLI; never execute it again."""
+    """Read the already version-checked CLI without repeating its version command."""
     windows = os.name == 'nt' if windows is None else windows
     raw = read_small(folder / 'cli.json')
     receipt = json.loads(raw)
@@ -112,7 +117,7 @@ def official_cli_record(folder, windows=None):
     if set(receipt) != {'version', 'sha256'} or receipt['version'] != '4.12.0' or receipt['sha256'] != digest:
         raise AssertionError('Official CLI identity differs from its retained receipt')
     return {'version': receipt['version'], 'sha256': digest, 'receipt_sha256': sha(raw),
-            'pe_subsystem': pe_subsystem(binary, windows), 'executed_again': False,
+            'pe_subsystem': pe_subsystem(binary, windows), 'version_command_repeated': False,
             'limit': 'PE subsystem is executable metadata, not proof of console-window behavior.'}
 
 
@@ -295,11 +300,140 @@ class WindowsConsoleObserver:
                 'limit': 'Sampled visible console classes only; new windows are not attributed to a process tree and absence is not a universal no-flash proof.'}
 
 
+def cli_command_matches(value, command, project=None):
+    if project is None:
+        return value == command
+    prefix = command + ' --source="'
+    if not value.startswith(prefix) or not value.endswith('"'):
+        return False
+    escaped = value[len(prefix):-1]
+    escape = '`"' if os.name == 'nt' else '\\"'
+    path = escaped.replace(escape, '"')
+    if path.replace('"', escape) != escaped:
+        return False
+    try:
+        a, b = Path(path).resolve(strict=True), project.resolve(strict=True)
+        def key(p):
+            text = str(p)
+            if os.name == 'nt':
+                if text.startswith('\\\\?\\UNC\\'): text = '\\\\' + text[8:]
+                elif text.startswith('\\\\?\\'): text = text[4:]
+                return os.path.normcase(text)
+            return unicodedata.normalize('NFC', text) if sys.platform == 'darwin' else text
+        return key(a) == key(b) and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def cli_hook_proof(stdout, stderr, commands, manifest, project):
+    if len(stdout) > CLI_OUTPUT_LIMIT or len(stderr) > CLI_OUTPUT_LIMIT:
+        raise AssertionError('Actual CLI output bound')
+    text = stdout.decode('utf-8')
+    errors = text + stderr.decode('utf-8')
+    if any(value in errors for value in ('failed to initialize hook configurations:', 'Error running ', 'Error initializing')):
+        raise AssertionError('Actual CLI reported a hook initialization error')
+    expected = [('hooks', commands['hooks'], None,
+                 {'runtime': 'rust', 'hooks': {'get-manifest': commands['manifest'], 'deploy': commands['install']}}),
+                ('manifest', commands['manifest'], project, manifest)]
+    debug = re.compile(r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] (.*)$')
+    completed, payload, outside, active = [], [], [], False
+    for line in text.splitlines():
+        match = debug.fullmatch(line)
+        if not match:
+            if line.strip(): outside.append(line)
+            continue
+        message = match.group(1)
+        if message.startswith('starting hook command: '):
+            if active or len(completed) >= len(expected):
+                raise AssertionError('Unexpected actual CLI hook start')
+            _, command, source, _ = expected[len(completed)]
+            if not cli_command_matches(message[len('starting hook command: '):], command, source):
+                raise AssertionError('Actual CLI hook command differs')
+            active, payload = True, []
+        elif message.startswith('finished hook command: '):
+            if not active:
+                raise AssertionError('Actual CLI hook finish without start')
+            action, command, source, value = expected[len(completed)]
+            if not cli_command_matches(message[len('finished hook command: '):], command, source):
+                raise AssertionError('Actual CLI hook finish differs')
+            if json.loads('\n'.join(payload)) != value:
+                raise AssertionError('Actual CLI hook response differs')
+            completed.append(action); active = False
+        elif active:
+            payload.append(message)
+    if active or completed != ['hooks', 'manifest']:
+        raise AssertionError('Actual CLI hooks missing; file fallback is not proof')
+    returned = json.loads('\n'.join(outside))
+    if not isinstance(returned, dict) or returned.get('display_information') != manifest['display_information']:
+        raise AssertionError('Actual CLI final manifest differs')
+    return {'actual_go_cli_hooks': completed, 'file_fallback_accepted': False}
+
+
+def cli_output_snapshot(paths, evidence, *, joined, returncode, cli_sha256):
+    records, captured = [], []
+    for path in paths:
+        ordinary(path)
+        # Separate read descriptors do not change possibly-live child offsets.
+        with path.open('rb') as stream: data = stream.read(CLI_OUTPUT_LIMIT + 1)
+        size = path.stat().st_size
+        overflow = len(data) > CLI_OUTPUT_LIMIT or size > CLI_OUTPUT_LIMIT
+        data = data[:CLI_OUTPUT_LIMIT]; captured.append(data)
+        records.append({'observed_size': size, 'overflow': overflow, 'snapshot_sha256': sha(data),
+                        'base64': base64.b64encode(data).decode('ascii')})
+    artifact = {'schema': 1, 'scope': 'Fresh empty config, no supplied tokens; actual pinned CLI local command only',
+                'joined': joined, 'returncode': returncode if joined else None, 'cli_sha256': cli_sha256,
+                'stdout': records[0], 'stderr': records[1]}
+    with evidence.open('x', encoding='utf-8') as output: json.dump(artifact, output, indent=2)
+    summary = {'raw_evidence_sha256': file_sha(evidence), 'raw_evidence_bytes': evidence.stat().st_size,
+               'stdout_size': records[0]['observed_size'], 'stderr_size': records[1]['observed_size'],
+               'output_overflow': any(row['overflow'] for row in records), 'output_complete': joined}
+    return captured, summary
+
+
+def actual_cli_local_phase(binary, identity, folder, project, commands, manifest, receipt, save, evidence):
+    config = folder / 'cli-probe-config'
+    if os.path.lexists(config) or any(os.path.lexists(project / name) for name in ('.env', '.venv')):
+        raise AssertionError('Actual CLI requires a new empty isolated configuration')
+    if file_sha(binary) != identity['sha256']:
+        raise AssertionError('Existing pinned CLI changed before launch')
+    config.mkdir(mode=0o700)
+    env = shell_environment()
+    env.update(SLACK_DISABLE_TELEMETRY='true', SLACK_SKIP_UPDATE='true', NO_COLOR='1')
+    argv = [str(binary), '--config-dir', str(config), '--no-color', '--skip-update', '--verbose',
+            'manifest', 'info', '--source', 'local']
+    phase = {'action': 'actual_cli_local_manifest', 'status': 'dispatching',
+             'cli_sha256': identity['sha256'], 'telemetry_disabled': True, 'fresh_empty_config': True}
+    receipt['phases'].append(phase); save()
+    paths = [folder / 'actual-cli-stdout', folder / 'actual-cli-stderr']
+    try:
+        with paths[0].open('xb') as out, paths[1].open('xb') as err:
+            child = subprocess.Popen(argv, cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            phase.update(child_identity(child)); save()
+            child.wait(timeout=20)
+    except BaseException as error:
+        phase.update(status='unknown_no_retry_no_kill', error_type=type(error).__name__)
+        try:
+            _, summary = cli_output_snapshot(paths, evidence, joined=False, returncode=None, cli_sha256=identity['sha256'])
+            phase.update(summary); save()
+        except BaseException as capture_error:
+            phase['capture_error_type'] = type(capture_error).__name__
+        raise
+    captured, summary = cli_output_snapshot(paths, evidence, joined=True, returncode=child.returncode, cli_sha256=identity['sha256'])
+    phase.update(summary, status='returned', returncode=child.returncode); save()
+    if child.returncode or summary['output_overflow']:
+        raise AssertionError('Actual CLI failed or output exceeded bound')
+    phase.update(cli_hook_proof(*captured, commands, manifest, project))
+    if json.loads(read_small(config / 'credentials.json')) != {}:
+        raise AssertionError('Actual CLI did not preserve an empty auth configuration')
+    phase['empty_auth_preserved'] = True; save()
+
+
 def run(home, helper_path, helper_sha256, result):
-    receipt = {'schema': 1, 'passed': False, 'phases': [], 'scope': 'actual packaged Python and native shell; pinned CLI shell grammar only, no CLI deploy/auth chain',
+    receipt = {'schema': 1, 'passed': False, 'phases': [], 'scope': 'Actual pinned Go CLI local GetHooks/GetManifest; separate fake-only private-Python install body, not auth/deploy',
                'explicit_slack_requests': 0, 'fake_install_only': True,
                'shell_profile_effects': 'Native shell uses upstream default flags; ambient profile effects are not independently audited.',
-               'windows_parent_substitution': 'Packaged Python substitutes for the Go CLI parent; caller uses CREATE_NO_WINDOW, native PowerShell uses default flags.'}
+               'windows_parent_scope': 'Actual CLI uses production CREATE_NO_WINDOW; Go owns native hook pipes and default shell flags. Fake install body is separate.'}
     def save():
         result.write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
     with result.open('x', encoding='utf-8') as stream:
@@ -332,23 +466,28 @@ def run(home, helper_path, helper_sha256, result):
                        helper_sha256=helper_sha256, project_has_repeated_spaces='  ' in str(project),
                        official_cli=official_cli_record(helper_path.parent / 'slack-setup'))
         observer.start()
-        for action in ('hooks', 'manifest', 'install'):
+        commands = {action: helper.hook_command(project, action) for action in ('hooks', 'manifest', 'install')}
+        binary = helper_path.parent / 'slack-setup/bin' / ('slack.exe' if os.name == 'nt' else 'slack')
+        actual_cli_local_phase(binary, receipt['official_cli'], folder, project, commands, manifest,
+                               receipt, save, result.with_name('native-hook-cli-evidence.json'))
+        for action in ('install',):
             command = helper.hook_command(project, action)
-            argv = shell_argv(command)
+            argv = [str(expected), '-I', '-B', '-X', 'utf8', str(project / 'hooks.py'), action]
             env = shell_environment()
-            if action == 'install':
-                env.update(SLACK_APP_TOKEN=FAKE['app_token'], SLACK_BOT_TOKEN=FAKE['bot_token'])
+            env.update(SLACK_APP_TOKEN=FAKE['app_token'], SLACK_BOT_TOKEN=FAKE['bot_token'])
             phase = {'action': action, 'status': 'dispatching', 'command_sha256': sha(command.encode()),
-                     'shell_pe_subsystem': pe_subsystem(Path(argv[0])), 'shell_creationflags': 0}
+                     'scope': 'Direct private-Python fake install body; not native shell or CLI deploy',
+                     'python_pe_subsystem': pe_subsystem(expected)}
             receipt['phases'].append(phase); save()
-            # Native hooks have tiny known responses. Files avoid unbounded pipe
+            # This fake install body has a tiny known response. Files avoid unbounded pipe
             # buffering if a shell fails unexpectedly. They remain with this
             # fixture on uncertainty; no process is signalled or replayed.
             stdout_path = folder / (action + '-stdout')
             stderr_path = folder / (action + '-stderr')
             with stdout_path.open('xb') as out, stderr_path.open('xb') as err:
                 child = subprocess.Popen(argv, cwd=project, env=env, stdin=subprocess.DEVNULL,
-                                         stdout=out, stderr=err)
+                                         stdout=out, stderr=err,
+                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                 phase.update(child_identity(child)); save()
                 try:
                     child.wait(timeout=20)
@@ -361,13 +500,7 @@ def run(home, helper_path, helper_sha256, result):
             save()
             if child.returncode != 0 or len(stdout) > LIMIT or len(stderr) > LIMIT:
                 raise AssertionError('Native hook failed or output exceeded bound')
-            if action == 'hooks':
-                value = json.loads(stdout)
-                if value != {'runtime': 'rust', 'hooks': {'get-manifest': helper.hook_command(project, 'manifest'), 'deploy': helper.hook_command(project, 'install')}}:
-                    raise AssertionError('Hook discovery differs')
-            elif action == 'manifest' and json.loads(stdout) != manifest:
-                raise AssertionError('Hook manifest differs')
-            elif action == 'install' and json.loads(read_small(folder / 'issued.json')) != FAKE:
+            if json.loads(read_small(folder / 'issued.json')) != FAKE:
                 raise AssertionError('Inert install hook did not preserve exact fake values')
         if read_small(home / 'adapter.json') != config_bytes or any(sha(read_small(p)) != value for p, value in protected.items()):
             raise AssertionError('Fixture settings or prior secrets changed')
@@ -378,6 +511,11 @@ def run(home, helper_path, helper_sha256, result):
         receipt['passed'] = True
     except BaseException as error:
         receipt['failure_type'] = type(error).__name__
+        if isinstance(error, json.JSONDecodeError):
+            receipt['failure_detail'] = {'message': error.msg[:160], 'line': error.lineno,
+                                         'column': error.colno, 'position': error.pos}
+        elif isinstance(error, AssertionError):
+            receipt['failure_detail'] = {'message': str(error)[:160]}
         raise
     finally:
         if 'console' not in receipt:
@@ -393,6 +531,100 @@ def run(home, helper_path, helper_sha256, result):
 
 
 class PureContractTests(unittest.TestCase):
+    @staticmethod
+    def cli_transcript(project):
+        commands = {'hooks': 'private-python hooks', 'manifest': 'private-python manifest', 'install': 'private-python install'}
+        manifest = {'display_information': {'name': 'Local hook contract fixture'}}
+        source = str(project).replace('"', '`"' if os.name == 'nt' else '\\"')
+        spans = [(commands['hooks'], {'runtime': 'rust', 'hooks': {'get-manifest': commands['manifest'], 'deploy': commands['install']}}),
+                 (commands['manifest'] + ' --source="' + source + '"', manifest)]
+        lines = []
+        for command, value in spans:
+            lines.extend(['starting hook command: ' + command, json.dumps(value), 'finished hook command: ' + command])
+        output = ''.join('[2026-11-19 01:02:03] ' + line + '\n' for line in lines) + json.dumps(manifest) + '\n'
+        return commands, manifest, output.encode('utf-8')
+
+    def test_actual_cli_ordered_hooks_require_exact_returned_json(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary).resolve()
+            commands, manifest, output = self.cli_transcript(project)
+            self.assertEqual(cli_hook_proof(output, b'', commands, manifest, project),
+                             {'actual_go_cli_hooks': ['hooks', 'manifest'], 'file_fallback_accepted': False})
+            self.assertFalse(cli_command_matches(commands['manifest'] + ' --source="' + str(project.parent) + '"', commands['manifest'], project))
+            for changed in [output.replace(b'private-python hooks', b'foreign hooks'),
+                            output.replace(b'"runtime": "rust"', b'"runtime": "foreign"'),
+                            output + output, output[:80], b'x' * (CLI_OUTPUT_LIMIT + 1)]:
+                with self.subTest(changed=sha(changed)),self.assertRaises((AssertionError, ValueError)):
+                    cli_hook_proof(changed, b'', commands, manifest, project)
+
+    def test_actual_cli_exit_zero_file_fallback_and_deferred_finish_are_not_proof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary).resolve()
+            commands, manifest, output = self.cli_transcript(project)
+            fallback = json.dumps(manifest).encode()
+            deferred = ('[2026-11-19 01:02:03] starting hook command: ' + commands['hooks'] + '\n' +
+                        '[2026-11-19 01:02:03] finished hook command: ' + commands['hooks'] + '\n').encode() + fallback
+            for value in (fallback, deferred, output.replace(b'starting hook command:', b'ignored hook command:', 1)):
+                with self.assertRaises((AssertionError, ValueError)):
+                    cli_hook_proof(value, b'', commands, manifest, project)
+            with self.assertRaisesRegex(AssertionError, 'initialization error'):
+                cli_hook_proof(output, b'failed to initialize hook configurations: failure', commands, manifest, project)
+
+    def test_actual_cli_raw_snapshot_is_bounded_and_never_overwrites_original(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); paths = [root/'out', root/'err']; evidence = root/'evidence.json'
+            paths[0].write_bytes(b'x' * (CLI_OUTPUT_LIMIT + 1)); paths[1].write_bytes(b'')
+            captured, summary = cli_output_snapshot(paths, evidence, joined=False, returncode=None, cli_sha256='a'*64)
+            self.assertEqual(len(captured[0]), CLI_OUTPUT_LIMIT); self.assertTrue(summary['output_overflow'])
+            self.assertFalse(summary['output_complete']); original = evidence.read_bytes()
+            saved = json.loads(original); self.assertEqual(base64.b64decode(saved['stdout']['base64']), captured[0])
+            self.assertIsNone(saved['returncode']); self.assertLess(len(original), LIMIT)
+            with self.assertRaises(FileExistsError):
+                cli_output_snapshot(paths, evidence, joined=True, returncode=0, cli_sha256='a'*64)
+            self.assertEqual(evidence.read_bytes(), original)
+
+    def test_actual_cli_fresh_config_clean_environment_and_one_dispatch(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve(); project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
+            commands, manifest, output = self.cli_transcript(project)
+            child=Mock(returncode=0, pid=42)
+            def launch(argv, **kwargs):
+                self.assertEqual(argv[-4:], ['manifest','info','--source','local'])
+                self.assertEqual(kwargs['cwd'], project)
+                self.assertEqual(kwargs['env']['SLACK_DISABLE_TELEMETRY'], 'true')
+                self.assertEqual(kwargs['env']['SLACK_SKIP_UPDATE'], 'true')
+                for forbidden in ('SLACK_TOKEN','SLACK_CONFIG_DIR','OPENAI_API_KEY','DENO_AUTH_TOKENS'):
+                    self.assertNotIn(forbidden, kwargs['env'])
+                kwargs['stdout'].write(output); kwargs['stderr'].write(b'')
+                (Path(argv[2])/'credentials.json').write_text('{}')
+                return child
+            receipt={'phases':[]};save=Mock()
+            with patch.dict(os.environ, {'SLACK_TOKEN':'never-use','SLACK_CONFIG_DIR':'never-use','OPENAI_API_KEY':'never-use','DENO_AUTH_TOKENS':'never-use'}), \
+                    patch.object(subprocess,'Popen',side_effect=launch) as popen, \
+                    patch(__name__+'.child_identity',return_value={'pid':42}):
+                actual_cli_local_phase(binary, {'sha256':file_sha(binary)}, root, project, commands, manifest, receipt, save, root/'evidence.json')
+            self.assertEqual(popen.call_count,1);child.wait.assert_called_once_with(timeout=20)
+            child.kill.assert_not_called();child.terminate.assert_not_called()
+            self.assertTrue(receipt['phases'][0]['empty_auth_preserved'])
+
+    def test_actual_cli_unknown_preserves_original_timeout_without_kill_or_retry(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
+            commands,manifest,_=self.cli_transcript(project)
+            original=subprocess.TimeoutExpired('fixed-local-cli',20)
+            child=Mock(returncode=None,pid=42);child.wait.side_effect=original
+            receipt={'phases':[]}
+            with patch.object(subprocess,'Popen',return_value=child) as popen, \
+                    patch(__name__+'.child_identity',return_value={'pid':42}):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    actual_cli_local_phase(binary, {'sha256':file_sha(binary)}, root, project, commands, manifest, receipt, lambda:None, root/'evidence.json')
+            self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1)
+            child.kill.assert_not_called();child.terminate.assert_not_called()
+            self.assertEqual(receipt['phases'][0]['status'],'unknown_no_retry_no_kill')
+            self.assertFalse(json.loads((root/'evidence.json').read_bytes())['joined'])
+
     def test_console_image_text_bound_retains_exact_digest_and_length(self):
         self.assertEqual(diagnostic_image('x' * 1024)['image'], 'x' * 1024)
         value = '\u5b50' * 1025
@@ -529,7 +761,7 @@ class PureContractTests(unittest.TestCase):
                 actual = official_cli_record(folder, True)
                 self.assertEqual(actual['pe_subsystem'], 3)
                 self.assertEqual(actual['sha256'], receipt['sha256'])
-                self.assertFalse(actual['executed_again'])
+                self.assertFalse(actual['version_command_repeated'])
                 binary.write_bytes(data + b'changed')
                 with self.assertRaisesRegex(AssertionError, 'identity differs'):
                     official_cli_record(folder, True)

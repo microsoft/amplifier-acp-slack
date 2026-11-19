@@ -66,6 +66,33 @@ class HookProbeBoundaryTests(unittest.TestCase):
             m.verify_packaged_hooks(self.root,self.helper,writer,{})
         self.assertIs(caught.exception,error)
 
+    def test_actual_cli_raw_evidence_export_survives_success_cleanup_and_failure(self):
+        for passed in (False, True):
+            with self.subTest(passed=passed):
+                root=self.root/('success' if passed else 'failure');root.mkdir()
+                target=self.root/(str(passed)+'-native-launch-result.json')
+                raw=b'{"schema":1,"joined":true,"stdout":{"base64":"e30="}}'
+                child=Mock(pid=45,returncode=0 if passed else 1)
+                def finished(timeout):
+                    self.assertEqual(timeout,90)
+                    (root/'native-hook-result.json').write_text(json.dumps({'passed':passed}))
+                    (root/'native-hook-cli-evidence.json').write_bytes(raw)
+                child.wait.side_effect=finished
+                with patch.object(m.subprocess,'Popen',return_value=child) as launch:
+                    if passed:m.verify_packaged_hooks(root,self.helper,target,{})
+                    else:
+                        with self.assertRaisesRegex(AssertionError,'Native hook contract failed'):
+                            m.verify_packaged_hooks(root,self.helper,target,{})
+                launch.assert_called_once();child.kill.assert_not_called();child.terminate.assert_not_called()
+                saved=json.loads(target.read_text())['raw_cli_evidence']
+                exported=Path(saved['path'])
+                self.assertEqual(saved['sha256'],hashlib.sha256(raw).hexdigest())
+                self.assertEqual(saved['size'],len(raw));self.assertEqual(exported.read_bytes(),raw)
+                if passed:
+                    m.shutil.rmtree(root)
+                    self.assertEqual(exported.read_bytes(),raw)
+                else:self.assertEqual((root/'native-hook-cli-evidence.json').read_bytes(),raw)
+
     def test_failed_fixture_root_is_retained_and_successful_root_removed(self):
         kept=self.root/'retained';kept.mkdir()
         error=TimeoutError('unknown fixture')

@@ -155,6 +155,7 @@ jobs:
           path: |
             dist/*
             *-native-launch-result.json
+            *-native-hook-cli-evidence.json
             *-native-manager-result.json
             *-native-update-result.json
             *-native-update-result-managed.json

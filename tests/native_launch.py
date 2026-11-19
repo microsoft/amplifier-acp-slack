@@ -289,7 +289,7 @@ def retained_fixture_root():
         shutil.rmtree(root)
 
 def verify_packaged_hooks(root,helper,result,env):
-    """Actual native shell only; this is not an actual CLI deploy/auth chain."""
+    """Actual CLI local hooks plus fake install body; never deploy/auth."""
     home=root/'finite  setup café 子'
     python=home/'runtime/python'/('python.exe' if os.name=='nt' else 'bin/python3')
     saved=root/'native-hook-result.json'
@@ -297,7 +297,7 @@ def verify_packaged_hooks(root,helper,result,env):
              '--home',str(home),'--helper',str(helper),'--helper-sha256',hashlib.sha256(helper.read_bytes()).hexdigest(),
              '--result',str(saved)]
     checkpoint={'passed':False,'phase':'packaged_native_hook_contract','retained_fixture_root':str(root),
-                'limits':['Python substitutes for the Go parent; not an actual Slack CLI hook/auth/deploy chain',
+                'limits':['Actual CLI GetHooks/GetManifest only; fake install body is separate, not auth/deploy',
                           'Windows visible-console sampling is bounded, and new windows are not attributed to the child tree']}
     def save():
         if saved.exists():
@@ -305,6 +305,20 @@ def verify_packaged_hooks(root,helper,result,env):
                 if saved.stat().st_size>1024*1024:raise ValueError('Hook receipt bound')
                 checkpoint['native_hook_contract']=json.loads(saved.read_text(encoding='utf-8'))
             except (OSError,ValueError):checkpoint['native_hook_readback']='unavailable_or_incomplete'
+        raw_cli=root/'native-hook-cli-evidence.json'
+        if result and raw_cli.exists():
+            if raw_cli.is_symlink() or not raw_cli.is_file() or raw_cli.stat().st_size>1024*1024:
+                raise AssertionError('Actual CLI evidence must be a bounded ordinary file')
+            data=raw_cli.read_bytes()
+            if len(data)>1024*1024:raise AssertionError('Actual CLI evidence grew beyond bound')
+            target=result.with_name(result.name.replace('-native-launch-result.json','-native-hook-cli-evidence.json'))
+            if target==result:target=result.with_name(result.stem+'-native-hook-cli-evidence.json')
+            if target.exists():
+                if target.is_symlink() or not target.is_file() or target.stat().st_size>1024*1024 or target.read_bytes()!=data:
+                    raise AssertionError('Actual CLI evidence destination changed')
+            else:
+                with target.open('xb') as output:output.write(data)
+            checkpoint['raw_cli_evidence']={'path':str(target),'sha256':hashlib.sha256(data).hexdigest(),'size':len(data)}
         if result:result.write_text(json.dumps(checkpoint,indent=2)+'\n',encoding='utf-8')
     save()
     try:
@@ -609,7 +623,7 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
                 assert verified.returncode==0,verified.stderr
                 checks.append('actual checksum-pinned official Slack CLI starts on this platform')
                 hook_receipt=verify_packaged_hooks(root,home/'secrets/slack-setup-helper.py',result,env)
-                checks.append('actual packaged Python/native-shell get-hooks, manifest and fake-only install preserve settings with OS-only PATH; not a CLI deploy/auth chain')
+                checks.append('actual pinned Go CLI get-hooks/get-manifest plus separate private-Python fake install body preserve settings with OS-only PATH; no auth/deploy')
 
         finally:p.terminate();p.wait(timeout=20);log.close()
         superseded_launch(binary,home,env);checks.extend(['actual superseded replacement refuses startup before state, listener or Slack runtime','management recovery remains available without Slack runtime; damaged journal is reported and preserved'])
