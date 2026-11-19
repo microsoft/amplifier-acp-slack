@@ -226,6 +226,7 @@ for line in sys.stdin:
   (root/'paused').write_text('1')
   end=time.monotonic()+10
   while not (root/'continue').exists() and time.monotonic()<end:time.sleep(.01)
+  if not (root/'continue').exists():raise TimeoutError('Fixture continuation deadline expired')
   if mode!='cancelled':update({'sessionUpdate':'agent_message_chunk','messageId':'final','content':{'type':'text','text':'Final answer.'},'_meta':{key:{'phase':'final_answer'}}})
   result={'stopReason':'cancelled' if mode=='cancelled' else 'end_turn'}
  else:result={}
@@ -244,39 +245,80 @@ for line in sys.stdin:
         input["job_id"] = j.id.clone().into();
         let path = home.path().to_path_buf();
         let running = tokio::spawn(acp_slack_adapter::driver::decide(c, path, input));
-        let waited = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            while !home.path().join("paused").exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            if mode == "negotiated" {
-                loop {
-                    let count: i64 =
-                        s.db.query_row("SELECT COUNT(*) FROM public_speech", [], |r| r.get(0))
-                            .unwrap();
-                    if count == 1 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Cold process/ACP setup is separate from the speech-delivery predicate.
+        // The 30s setup scale also bounds driver::check in client_interop tests;
+        // this is a fixture phase, not a change to the product execution budget.
+        let started = std::time::Instant::now();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if home.path().join("paused").exists() {
+                    break true;
                 }
+                if running.is_finished() {
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await;
-        if waited.is_err() {
-            std::fs::write(home.path().join("continue"), "1").unwrap();
-            panic!(
-                "{mode}: no expected mid-turn event; paused={}, error={:?}, result={:?}",
-                home.path().join("paused").exists(),
-                std::fs::read_to_string(home.path().join("error")),
-                running.await
-            );
-        }
-        assert!(!running.is_finished());
-        let before: i64 =
-            s.db.query_row("SELECT COUNT(*) FROM public_speech", [], |r| r.get(0))
-                .unwrap();
+        let ready_elapsed = started.elapsed();
+        let waited = if matches!(&ready, Ok(true)) {
+            Some(
+                tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                    if mode == "negotiated" {
+                        loop {
+                            let count: i64 =
+                                s.db.query_row("SELECT COUNT(*) FROM public_speech", [], |r| {
+                                    r.get(0)
+                                })?;
+                            if count == 1 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                    Ok::<(), rusqlite::Error>(())
+                })
+                .await,
+            )
+        } else {
+            None
+        };
+        // Record the held-open state before releasing this one fixture. Do not
+        // assert or unwrap between spawning and joining: a failed observation
+        // must not drop TempDir while the actual driver still owns its child.
+        let before_finished = running.is_finished();
+        let before_paused = home.path().join("paused").exists();
+        let before_error = std::fs::read_to_string(home.path().join("error"));
+        let before_count =
+            s.db.query_row("SELECT COUNT(*) FROM public_speech", [], |r| {
+                r.get::<_, i64>(0)
+            });
+        let before_elapsed = started.elapsed();
+        let released = std::fs::write(home.path().join("continue"), "1");
+        let result = running.await;
+        let after_paused = home.path().join("paused").exists();
+        let after_error = std::fs::read_to_string(home.path().join("error"));
+        let after_count =
+            s.db.query_row("SELECT COUNT(*) FROM public_speech", [], |r| {
+                r.get::<_, i64>(0)
+            });
+        assert!(
+            matches!(&ready, Ok(true))
+                && matches!(&waited, Some(Ok(Ok(()))))
+                && !before_finished
+                && released.is_ok()
+                && before_count.is_ok()
+                && result.as_ref().is_ok_and(|answer| answer.is_ok()),
+            "{mode}: ready={ready:?} ready_elapsed={ready_elapsed:?}, speech={waited:?}; \
+             before_release: elapsed={before_elapsed:?}, paused={before_paused}, finished={before_finished}, \
+             count={before_count:?}, error={before_error:?}; release={released:?}; \
+             after_join: elapsed={:?}, paused={after_paused}, count={after_count:?}, error={after_error:?}, result={result:?}",
+            started.elapsed()
+        );
+        let before = before_count.unwrap();
         assert_eq!(before, if mode == "negotiated" { 1 } else { 0 });
-        std::fs::write(home.path().join("continue"), "1").unwrap();
-        let answer = running.await.unwrap().unwrap();
+        let answer = result.unwrap().unwrap();
         if mode != "cancelled" {
             assert_eq!(answer.text, "Final answer.");
         }
