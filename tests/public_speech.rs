@@ -244,12 +244,13 @@ for line in sys.stdin:
         let mut input = acp_slack_adapter::driver::request(&c, &j.trigger, vec![j.trigger.clone()]);
         input["job_id"] = j.id.clone().into();
         let path = home.path().to_path_buf();
+        let readiness_budget = std::time::Duration::from_secs(c.acp.timeout_seconds);
         let running = tokio::spawn(acp_slack_adapter::driver::decide(c, path, input));
         // Cold process/ACP setup is separate from the speech-delivery predicate.
-        // The 30s setup scale also bounds driver::check in client_interop tests;
-        // this is a fixture phase, not a change to the product execution budget.
+        // Readiness shares this decision's existing execution budget; the same
+        // running task still owns that deadline during the speech assertion.
         let started = std::time::Instant::now();
-        let ready = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let ready = tokio::time::timeout(readiness_budget, async {
             loop {
                 if home.path().join("paused").exists() {
                     break true;
