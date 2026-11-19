@@ -1,0 +1,3 @@
+* -text
+# Unified-diff context lines deliberately preserve upstream indentation/blank lines.
+windows-no-color.patch whitespace=-blank-at-eol,-space-before-tab

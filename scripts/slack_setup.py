@@ -26,14 +26,16 @@ import time
 import urllib.request
 
 VERSION = '4.12.0'
+WINDOWS_CLI_DISTRIBUTION = 'constellation-headless-1'
+WINDOWS_CLI_SOURCE = '91df4803911140c5a6da56e88ecd04e25c9c7515'
+WINDOWS_CLI_PATCH = 'a5122ebf2ea5a7c012f7205ed477eef4795f3a53260f3c310a12980df80a9476'
+WINDOWS_CLI_BINARY = 'slack-headless-1.exe'
+WINDOWS_CLI_RECEIPT = 'cli-headless-1.json'
 ARCHIVES = {
     ('Linux', 'x86_64'): ('linux_amd64', '8b93b0ff3a30879b5ef09fe01fb3bc457afb368bb26827b526f101eccce96c76'),
     ('Linux', 'aarch64'): ('linux_arm64', 'd98ad8ba0848958a47befb73761a51ebd97a363b431758e177a828c7774bdb7d'),
     ('Darwin', 'x86_64'): ('macOS_amd64', '838aa81d10f82e5e9212800d084924ac66e5807aecaac16ae747c90d985352a2'),
     ('Darwin', 'arm64'): ('macOS_arm64', '23a5001854d2bb283ded8ad941cff13d4b2573ba922233087609b70ce53e4b6d'),
-    # Slack publishes x64 only. Windows 11 ARM runs this official CLI through OS x64 compatibility.
-    ('Windows', 'AMD64'): ('windows_64-bit', 'b1ca5e13e7c90cc7a9dfcb2af055f91d9a1e22db20790caa50ab530c07d4e914'),
-    ('Windows', 'ARM64'): ('windows_64-bit', 'b1ca5e13e7c90cc7a9dfcb2af055f91d9a1e22db20790caa50ab530c07d4e914'),
 }
 
 
@@ -81,9 +83,96 @@ def write(path, value):
     temporary.replace(path)
 
 
+def cli_regular_bytes(path, maximum):
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_size > maximum
+            or getattr(info, 'st_file_attributes', 0) & 0x400):
+        raise SetupError('The private Slack setup tool is invalid. Reopen the complete app download.')
+    with path.open('rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (info.st_dev, info.st_ino, info.st_size):
+            raise SetupError('The private Slack setup tool changed before verification.')
+        data = stream.read(maximum + 1)
+    if len(data) != info.st_size:
+        raise SetupError('The private Slack setup tool changed during verification.')
+    return data
+
+
+def cli_regular_directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+        raise SetupError('The private Slack setup tool directory is invalid.')
+
+
+def bundled_windows_cli():
+    # This derived CLI is part of the verified private runtime inventory. It
+    # preserves the upstream commands and disables only an init-time Windows
+    # console-colour query when this helper explicitly sets NO_COLOR.
+    root = Path(sys.executable).resolve().parent / 'slack-cli'
+    metadata_path = root / 'provenance.json'
+    binary = root / 'slack.exe'
+    try:
+        cli_regular_directory(root)
+        metadata = json.loads(cli_regular_bytes(metadata_path, 64 * 1024))
+        expected = {'distribution': WINDOWS_CLI_DISTRIBUTION,
+                    'upstream_version': VERSION, 'upstream_source': WINDOWS_CLI_SOURCE,
+                    'patch_sha256': WINDOWS_CLI_PATCH, 'goos': 'windows', 'goarch': 'amd64'}
+        if (not isinstance(metadata, dict) or type(metadata.get('schema')) is not int or metadata['schema'] != 1
+                or any(metadata.get(k) != v for k, v in expected.items())
+                or metadata.get('cgo_enabled') is not False
+                or type(metadata.get('binary_size')) is not int
+                or not 0 < metadata['binary_size'] <= 150 * 1024 * 1024
+                or not isinstance(metadata.get('binary_sha256'), str)
+                or re.fullmatch(r'[0-9a-f]{64}', metadata['binary_sha256']) is None):
+            raise SetupError('The bundled Slack setup tool has an unexpected build identity.')
+        data = cli_regular_bytes(binary, 150 * 1024 * 1024)
+        if len(data) != metadata['binary_size'] or hashlib.sha256(data).hexdigest() != metadata['binary_sha256']:
+            raise SetupError('The bundled Slack setup tool failed verification.')
+    except (OSError, ValueError, TypeError) as error:
+        raise SetupError('The bundled Slack setup tool is missing or invalid. Reopen the complete app download.') from error
+    receipt = {'version': VERSION, 'distribution': WINDOWS_CLI_DISTRIBUTION,
+               'upstream_source': WINDOWS_CLI_SOURCE, 'patch_sha256': WINDOWS_CLI_PATCH,
+               'sha256': metadata['binary_sha256'], 'size': len(data)}
+    return data, receipt
+
+
 def ensure_cli(folder):
-    binary = folder / ('bin/slack.exe' if os.name == 'nt' else 'bin/slack')
-    receipt = read(folder / 'cli.json', {})
+    windows = sys.platform == 'win32'
+    binary = folder / 'bin' / (WINDOWS_CLI_BINARY if windows else 'slack')
+    receipt_path = folder / (WINDOWS_CLI_RECEIPT if windows else 'cli.json')
+    if windows:
+        data, expected = bundled_windows_cli()
+        temporary = binary.with_suffix('.new')
+        receipt_temporary = receipt_path.with_suffix('.tmp')
+        if os.path.lexists(temporary) or os.path.lexists(receipt_temporary):
+            raise SetupError('A previous Slack setup-tool preparation is incomplete. Its files have been preserved.')
+        receipt = {}
+        if os.path.lexists(receipt_path):
+            try:
+                receipt = json.loads(cli_regular_bytes(receipt_path, 64 * 1024))
+            except (OSError, ValueError, TypeError) as error:
+                raise SetupError('The private Slack setup-tool receipt is invalid; it has been preserved.') from error
+        if os.path.lexists(binary.parent):
+            cli_regular_directory(binary.parent)
+        if os.path.lexists(binary):
+            cached = cli_regular_bytes(binary, 150 * 1024 * 1024)
+            if receipt == expected and hashlib.sha256(cached).hexdigest() == expected['sha256']:
+                return binary
+        # Keep the official cache and its receipt intact for older helpers
+        # after rollback. This fixed derived slot is never an implicit fallback
+        # for that cache, and has no network or unpatched-tool fallback.
+        binary.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cli_regular_directory(binary.parent)
+        with open(temporary, 'xb', opener=lambda p, f: os.open(p, f, 0o700)) as stream:
+            stream.write(data)
+        temporary.chmod(0o700)
+        with open(receipt_temporary, 'x', encoding='utf-8',
+                  opener=lambda p, f: os.open(p, f, 0o600)) as stream:
+            json.dump(expected, stream)
+        temporary.replace(binary)
+        receipt_temporary.replace(receipt_path)
+        return binary
+    receipt = read(receipt_path, {})
     if binary.exists() and receipt.get('version') == VERSION:
         if hashlib.sha256(binary.read_bytes()).hexdigest() == receipt.get('sha256'):
             return binary
@@ -131,7 +220,7 @@ def cli(folder, *args, cwd=None, auth_dir=None):
             del env[name]
     env.update({'SLACK_SKIP_UPDATE': 'true', 'NO_COLOR': '1'})
     # Output stays in this private process; errors below use an allowlist.
-    # The official CLI is a contained, noninteractive setup child, not a user
+    # The pinned CLI is a contained, noninteractive setup child, not a user
     # terminal. It continues inheriting the helper's Job Object on Windows.
     window = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
     result = subprocess.run([str(binary), '--config-dir', str(config), '--no-color',

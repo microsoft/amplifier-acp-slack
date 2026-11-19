@@ -619,11 +619,11 @@ def run(package,result,browser=False,verify_setup_tool=False,verify_startup=Fals
             if verify_setup_tool:
                 prepare_fresh_setup_tool(home,base,{'Cookie':cookie,'X-CSRF-Token':session['csrf']})
                 checks.append('one explicit fresh-home local discard materializes the exact helper; subsequent read-only saved setup succeeds without authorization/network or account/configuration changes')
-                code="import importlib.util,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],capture_output=True,text=True,encoding='utf-8',timeout=30); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Official Slack CLI 4.12.0 starts')"
+                code="import importlib.util,os,pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); spec=importlib.util.spec_from_file_location('setup',p/'secrets/slack-setup-helper.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); b=m.ensure_cli(p/'secrets/slack-setup'); r=subprocess.run([str(b),'version','--skip-update'],env=dict(os.environ,NO_COLOR='1',SLACK_SKIP_UPDATE='true'),capture_output=True,text=True,encoding='utf-8',timeout=30,creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0); assert r.returncode==0 and '4.12.0' in r.stdout, (r.returncode,r.stdout); print('Pinned Slack setup CLI starts: '+(m.WINDOWS_CLI_DISTRIBUTION if sys.platform=='win32' else 'official upstream 4.12.0'))"
                 vendor_env={**env,'SLACK_SKIP_UPDATE':'true','NO_COLOR':'1'}
-                verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150)
+                verified=subprocess.run([str(private_python),'-I','-B','-X','utf8','-c',code,str(home)],env=vendor_env,capture_output=True,text=True,encoding='utf-8',timeout=150,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
                 assert verified.returncode==0,verified.stderr
-                checks.append('actual checksum-pinned official Slack CLI starts on this platform')
+                checks.append('actual pinned Slack setup CLI starts: bundled Windows derivative or official non-Windows tool; exact identity follows in setup_cli')
                 hook_receipt=verify_packaged_hooks(root,home/'secrets/slack-setup-helper.py',result,env)
                 checks.append('actual pinned Go CLI get-hooks/get-manifest plus separate private-Python fake install body preserve settings with OS-only PATH; no auth/deploy')
 

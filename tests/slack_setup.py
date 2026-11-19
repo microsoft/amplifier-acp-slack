@@ -1,5 +1,6 @@
 """Guided setup lifecycle, with the official CLI's boundary replaced by a fixture."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,104 @@ class SetupChildTests(unittest.TestCase):
                     self.assertTrue(kwargs['capture_output'])
                     if platform=='win32':self.assertEqual(kwargs['creationflags'],0x08000000)
                     else:self.assertNotIn('creationflags',kwargs)
+
+class BundledWindowsCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = self.root / 'runtime/python'
+        self.tool = self.runtime / 'slack-cli'
+        self.tool.mkdir(parents=True)
+        self.python = self.runtime / 'python.exe'
+        self.python.write_bytes(b'private interpreter fixture')
+        self.data = b'non-executable derived CLI fixture'
+        self.metadata = {'schema': 1, 'distribution': s.WINDOWS_CLI_DISTRIBUTION,
+                         'upstream_version': s.VERSION, 'upstream_source': s.WINDOWS_CLI_SOURCE,
+                         'patch_sha256': s.WINDOWS_CLI_PATCH, 'goos': 'windows', 'goarch': 'amd64',
+                         'cgo_enabled': False, 'binary_size': len(self.data),
+                         'binary_sha256': hashlib.sha256(self.data).hexdigest()}
+        (self.tool / 'slack.exe').write_bytes(self.data)
+        self.save_metadata()
+        for item in [patch.object(s.sys, 'platform', 'win32'),
+                     patch.object(s.sys, 'executable', str(self.python))]:
+            item.start(); self.addCleanup(item.stop)
+        self.folder = self.root / 'secrets/slack-setup'
+        self.folder.mkdir(parents=True)
+
+    def save_metadata(self):
+        (self.tool / 'provenance.json').write_text(json.dumps(self.metadata))
+
+    def test_materializes_derived_tool_and_reuses_only_exact_cache(self):
+        with patch.object(s.urllib.request, 'urlopen', side_effect=AssertionError('network forbidden')):
+            binary = s.ensure_cli(self.folder)
+            self.assertEqual(binary.read_bytes(), self.data)
+            receipt = s.read(self.folder / s.WINDOWS_CLI_RECEIPT)
+            self.assertEqual(receipt['distribution'], s.WINDOWS_CLI_DISTRIBUTION)
+            self.assertEqual(receipt['upstream_source'], s.WINDOWS_CLI_SOURCE)
+            self.assertEqual(receipt['patch_sha256'], s.WINDOWS_CLI_PATCH)
+            self.assertEqual(receipt['size'], len(self.data))
+            original = binary.stat()
+            self.assertEqual(s.ensure_cli(self.folder), binary)
+            self.assertEqual(binary.stat().st_mtime_ns, original.st_mtime_ns)
+
+    def test_old_official_cache_does_not_mask_new_derived_build(self):
+        binary = self.folder / 'bin/slack.exe'
+        binary.parent.mkdir(); binary.write_bytes(b'old official bytes')
+        s.write(self.folder / 'cli.json', {'version': s.VERSION, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()})
+        auth = self.folder / 'auth/credentials.json'
+        auth.parent.mkdir(); auth.write_bytes(b'fixture credential preserved')
+        with patch.object(s.urllib.request, 'urlopen', side_effect=AssertionError('network forbidden')):
+            self.assertEqual(s.ensure_cli(self.folder).read_bytes(), self.data)
+        self.assertEqual(binary.read_bytes(), b'old official bytes')
+        self.assertEqual(set(s.read(self.folder / 'cli.json')), {'version', 'sha256'})
+        self.assertEqual(auth.read_bytes(), b'fixture credential preserved')
+
+    def test_missing_or_wrong_bundle_refuses_without_using_old_cache(self):
+        for key, value in [('distribution', 'official'), ('upstream_source', '0' * 40),
+                           ('patch_sha256', '0' * 64), ('goarch', 'arm64'),
+                           ('cgo_enabled', 0), ('binary_size', True),
+                           ('binary_size', 150 * 1024 * 1024 + 1), ('binary_sha256', '0' * 64)]:
+            with self.subTest(key=key, value=value):
+                old = self.metadata[key]; self.metadata[key] = value; self.save_metadata()
+                with patch.object(s.urllib.request, 'urlopen', side_effect=AssertionError('network forbidden')):
+                    with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+                self.assertFalse((self.folder / 'bin').exists())
+                self.metadata[key] = old
+        self.save_metadata(); (self.tool / 'slack.exe').unlink()
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+
+    def test_corrupt_bundle_cannot_be_hidden_by_a_valid_cache(self):
+        binary = s.ensure_cli(self.folder)
+        before = binary.read_bytes()
+        (self.tool / 'slack.exe').write_bytes(b'changed')
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+        self.assertEqual(binary.read_bytes(), before)
+
+    def test_oversize_metadata_and_symlink_refuse(self):
+        metadata = self.tool / 'provenance.json'
+        metadata.write_bytes(b' ' * (64 * 1024 + 1))
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+        self.save_metadata()
+        if os.name != 'nt':
+            binary = self.tool / 'slack.exe'; binary.unlink(); binary.symlink_to(self.python)
+            with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+
+    def test_pending_derived_files_are_preserved_without_replacing_old_tools(self):
+        for name in ['bin/slack-headless-1.new', 'cli-headless-1.tmp']:
+            with self.subTest(name=name):
+                pending = self.folder / name; pending.parent.mkdir(exist_ok=True)
+                pending.write_bytes(b'retained unknown preparation')
+                with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+                self.assertEqual(pending.read_bytes(), b'retained unknown preparation')
+                self.assertFalse((self.folder / 'bin' / s.WINDOWS_CLI_BINARY).exists())
+                pending.unlink()
+
+    def test_oversized_derived_receipt_refuses_before_materialization(self):
+        receipt = self.folder / s.WINDOWS_CLI_RECEIPT
+        receipt.write_bytes(b' ' * (64 * 1024 + 1))
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+        self.assertFalse((self.folder / 'bin').exists())
 
 class ConfirmationRefusalTests(unittest.TestCase):
     exact = ('The following error was returned by the apps.hosted.exchangeAuthTicket Slack API method\n\n'
@@ -308,7 +407,7 @@ class SetupTests(unittest.TestCase):
                 member=tarfile.TarInfo(name);member.size=6;bundle.addfile(member,io.BytesIO(b'native'))
             data=archive.getvalue();target=('macOS_arm64',hashlib.sha256(data).hexdigest())
             folder=self.folder/name.replace('/','_')
-            with patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
+            with patch.object(s.sys,'platform','darwin'),patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
                 self.assertEqual(s.ensure_cli(folder).read_bytes(),b'native')
 
     def test_verified_archive_still_rejects_ambiguous_binary_entries(self):
@@ -318,7 +417,7 @@ class SetupTests(unittest.TestCase):
             for name in ['bin/slack','./bin/slack']:
                 member=tarfile.TarInfo(name);member.size=6;bundle.addfile(member,io.BytesIO(b'native'))
         data=archive.getvalue();target=('macOS_arm64',hashlib.sha256(data).hexdigest())
-        with patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
             with self.assertRaises(s.SetupError):s.ensure_cli(self.folder)
 
     def test_existing_app_is_adopted_without_another_identity(self):

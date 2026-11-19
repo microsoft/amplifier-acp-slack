@@ -111,16 +111,38 @@ def file_sha(path):
     raise AssertionError('Fixture executable exceeds bound')
 
 
-def official_cli_record(folder, windows=None):
+def setup_cli_record(folder, helper=None, windows=None):
     """Read the already version-checked CLI without repeating its version command."""
     windows = os.name == 'nt' if windows is None else windows
-    raw = read_small(folder / 'cli.json')
+    if windows and helper is None:
+        raise AssertionError('Windows requires the exact materialized setup helper')
+    raw = read_small(folder / (helper.WINDOWS_CLI_RECEIPT if windows else 'cli.json'))
     receipt = json.loads(raw)
-    binary = folder / ('bin/slack.exe' if windows else 'bin/slack')
+    binary = folder / 'bin' / (helper.WINDOWS_CLI_BINARY if windows else 'slack')
     digest = file_sha(binary)
-    if set(receipt) != {'version', 'sha256'} or receipt['version'] != '4.12.0' or receipt['sha256'] != digest:
-        raise AssertionError('Official CLI identity differs from its retained receipt')
-    return {'version': receipt['version'], 'sha256': digest, 'receipt_sha256': sha(raw),
+    if windows:
+        data, expected = helper.bundled_windows_cli()  # Read-only verified bundled input.
+        private = Path(sys.executable).resolve().parent
+        provenance_raw = read_small(private / 'slack-cli/provenance.json')
+        provenance = json.loads(provenance_raw)
+        bundle_raw = read_small(private.parent / 'native-bundle.json')
+        bundle = json.loads(bundle_raw)
+        inventory = bundle.get('python_files', {})
+        if (receipt != expected or digest != expected['sha256']
+                or binary.stat().st_size != expected['size'] or sha(data) != digest
+                or bundle.get('slack_cli') != provenance
+                or inventory.get('slack-cli/provenance.json') != sha(provenance_raw)
+                or inventory.get('slack-cli/slack.exe') != digest):
+            raise AssertionError('Derived CLI identity differs from its bundled provenance')
+        origin = {'kind': 'constellation_derived', 'distribution': expected['distribution'],
+                  'upstream_source': expected['upstream_source'], 'patch_sha256': expected['patch_sha256'],
+                  'size': expected['size'], 'bundled_provenance_sha256': sha(provenance_raw),
+                  'native_bundle_sha256': sha(bundle_raw)}
+    else:
+        if set(receipt) != {'version', 'sha256'} or receipt['version'] != '4.12.0' or receipt['sha256'] != digest:
+            raise AssertionError('Official CLI identity differs from its retained receipt')
+        origin = {'kind': 'official_upstream'}
+    return {'version': receipt['version'], 'sha256': digest, 'receipt_sha256': sha(raw), **origin,
             'pe_subsystem': pe_subsystem(binary, windows), 'version_command_repeated': False,
             'limit': 'PE subsystem is executable metadata, not proof of console-window behavior.'}
 
@@ -434,6 +456,56 @@ def cli_elapsed(started):
         return {'elapsed_ms': None, 'elapsed_error_type': type(error).__name__}
 
 
+def cli_exception_observation(child, phase, windows=None):
+    """One observational snapshot of existing objects; never settle the action."""
+    result = {'timing': 'after_original_communicate_exception_before_config_checkpoint',
+              'identity': {'pid': phase.get('pid'), 'birth': phase.get('birth'),
+                           'binding': 'initial_owned_child_identity'},
+              'scope': 'Point-in-time only; not continuous liveness or pipe/output completion',
+              'process': {'state': 'unavailable'}, 'threads': {}}
+    for name in ('_stdin_thread', 'stdout_thread', 'stderr_thread'):
+        row = {'present': None, 'alive': None}; result['threads'][name] = row
+        try:
+            thread = getattr(child, name, None)
+            row['present'] = thread is not None
+            if thread is not None:
+                row['alive'] = bool(thread.is_alive())
+        except BaseException as error:
+            row['error_type'] = type(error).__name__
+    if not (os.name == 'nt' if windows is None else windows):
+        result['process']['reason'] = 'windows_only'
+        return result
+    try:
+        if (type(phase.get('pid')) is not int or phase['pid'] != child.pid
+                or type(phase.get('birth')) is not int or phase['birth'] <= 0):
+            raise ValueError('Initial child identity unavailable')
+        from ctypes import wintypes as w
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+        kernel.WaitForSingleObject.restype = w.DWORD
+        kernel.GetExitCodeProcess.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD)]
+        kernel.GetExitCodeProcess.restype = w.BOOL
+        handle = child._handle  # Borrow only; Popen retains ownership.
+        if not handle:
+            raise ValueError('Owned child handle unavailable')
+        status = kernel.WaitForSingleObject(handle, 0)
+        if status == 0x102:  # WAIT_TIMEOUT: this exact handle was not signaled.
+            result['process'] = {'state': 'pending'}
+        elif status == 0:  # WAIT_OBJECT_0: exit259 is still an actual exit.
+            result['process'] = {'state': 'exited', 'exit_code': None}
+            code = w.DWORD()
+            if kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                result['process']['exit_code'] = code.value
+            else:
+                result['process'].update(api='GetExitCodeProcess', winerror=ctypes.get_last_error())
+        else:
+            result['process'].update(api='WaitForSingleObject', result=int(status),
+                                     winerror=ctypes.get_last_error())
+    except BaseException as error:
+        result['process']['error_type'] = type(error).__name__
+    return result
+
+
 def cli_output_snapshot(outputs, evidence, *, joined, returncode, cli_sha256, config_checkpoint=None):
     records, captured = [], []
     for output in outputs:
@@ -483,6 +555,7 @@ def actual_cli_local_phase(binary, identity, folder, project, commands, manifest
              'stdio': 'pipe_stdin_stdout_stderr', 'capture_limit_scope': 'Saved prefixes only; live communicate memory is not capped'}
     receipt['phases'].append(phase); save()
     started = time.monotonic()
+    communicating = False
     try:
         child = subprocess.Popen(argv, cwd=project, env=env, stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -490,9 +563,15 @@ def actual_cli_local_phase(binary, identity, folder, project, commands, manifest
         phase.update(child_identity(child)); save()
         # Match production's empty-input/piped-output boundary. Unlike run(),
         # communicate() leaves a timed-out child untouched; do not retry or kill.
+        communicating = True
         outputs = child.communicate(input=b'', timeout=CLI_CALL_SECONDS)
     except BaseException as error:
         phase.update(status='unknown_no_retry_no_kill', error_type=type(error).__name__, **cli_elapsed(started))
+        if communicating:
+            try:
+                phase['exception_observation'] = cli_exception_observation(child, phase)
+            except BaseException as capture_error:
+                phase['exception_observation'] = {'status': 'unavailable', 'error_type': type(capture_error).__name__}
         try:
             checkpoint = cli_config_checkpoint(config)
         except BaseException as capture_error:
@@ -551,11 +630,11 @@ def run(home, helper_path, helper_sha256, result):
             raise AssertionError('Unexpected fixture project')
         receipt.update(private_python_sha256=file_sha(expected), private_python_pe_subsystem=pe_subsystem(expected),
                        helper_sha256=helper_sha256, project_has_repeated_spaces='  ' in str(project),
-                       official_cli=official_cli_record(helper_path.parent / 'slack-setup'))
+                       setup_cli=setup_cli_record(helper_path.parent / 'slack-setup', helper))
         observer.start()
         commands = {action: helper.hook_command(project, action) for action in ('hooks', 'manifest', 'install')}
-        binary = helper_path.parent / 'slack-setup/bin' / ('slack.exe' if os.name == 'nt' else 'slack')
-        actual_cli_local_phase(binary, receipt['official_cli'], folder, project, commands, manifest,
+        binary = helper_path.parent / 'slack-setup/bin' / (helper.WINDOWS_CLI_BINARY if os.name == 'nt' else 'slack')
+        actual_cli_local_phase(binary, receipt['setup_cli'], folder, project, commands, manifest,
                                receipt, save, result.with_name('native-hook-cli-evidence.json'))
         for action in ('install',):
             command = helper.hook_command(project, action)
@@ -794,6 +873,100 @@ class PureContractTests(unittest.TestCase):
         with patch.object(time,'monotonic',side_effect=OSError('unavailable')):
             self.assertEqual(cli_elapsed(0),{'elapsed_ms':None,'elapsed_error_type':'OSError'})
 
+    def test_exception_observer_pending_uses_one_owned_handle_probe_and_thread_flags(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        stdin=Mock();stdin.is_alive.return_value=False
+        stdout=Mock();stdout.is_alive.return_value=True
+        child=SimpleNamespace(pid=42,_handle=73,_stdin_thread=stdin,stdout_thread=stdout)
+        kernel=SimpleNamespace(WaitForSingleObject=Mock(return_value=0x102),GetExitCodeProcess=Mock())
+        with patch.object(ctypes,'WinDLL',return_value=kernel,create=True):
+            result=cli_exception_observation(child,{'pid':42,'birth':123},True)
+        kernel.WaitForSingleObject.assert_called_once_with(73,0)
+        kernel.GetExitCodeProcess.assert_not_called()
+        stdin.is_alive.assert_called_once_with();stdout.is_alive.assert_called_once_with()
+        self.assertEqual(result['process'],{'state':'pending'})
+        self.assertEqual(result['identity'],{'pid':42,'birth':123,'binding':'initial_owned_child_identity'})
+        self.assertEqual(result['threads'],{'_stdin_thread':{'present':True,'alive':False},
+                         'stdout_thread':{'present':True,'alive':True},'stderr_thread':{'present':False,'alive':None}})
+
+    def test_exception_observer_signaled_exit259_is_not_pending(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        events=[]
+        def signaled(handle,timeout):events.append(('signal',handle,timeout));return 0
+        def exited(handle,code):events.append(('code',handle));code._obj.value=259;return 1
+        kernel=SimpleNamespace(WaitForSingleObject=Mock(side_effect=signaled),GetExitCodeProcess=Mock(side_effect=exited))
+        with patch.object(ctypes,'WinDLL',return_value=kernel,create=True):
+            result=cli_exception_observation(SimpleNamespace(pid=42,_handle=73),{'pid':42,'birth':123},True)
+        self.assertEqual(events,[('signal',73,0),('code',73)])
+        self.assertEqual(result['process'],{'state':'exited','exit_code':259})
+
+    def test_exception_observer_failed_wait_and_thread_query_stay_unavailable(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        thread=Mock();thread.is_alive.side_effect=OSError('must-not-be-serialized')
+        kernel=SimpleNamespace(WaitForSingleObject=Mock(return_value=0xffffffff),GetExitCodeProcess=Mock())
+        with patch.object(ctypes,'WinDLL',return_value=kernel,create=True), \
+                patch.object(ctypes,'get_last_error',return_value=5,create=True):
+            result=cli_exception_observation(SimpleNamespace(pid=42,_handle=73,stdout_thread=thread),{'pid':42,'birth':123},True)
+        kernel.WaitForSingleObject.assert_called_once_with(73,0);kernel.GetExitCodeProcess.assert_not_called()
+        self.assertEqual(result['process'],{'state':'unavailable','api':'WaitForSingleObject','result':0xffffffff,'winerror':5})
+        self.assertEqual(result['threads']['stdout_thread'],{'present':True,'alive':None,'error_type':'OSError'})
+        self.assertNotIn('must-not-be-serialized',json.dumps(result))
+
+    def test_exception_observer_signaled_without_exit_code_preserves_signal_proof(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        kernel=SimpleNamespace(WaitForSingleObject=Mock(return_value=0),GetExitCodeProcess=Mock(return_value=0))
+        with patch.object(ctypes,'WinDLL',return_value=kernel,create=True), \
+                patch.object(ctypes,'get_last_error',return_value=5,create=True):
+            result=cli_exception_observation(SimpleNamespace(pid=42,_handle=73),{'pid':42,'birth':123},True)
+        kernel.WaitForSingleObject.assert_called_once_with(73,0)
+        self.assertEqual(kernel.GetExitCodeProcess.call_count,1)
+        self.assertEqual(result['process'],{'state':'exited','exit_code':None,'api':'GetExitCodeProcess','winerror':5})
+
+    def test_exception_observer_requires_initial_identity_and_never_opens_a_handle(self):
+        from types import SimpleNamespace
+        with patch.object(ctypes,'WinDLL',side_effect=AssertionError('Must not query'),create=True) as library:
+            for phase in ({'pid':43,'birth':123},{'pid':42}):
+                result=cli_exception_observation(SimpleNamespace(pid=42,_handle=73),phase,True)
+                self.assertEqual(result['process'],{'state':'unavailable','error_type':'ValueError'})
+            library.assert_not_called()
+
+    def test_exception_observation_failure_does_not_mask_original_or_settle_output(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
+            commands,manifest,_=self.cli_transcript(project)
+            original=subprocess.TimeoutExpired('fixed-local-cli',120)
+            child=Mock(returncode=None,pid=42);child.communicate.side_effect=original
+            receipt={'phases':[]}
+            with patch.object(subprocess,'Popen',return_value=child) as popen, \
+                    patch(__name__+'.child_identity',return_value={'pid':42,'birth':123}), \
+                    patch(__name__+'.cli_exception_observation',side_effect=RuntimeError('must-not-be-serialized')) as observation:
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    actual_cli_local_phase(binary,{'sha256':file_sha(binary)},root,project,commands,manifest,receipt,lambda:None,root/'evidence.json')
+            self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1)
+            observation.assert_called_once();child.communicate.assert_called_once_with(input=b'',timeout=120)
+            child.poll.assert_not_called();child.wait.assert_not_called();child.kill.assert_not_called();child.terminate.assert_not_called()
+            phase=receipt['phases'][0]
+            self.assertEqual(phase['status'],'unknown_no_retry_no_kill')
+            self.assertEqual(phase['exception_observation'],{'status':'unavailable','error_type':'RuntimeError'})
+            self.assertIsNone(phase['stdout_size']);self.assertIsNone(phase['stderr_size'])
+            self.assertNotIn('must-not-be-serialized',json.dumps(receipt))
+
+    def test_launch_refusal_does_not_observe_uncreated_child(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=root/'project';project.mkdir();binary=root/'slack';binary.write_bytes(b'inert')
+            commands,manifest,_=self.cli_transcript(project);original=OSError('launch refused')
+            with patch.object(subprocess,'Popen',side_effect=original) as popen, \
+                    patch(__name__+'.cli_exception_observation') as observation:
+                with self.assertRaises(OSError) as caught:
+                    actual_cli_local_phase(binary,{'sha256':file_sha(binary)},root,project,commands,manifest,{'phases':[]},lambda:None,root/'evidence.json')
+            self.assertIs(caught.exception,original);self.assertEqual(popen.call_count,1);observation.assert_not_called()
+
     def test_own_config_checkpoint_refuses_unexpected_or_linked_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary).resolve();config=root/'cli-probe-config';config.mkdir();logs=config/'logs';logs.mkdir()
@@ -976,27 +1149,111 @@ class PureContractTests(unittest.TestCase):
                 read_small(link)
             self.assertEqual(target.read_bytes(), b'unchanged')
 
-    def test_cli_pe_record_binds_existing_receipt_without_execution(self):
+    def test_stock_cli_record_remains_official_non_windows_without_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary).resolve()
             (folder / 'bin').mkdir()
-            data = bytearray(64 + 94)
-            data[:2] = b'MZ'; struct.pack_into('<I', data, 60, 64)
-            data[64:68] = b'PE\0\0'
-            struct.pack_into('<H', data, 64 + 24, 0x20b)
-            struct.pack_into('<H', data, 64 + 24 + 68, 3)
-            binary = folder / 'bin/slack.exe'; binary.write_bytes(data)
+            data=b'fixed stock tool';binary=folder/'bin/slack';binary.write_bytes(data)
             receipt = {'version': '4.12.0', 'sha256': sha(data)}
             (folder / 'cli.json').write_text(json.dumps(receipt))
             with patch.object(subprocess, 'Popen', side_effect=AssertionError('No native launch')) as launch:
-                actual = official_cli_record(folder, True)
-                self.assertEqual(actual['pe_subsystem'], 3)
+                actual = setup_cli_record(folder, windows=False)
+                self.assertEqual(actual['kind'],'official_upstream');self.assertIsNone(actual['pe_subsystem'])
                 self.assertEqual(actual['sha256'], receipt['sha256'])
                 self.assertFalse(actual['version_command_repeated'])
                 binary.write_bytes(data + b'changed')
                 with self.assertRaisesRegex(AssertionError, 'identity differs'):
-                    official_cli_record(folder, True)
+                    setup_cli_record(folder, windows=False)
                 launch.assert_not_called()
+
+    @staticmethod
+    def derived_cli_fixture(root):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        folder=root/'cache';(folder/'bin').mkdir(parents=True)
+        private=root/'runtime/python';(private/'slack-cli').mkdir(parents=True)
+        (private/'python.exe').write_bytes(b'inert private interpreter')
+        data=bytearray(64+94);data[:2]=b'MZ';struct.pack_into('<I',data,60,64)
+        data[64:68]=b'PE\0\0';struct.pack_into('<H',data,64+24,0x20b);struct.pack_into('<H',data,64+24+68,3)
+        data=bytes(data)
+        expected={'version':'4.12.0','distribution':'constellation-headless-1','upstream_source':'1'*40,
+                  'patch_sha256':'2'*64,'sha256':sha(data),'size':len(data)}
+        helper=SimpleNamespace(WINDOWS_CLI_BINARY='slack-headless-1.exe',WINDOWS_CLI_RECEIPT='cli-headless-1.json',
+                               bundled_windows_cli=Mock(return_value=(data,expected)))
+        binary=folder/'bin'/helper.WINDOWS_CLI_BINARY;binary.write_bytes(data)
+        (folder/helper.WINDOWS_CLI_RECEIPT).write_text(json.dumps(expected))
+        (folder/'bin/slack.exe').write_bytes(b'preserved old official tool')
+        (folder/'cli.json').write_bytes(b'preserved old receipt; never read by new fixture')
+        provenance={'distribution':expected['distribution'],'upstream_version':expected['version'],
+                    'upstream_source':expected['upstream_source'],'patch_sha256':expected['patch_sha256'],
+                    'goos':'windows','goarch':'amd64','cgo_enabled':False,'binary_size':len(data),'binary_sha256':sha(data)}
+        provenance_raw=json.dumps(provenance).encode();(private/'slack-cli/provenance.json').write_bytes(provenance_raw)
+        (private/'slack-cli/slack.exe').write_bytes(data)
+        bundle={'slack_cli':provenance,'python_files':{'slack-cli/provenance.json':sha(provenance_raw),'slack-cli/slack.exe':sha(data)}}
+        (private.parent/'native-bundle.json').write_text(json.dumps(bundle))
+        return folder,private,helper,expected,binary,bundle
+
+    def test_derived_cli_record_binds_bundle_receipt_and_preserves_official_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder,private,helper,expected,binary,bundle=self.derived_cli_fixture(Path(temporary).resolve())
+            before={path:path.read_bytes() for path in (folder/'bin/slack.exe',folder/'cli.json')}
+            with patch.object(sys,'executable',str(private/'python.exe')), \
+                    patch.object(subprocess,'Popen',side_effect=AssertionError('No native launch')) as launch:
+                actual=setup_cli_record(folder,helper,True)
+            self.assertEqual(actual['kind'],'constellation_derived');self.assertEqual(actual['pe_subsystem'],3)
+            for key in ('version','distribution','upstream_source','patch_sha256','sha256','size'):
+                self.assertEqual(actual[key],expected[key])
+            self.assertEqual(actual['bundled_provenance_sha256'],bundle['python_files']['slack-cli/provenance.json'])
+            helper.bundled_windows_cli.assert_called_once_with();launch.assert_not_called()
+            self.assertFalse(actual['version_command_repeated'])
+            for path,data in before.items():self.assertEqual(path.read_bytes(),data)
+
+    def test_derived_cli_record_refuses_old_or_changed_receipt_and_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder,private,helper,expected,binary,bundle=self.derived_cli_fixture(Path(temporary).resolve())
+            receipt_path=folder/helper.WINDOWS_CLI_RECEIPT
+            with patch.object(sys,'executable',str(private/'python.exe')):
+                for changed in ({'version':'4.12.0','sha256':expected['sha256']},
+                                {**expected,'upstream_source':'3'*40},{**expected,'patch_sha256':'4'*64}):
+                    receipt_path.write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(AssertionError,'identity differs'):setup_cli_record(folder,helper,True)
+                receipt_path.write_text(json.dumps(expected))
+                for changed in ({**bundle,'slack_cli':{}},{**bundle,'python_files':{}},
+                                {**bundle,'python_files':{**bundle['python_files'],'slack-cli/slack.exe':'0'*64}}):
+                    (private.parent/'native-bundle.json').write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(AssertionError,'identity differs'):setup_cli_record(folder,helper,True)
+                (private.parent/'native-bundle.json').write_text(json.dumps(bundle))
+                binary.write_bytes(b'changed')
+                with self.assertRaisesRegex(AssertionError,'identity differs'):setup_cli_record(folder,helper,True)
+                receipt_path.unlink()
+                with self.assertRaises(FileNotFoundError):setup_cli_record(folder,helper,True)
+            self.assertEqual((folder/'bin/slack.exe').read_bytes(),b'preserved old official tool')
+
+    def test_native_version_probe_hides_windows_cli_and_labels_derived_source(self):
+        import ast
+        import contextlib
+        from types import SimpleNamespace
+        tree=ast.parse(Path(__file__).with_name('native_launch.py').read_text(encoding='utf-8'))
+        code=next(node.value.value for node in ast.walk(tree) if isinstance(node,ast.Assign)
+                  and any(isinstance(target,ast.Name) and target.id=='code' for target in node.targets)
+                  and isinstance(node.value,ast.Constant) and isinstance(node.value.value,str)
+                  and 'm.ensure_cli' in node.value.value)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();(root/'secrets').mkdir()
+            (root/'secrets/slack-setup-helper.py').write_text("WINDOWS_CLI_DISTRIBUTION='constellation-headless-1'\ndef ensure_cli(folder): return folder/'bin/slack-headless-1.exe'\n")
+            for platform in ('win32','linux'):
+                with patch.object(sys,'argv',['fixture',str(root)]),patch.object(sys,'platform',platform), \
+                        patch.dict(os.environ,{'NO_COLOR':'','SLACK_SKIP_UPDATE':'false'}), \
+                        patch.object(subprocess,'CREATE_NO_WINDOW',0x08000000,create=True), \
+                        patch.object(subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='4.12.0')) as child, \
+                        contextlib.redirect_stdout(__import__('io').StringIO()) as output:
+                    exec(compile(code,'<inert version fixture>','exec'),{})
+                self.assertEqual(child.call_count,1)
+                self.assertEqual(child.call_args.kwargs['creationflags'],0x08000000 if platform=='win32' else 0)
+                self.assertEqual(child.call_args.kwargs['timeout'],30)
+                self.assertEqual(child.call_args.kwargs['env']['NO_COLOR'],'1')
+                self.assertEqual(child.call_args.kwargs['env']['SLACK_SKIP_UPDATE'],'true')
+                self.assertIn('constellation-headless-1' if platform=='win32' else 'official upstream',output.getvalue())
 
 
 if __name__ == '__main__':

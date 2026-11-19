@@ -1,0 +1,24 @@
+--- a/internal/style/colors.go
++++ b/internal/style/colors.go
+@@ -22,12 +22,20 @@
+ import (
+ 	"image/color"
+ 	"os"
++	"runtime"
+ 
+ 	lipgloss "charm.land/lipgloss/v2"
+ )
+ 
+ // hasDarkBG caches the terminal background detection at package init.
+-var hasDarkBG = lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
++var hasDarkBG = func() bool {
++	// Constellation's Windows setup child has redirected standard streams.
++	// Honour its explicit no-colour policy before opening console devices.
++	if runtime.GOOS == "windows" && os.Getenv("NO_COLOR") != "" {
++		return true
++	}
++	return lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
++}()
+ 
+ // lightDark selects a color based on the terminal background.
+ var lightDark = lipgloss.LightDark(hasDarkBG)
