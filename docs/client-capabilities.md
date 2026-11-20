@@ -5,6 +5,39 @@ the Constellation Instance host, persona files, or an agent management API.
 The default remains text chat with no connector filesystem or terminal access and no automatic
 permission grants.
 
+## Optional agent-host directories
+
+Operators can set `acp.additional_directories` through the existing revision-safe
+config API or CLI, for example `"additional_directories": ["/srv/projects/shared"]`
+inside `acp`. It defaults to an empty list and is omitted from saved configuration
+when empty, so the default remains readable by older connector packages.
+Clear it before rolling back to a package that does not recognize this field.
+Slack messages never supply or modify this setting.
+
+Like `acp.cwd`, these are absolute paths on the **agent host**, using the
+connector platform's native absolute-path convention. Up to 16 paths of 4096
+bytes each are allowed; relative paths, control characters (including NUL),
+parent traversal and unrestricted filesystem roots are rejected. The connector
+does not resolve, canonicalize, or check the existence of these remote paths.
+The endpoint remains responsible for authorizing and enforcing their scope.
+
+A nonempty list requires an object-valued
+`agentCapabilities.sessionCapabilities.additionalDirectories` advertisement
+(`{}` is sufficient). Otherwise setup fails before any session request or prompt;
+the connector never silently drops the requested scope. When configured, it sends
+`additionalDirectories` on session new/load/resume, operator probes and
+conversation-mode loads, including reconnect verification. When empty it omits
+the wire field, even for a capable endpoint.
+
+Directory edits do not change the endpoint key: the next turn loads or resumes the
+same saved session with the current list, including omission after clearing.
+A failed load with a nonempty list preserves that binding and sends neither a
+replacement session request nor a prompt; review the grant and endpoint policy
+before retrying. Default-empty load fallback and resume failure behavior remain
+unchanged. These settings do not change `acp.client.workspace_roots`, tool
+approvals, transport, identity or Slack scopes, and do not grant connector-local
+filesystem access.
+
 ## One approval setting
 
 `acp.client.approvals_required` defaults to `true`, including when upgrading an

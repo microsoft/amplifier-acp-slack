@@ -64,6 +64,9 @@ pub struct AcpConfig {
     pub env: BTreeMap<String, String>,
     pub secret_env: BTreeMap<String, String>,
     pub cwd: String,
+    /// Operator-requested directories on the agent host, not client tool roots.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<String>,
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
     pub client: ClientCapabilities,
@@ -310,6 +313,25 @@ impl Config {
             "ACP timeout must be 1–3600 seconds"
         );
         let client = &self.acp.client;
+        ensure!(
+            self.acp.additional_directories.len() <= 16
+                && self.acp.additional_directories.iter().all(|p| {
+                    let path = Path::new(p);
+                    path.is_absolute()
+                        && p.len() <= 4096
+                        && !p.chars().any(char::is_control)
+                        && path
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::Normal(_)))
+                        && !path.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )
+                        })
+                }),
+            "ACP additional directories must be at most 16 explicit absolute folders (up to 4096 bytes each), without control characters, traversal, or filesystem roots"
+        );
         ensure!(
             client.workspace_roots.len() <= 16
                 && client
@@ -560,4 +582,90 @@ pub fn check_private(_path: &Path) -> Result<()> {
 }
 pub fn local_path(home: &Path, s: &str) -> PathBuf {
     PathBuf::from(s.replace("${ADAPTER_HOME}", &home.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod additional_directory_tests {
+    use super::*;
+
+    #[test]
+    fn old_config_defaults_and_empty_serialization_remain_backward_compatible() {
+        // Match the old deny_unknown_fields ACP parser, not the new configuration.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyAcp {
+            command: Value,
+            args: Value,
+            env: Value,
+            secret_env: Value,
+            cwd: Value,
+            timeout_seconds: Value,
+            client: Value,
+        }
+        use serde_json::{Value, json};
+        let c = Config::new("fixture".into(), "owner".into());
+        let serialized = serde_json::to_value(&c).unwrap();
+        assert!(serialized["acp"].get("additional_directories").is_none());
+        let old: LegacyAcp = serde_json::from_value(serialized["acp"].clone()).unwrap();
+        assert_eq!(old.command, "");
+        assert_eq!(old.args, json!([]));
+        assert_eq!(old.env, json!({}));
+        assert_eq!(old.secret_env, json!({}));
+        assert_eq!(old.cwd, "");
+        assert_eq!(old.timeout_seconds, 300);
+        assert!(old.client.is_object());
+        let loaded: Config = serde_json::from_value(serialized).unwrap();
+        assert!(loaded.acp.additional_directories.is_empty());
+        let schema = serde_json::to_value(schemars::schema_for!(AcpConfig)).unwrap();
+        assert!(!schema["required"].as_array().is_some_and(|required| {
+            required
+                .iter()
+                .any(|field| field == "additional_directories")
+        }));
+        assert!(schema["properties"]["additional_directories"].is_object());
+    }
+
+    #[test]
+    fn directory_validation_is_bounded_and_lexical_not_a_local_filesystem_check() {
+        let mut c = Config::new("fixture".into(), "owner".into());
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp
+            .path()
+            .join("not-created")
+            .to_string_lossy()
+            .into_owned();
+        c.acp.additional_directories = vec![absent.clone(); 16];
+        c.validate().unwrap();
+        c.acp.additional_directories.push(absent.clone());
+        assert!(c.validate().is_err());
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        for invalid in [
+            "".into(),
+            "relative/path".into(),
+            "~/project".into(),
+            root.into(),
+            format!("{root}.."),
+            format!("{absent}/.."),
+            format!("{absent}\0bad"),
+            format!("{absent}\nline"),
+            format!("{root}{}", "a".repeat(4096)),
+        ] {
+            c.acp.additional_directories = vec![invalid.clone()];
+            assert!(c.validate().is_err(), "accepted {invalid:?}");
+        }
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!([null]),
+            serde_json::json!([1]),
+            serde_json::json!("path"),
+        ] {
+            let mut value = serde_json::to_value(&c).unwrap();
+            value["acp"]["additional_directories"] = malformed;
+            assert!(serde_json::from_value::<Config>(value).is_err());
+        }
+        c.acp.additional_directories = vec![absent.clone()];
+        let roundtrip: Config = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+        assert_eq!(roundtrip.acp.additional_directories, vec![absent]);
+        assert!(!temp.path().join("not-created").exists());
+    }
 }

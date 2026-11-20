@@ -378,12 +378,24 @@ impl Drop for Client {
         let _ = self.child.start_kill();
     }
 }
+/// Endpoint-owned filesystem scope; never inferred from Slack content or client roots.
+fn base_session_params(c: &Config, init: &Value) -> Result<Value> {
+    let mut params = json!({"cwd":c.acp.cwd,"mcpServers":[]});
+    if !c.acp.additional_directories.is_empty() {
+        ensure!(
+            init["agentCapabilities"]["sessionCapabilities"]["additionalDirectories"].is_object(),
+            "ACP additional directories are configured, but the agent does not advertise sessionCapabilities.additionalDirectories support. No session or prompt was sent."
+        );
+        params["additionalDirectories"] = json!(c.acp.additional_directories);
+    }
+    Ok(params)
+}
 pub async fn check(c: &Config, home: &Path) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(30),async {
         let mut probe_config = c.clone();
         probe_config.acp.client = Default::default();
         let (mut client,init)=Client::connect(&probe_config,home).await?;
-        let session=client.peer.request("session/new",json!({"cwd":c.acp.cwd,"mcpServers":[]})).await?;
+        let session=client.peer.request("session/new",base_session_params(c,&init)?).await?;
         ensure!(session["sessionId"].is_string(),"Agent did not return a session");
         Ok(json!({"ok":true,"protocol_version":1,"agent_info":init["agentInfo"],"load_session":init["agentCapabilities"]["loadSession"]==true,"authentication":crate::acp_auth::authentication(&init),"note":"ACP handshake and session creation succeeded. No prompt or Slack message was sent."}))
     }).await.context("ACP connection check timed out")?
@@ -544,7 +556,7 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
     let (mut client, init) = Client::connect(c, home).await?;
     let can_load = init["agentCapabilities"]["loadSession"] == true;
     let can_resume = init["agentCapabilities"]["sessionCapabilities"]["resume"].is_object();
-    let mut session_params = json!({"cwd":c.acp.cwd,"mcpServers":[]});
+    let mut session_params = base_session_params(c, &init)?;
     if c.context.enabled {
         let grant = crate::context::issue_grant(c, home, input)?;
         session_params["_meta"] = json!({"io.github.bkrabach.conversation":{
@@ -591,6 +603,10 @@ async fn turn(c: &Config, home: &Path, input: &Value) -> Result<Decision> {
             loaded = true;
             old
         } else {
+            ensure!(
+                c.acp.additional_directories.is_empty(),
+                "The agent could not load the saved session with the configured ACP additional directories; directory scope may have been denied. The saved binding was preserved; no replacement session or prompt was sent. Review the directory settings and endpoint policy before retrying."
+            );
             tools = None;
             store.audit("session_replaced",json!({"context":ctx,"reason":"Agent could not restore the previous session; rebuilding from the Slack conversation"}))?;
             let r = client
@@ -1578,7 +1594,8 @@ pub(crate) async fn conversation_mode(
         init["agentCapabilities"]["loadSession"] == true,
         "This agent does not support reopening saved conversations to inspect permissions."
     );
-    let mut params = json!({"sessionId":sid,"cwd":c.acp.cwd,"mcpServers":[]});
+    let mut params = base_session_params(c, &init)?;
+    params["sessionId"] = json!(sid);
     if c.context.enabled {
         let grant = crate::context::issue_grant(c, home, input)?;
         params["_meta"] = json!({"io.github.bkrabach.conversation":{
@@ -1636,9 +1653,16 @@ pub(crate) async fn conversation_mode(
     // Reconnect to verify saved state; some ACP agents reject a second load on
     // the same connection, and notifications alone need not prove persistence.
     drop(client);
-    let (mut verify, _) = Client::connect(c,home).await
+    let (mut verify, verify_init) = Client::connect(c,home).await
         .context("The change was accepted but could not be verified. Reload this conversation's permissions before retrying.")?;
-    let loaded=verify.peer.request("session/load",params).await
+    let mut verify_params = base_session_params(c, &verify_init)
+        .context("The change was accepted but could not be verified. Reload this conversation's permissions before retrying.")?;
+    verify_params["sessionId"] = json!(sid);
+    verify_params["mcpServers"] = params["mcpServers"].clone();
+    if let Some(meta) = params.get("_meta") {
+        verify_params["_meta"] = meta.clone();
+    }
+    let loaded=verify.peer.request("session/load",verify_params).await
         .context("The change was accepted but could not be verified. Reload this conversation's permissions before retrying.")?;
     let confirmed = mode_details(&loaded)?;
     ensure!(

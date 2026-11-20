@@ -63,20 +63,24 @@ for line in sys.stdin:
             capabilities["sessionCapabilities"] = {"resume": {}}
         elif os.getenv("FIXTURE_RESUME") == "boolean":
             capabilities["sessionCapabilities"] = {"resume": True}
+        extra = os.getenv("FIXTURE_ADDITIONAL_DIRECTORIES")
+        if extra and not (ROOT / "no-additional-directories").exists():
+            capabilities.setdefault("sessionCapabilities", {})["additionalDirectories"] = (
+                {} if extra == "1" else json.loads(extra))
         result(request, {"protocolVersion": 1, "agentCapabilities": capabilities,
                          "agentInfo": {"name": "independent-python-fixture", "version": "1.0"}})
     elif method == "session/new":
         sid = str(uuid.uuid4())
         session_path(sid).write_text(json.dumps({"turns": 0}))
-        log("session_new", session_id=sid, cwd=params["cwd"])
+        log("session_new", session_id=sid, cwd=params["cwd"], params=params)
         result(request, {"sessionId": sid})
     elif method in ("session/load", "session/resume"):
         sid = params["sessionId"]
         if session_path(sid).exists() and not (ROOT / (method.split("/")[1] + "-failure")).exists():
-            log("session_load" if method == "session/load" else "session_resume", session_id=sid, cwd=params["cwd"])
+            log("session_load" if method == "session/load" else "session_resume", session_id=sid, cwd=params["cwd"], params=params)
             result(request, {})
         else:
-            log(method.replace("/", "_") + "_failed", session_id=sid)
+            log(method.replace("/", "_") + "_failed", session_id=sid, params=params)
             send({"id": request["id"], "error": {"code": -32602, "message": "Unknown session"}})
     elif method == "session/prompt":
         sid = params["sessionId"]
