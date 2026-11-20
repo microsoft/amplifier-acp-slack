@@ -52,8 +52,10 @@ for line in sys.stdin:
   modes=json.loads(saved.read_text()) if saved.exists() else {}
   send({'id':i,'result':{'modes':{'currentModeId':modes.get(p['sessionId'],'ask'),'availableModes':[{'id':'ask','name':'Ask'},{'id':'workspace','name':'Workspace','description':'Local workspace work'}]}}})
  elif m=='session/set_mode':
-  modes=json.loads(saved.read_text()) if saved.exists() else {};modes[p['sessionId']]=p['modeId'];saved.write_text(json.dumps(modes));send({'id':i,'result':{}})
+  modes=json.loads(saved.read_text()) if saved.exists() else {};modes[p['sessionId']]=p['modeId'];saved.write_text(json.dumps(modes))
+  # The connector can terminate this process as soon as it reads the reply.
   if (root/'lose-capability').exists():(root/'no-directories').touch()
+  send({'id':i,'result':{}})
  else:send({'id':i,'error':{'code':-32601,'message':'not supported'}})
 "#).unwrap();
         let mut c = Config::new("Mode fixture".into(), "owner".into());
@@ -286,6 +288,13 @@ async fn mode_load_and_post_change_verification_require_directory_capability() {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "initialize")
+                .count(),
+            1 + usize::from(lose_after_change)
+        );
         assert_eq!(
             calls
                 .iter()
