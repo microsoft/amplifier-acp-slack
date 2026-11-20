@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import stat
 import subprocess
 import shlex
 import zipfile
@@ -25,19 +26,49 @@ import time
 import urllib.request
 
 VERSION = '4.12.0'
+WINDOWS_CLI_DISTRIBUTION = 'constellation-headless-1'
+WINDOWS_CLI_SOURCE = '91df4803911140c5a6da56e88ecd04e25c9c7515'
+WINDOWS_CLI_PATCH = 'a5122ebf2ea5a7c012f7205ed477eef4795f3a53260f3c310a12980df80a9476'
+WINDOWS_CLI_BINARY = 'slack-headless-1.exe'
+WINDOWS_CLI_RECEIPT = 'cli-headless-1.json'
 ARCHIVES = {
     ('Linux', 'x86_64'): ('linux_amd64', '8b93b0ff3a30879b5ef09fe01fb3bc457afb368bb26827b526f101eccce96c76'),
     ('Linux', 'aarch64'): ('linux_arm64', 'd98ad8ba0848958a47befb73761a51ebd97a363b431758e177a828c7774bdb7d'),
     ('Darwin', 'x86_64'): ('macOS_amd64', '838aa81d10f82e5e9212800d084924ac66e5807aecaac16ae747c90d985352a2'),
     ('Darwin', 'arm64'): ('macOS_arm64', '23a5001854d2bb283ded8ad941cff13d4b2573ba922233087609b70ce53e4b6d'),
-    # Slack publishes x64 only. Windows 11 ARM runs this official CLI through OS x64 compatibility.
-    ('Windows', 'AMD64'): ('windows_64-bit', 'b1ca5e13e7c90cc7a9dfcb2af055f91d9a1e22db20790caa50ab530c07d4e914'),
-    ('Windows', 'ARM64'): ('windows_64-bit', 'b1ca5e13e7c90cc7a9dfcb2af055f91d9a1e22db20790caa50ab530c07d4e914'),
 }
 
 
 class SetupError(Exception):
     pass
+
+
+class ConfirmationRefusal(SetupError):
+    """An exact local validation or completed ticket-exchange rejection."""
+    MESSAGES = {
+        'invalid_confirmation_format': 'Enter the confirmation code shown by Slack.',
+        'authorization_expired': 'That authorization attempt expired. Start authorization again.',
+        'invalid_challenge': 'Slack refused that confirmation code and expired its ticket. Start authorization again.',
+    }
+
+    def __init__(self, code):
+        super().__init__(self.MESSAGES[code])
+        self.code = code
+
+
+def explicit_invalid_challenge(result, args, auth_dir):
+    # Pinned Slack CLI 4.12.0: ExchangeAuthTicket returns its API error before
+    # saveNewAuth. Match that method and exact known heading, not a substring
+    # echoed by a generic failure. Any credential output contradicts refusal.
+    if (result.returncode <= 0 or len(args) != 6 or args[:2] != ('auth', 'login')
+            or args[2] != '--ticket' or args[4] != '--challenge' or auth_dir is None
+            or os.path.lexists(auth_dir / 'credentials.json')):
+        return False
+    output = result.stdout + result.stderr
+    lines = {line.strip() for line in output.splitlines()}
+    return ('The following error was returned by the apps.hosted.exchangeAuthTicket Slack API method' in lines
+            and 'The challenge code is invalid (invalid_challenge)' in lines
+            and set(re.findall(r'\(([a-z][a-z0-9_]+)\)', output)) == {'invalid_challenge'})
 
 
 def read(path, default=None):
@@ -52,9 +83,96 @@ def write(path, value):
     temporary.replace(path)
 
 
+def cli_regular_bytes(path, maximum):
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_size > maximum
+            or getattr(info, 'st_file_attributes', 0) & 0x400):
+        raise SetupError('The private Slack setup tool is invalid. Reopen the complete app download.')
+    with path.open('rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (info.st_dev, info.st_ino, info.st_size):
+            raise SetupError('The private Slack setup tool changed before verification.')
+        data = stream.read(maximum + 1)
+    if len(data) != info.st_size:
+        raise SetupError('The private Slack setup tool changed during verification.')
+    return data
+
+
+def cli_regular_directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+        raise SetupError('The private Slack setup tool directory is invalid.')
+
+
+def bundled_windows_cli():
+    # This derived CLI is part of the verified private runtime inventory. It
+    # preserves the upstream commands and disables only an init-time Windows
+    # console-colour query when this helper explicitly sets NO_COLOR.
+    root = Path(sys.executable).resolve().parent / 'slack-cli'
+    metadata_path = root / 'provenance.json'
+    binary = root / 'slack.exe'
+    try:
+        cli_regular_directory(root)
+        metadata = json.loads(cli_regular_bytes(metadata_path, 64 * 1024))
+        expected = {'distribution': WINDOWS_CLI_DISTRIBUTION,
+                    'upstream_version': VERSION, 'upstream_source': WINDOWS_CLI_SOURCE,
+                    'patch_sha256': WINDOWS_CLI_PATCH, 'goos': 'windows', 'goarch': 'amd64'}
+        if (not isinstance(metadata, dict) or type(metadata.get('schema')) is not int or metadata['schema'] != 1
+                or any(metadata.get(k) != v for k, v in expected.items())
+                or metadata.get('cgo_enabled') is not False
+                or type(metadata.get('binary_size')) is not int
+                or not 0 < metadata['binary_size'] <= 150 * 1024 * 1024
+                or not isinstance(metadata.get('binary_sha256'), str)
+                or re.fullmatch(r'[0-9a-f]{64}', metadata['binary_sha256']) is None):
+            raise SetupError('The bundled Slack setup tool has an unexpected build identity.')
+        data = cli_regular_bytes(binary, 150 * 1024 * 1024)
+        if len(data) != metadata['binary_size'] or hashlib.sha256(data).hexdigest() != metadata['binary_sha256']:
+            raise SetupError('The bundled Slack setup tool failed verification.')
+    except (OSError, ValueError, TypeError) as error:
+        raise SetupError('The bundled Slack setup tool is missing or invalid. Reopen the complete app download.') from error
+    receipt = {'version': VERSION, 'distribution': WINDOWS_CLI_DISTRIBUTION,
+               'upstream_source': WINDOWS_CLI_SOURCE, 'patch_sha256': WINDOWS_CLI_PATCH,
+               'sha256': metadata['binary_sha256'], 'size': len(data)}
+    return data, receipt
+
+
 def ensure_cli(folder):
-    binary = folder / ('bin/slack.exe' if os.name == 'nt' else 'bin/slack')
-    receipt = read(folder / 'cli.json', {})
+    windows = sys.platform == 'win32'
+    binary = folder / 'bin' / (WINDOWS_CLI_BINARY if windows else 'slack')
+    receipt_path = folder / (WINDOWS_CLI_RECEIPT if windows else 'cli.json')
+    if windows:
+        data, expected = bundled_windows_cli()
+        temporary = binary.with_suffix('.new')
+        receipt_temporary = receipt_path.with_suffix('.tmp')
+        if os.path.lexists(temporary) or os.path.lexists(receipt_temporary):
+            raise SetupError('A previous Slack setup-tool preparation is incomplete. Its files have been preserved.')
+        receipt = {}
+        if os.path.lexists(receipt_path):
+            try:
+                receipt = json.loads(cli_regular_bytes(receipt_path, 64 * 1024))
+            except (OSError, ValueError, TypeError) as error:
+                raise SetupError('The private Slack setup-tool receipt is invalid; it has been preserved.') from error
+        if os.path.lexists(binary.parent):
+            cli_regular_directory(binary.parent)
+        if os.path.lexists(binary):
+            cached = cli_regular_bytes(binary, 150 * 1024 * 1024)
+            if receipt == expected and hashlib.sha256(cached).hexdigest() == expected['sha256']:
+                return binary
+        # Keep the official cache and its receipt intact for older helpers
+        # after rollback. This fixed derived slot is never an implicit fallback
+        # for that cache, and has no network or unpatched-tool fallback.
+        binary.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cli_regular_directory(binary.parent)
+        with open(temporary, 'xb', opener=lambda p, f: os.open(p, f, 0o700)) as stream:
+            stream.write(data)
+        temporary.chmod(0o700)
+        with open(receipt_temporary, 'x', encoding='utf-8',
+                  opener=lambda p, f: os.open(p, f, 0o600)) as stream:
+            json.dump(expected, stream)
+        temporary.replace(binary)
+        receipt_temporary.replace(receipt_path)
+        return binary
+    receipt = read(receipt_path, {})
     if binary.exists() and receipt.get('version') == VERSION:
         if hashlib.sha256(binary.read_bytes()).hexdigest() == receipt.get('sha256'):
             return binary
@@ -102,11 +220,16 @@ def cli(folder, *args, cwd=None, auth_dir=None):
             del env[name]
     env.update({'SLACK_SKIP_UPDATE': 'true', 'NO_COLOR': '1'})
     # Output stays in this private process; errors below use an allowlist.
+    # The pinned CLI is a contained, noninteractive setup child, not a user
+    # terminal. It continues inheriting the helper's Job Object on Windows.
+    window = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
     result = subprocess.run([str(binary), '--config-dir', str(config), '--no-color',
                              '--skip-update', *args], cwd=cwd or folder, env=env,
-                            input='', text=True, capture_output=True, timeout=120)
+                            input='', text=True, capture_output=True, timeout=120, **window)
     output = result.stdout + result.stderr
     if result.returncode:
+        if explicit_invalid_challenge(result, args, auth_dir):
+            raise ConfirmationRefusal('invalid_challenge')
         for code, explanation in [
             ('app_approval_request_pending', 'The app is awaiting Slack administrator approval. After approval, choose Connect again.'),
             ('app_approval_request_eligible', 'Slack requires administrator approval for this app. Ask your workspace administrator to approve it, then retry.'),
@@ -165,11 +288,14 @@ def wrong_workspace(auth, body, outcome):
 
 def prepare_project(folder, manifest, app_id, auth):
     project = folder / 'project'
+    # Refuse a mismatched runtime/layout before materializing a project. Hooks
+    # run from this exact cwd; absolute user paths must never enter shell text.
+    commands = {action: hook_command(project, action) for action in ('hooks', 'manifest', 'install')}
     (project / '.slack').mkdir(mode=0o700, parents=True, exist_ok=True)
     write(project / 'manifest.json', manifest)
-    write(project / '.slack/hooks.json', {'hooks': {'get-hooks': hook_command(project, 'hooks')}})
+    write(project / '.slack/hooks.json', {'hooks': {'get-hooks': commands['hooks']}})
     write(project / '.slack/config.json', {'manifest': {'source': 'local'}})
-    (project / 'hooks.py').write_text(HOOK.replace('__MANIFEST_COMMAND__', repr(hook_command(project, 'manifest'))).replace('__INSTALL_COMMAND__', repr(hook_command(project, 'install'))))
+    (project / 'hooks.py').write_text(HOOK.replace('__MANIFEST_COMMAND__', repr(commands['manifest'])).replace('__INSTALL_COMMAND__', repr(commands['install'])))
     apps_path = project / '.slack/apps.json'
     apps = read(apps_path, {'apps': {}})
     existing = apps.get('apps', {}).get(auth['team_id'], {}).get('app_id')
@@ -182,8 +308,59 @@ def prepare_project(folder, manifest, app_id, auth):
 
 
 def hook_command(project, action):
-    args = [sys.executable, '-I', '-B', '-X', 'utf8', str(project / 'hooks.py'), action]
-    return subprocess.list2cmdline(args) if os.name == 'nt' else shlex.join(args)
+    if action not in ('hooks', 'manifest', 'install'):
+        raise SetupError('Invalid private Slack setup action.')
+    project = Path(project)
+    if (not project.is_absolute() or '..' in project.parts or
+            project.parts[-3:] != ('secrets', 'slack-setup', 'project')):
+        raise SetupError('The private Slack setup project does not match this installation.')
+    home = project.parents[2]
+
+    def ordinary(path, directory=False, optional=False):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if optional:
+                return False
+            raise SetupError('The private Slack setup path is missing.') from None
+        valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        if not valid_type or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise SetupError('The private Slack setup path has changed.')
+        return True
+
+    for directory in (home, home / 'secrets', project.parent):
+        ordinary(directory, directory=True)
+    ordinary(project, directory=True, optional=True)
+    ordinary(project / 'hooks.py', optional=True)
+    windows = sys.platform == 'win32'
+    interpreter = home / 'runtime/python' / ('python.exe' if windows else 'bin/python3')
+    if ordinary(interpreter, optional=True):
+        for directory in (home / 'runtime', home / 'runtime/python', interpreter.parent):
+            ordinary(directory, directory=True)
+        try:
+            actual = Path(sys.executable).resolve(strict=True)
+            expected = interpreter.resolve(strict=True)
+            same = (os.path.normcase(str(actual)) == os.path.normcase(str(expected))
+                    and os.path.samefile(actual, expected))
+        except OSError:
+            same = False
+        if not same:
+            raise SetupError('The Slack setup interpreter does not match this installation.')
+        # CLI4.12.0 splits on whitespace before handing hooks to PowerShell or
+        # a POSIX shell. Fixed relative tokens survive that normalization and
+        # do not interpret a username/home as shell syntax. cli() owns cwd.
+        prefix = (r'& ..\..\..\runtime\python\python.exe -I -B -X utf8 .\hooks.py '
+                  if windows else '../../../runtime/python/bin/python3 -I -B -X utf8 ./hooks.py ')
+        return prefix + action
+    server = read(home / 'adapter.json', {}).get('server') if sys.platform == 'linux' else None
+    # Match Rust ServerConfig's serde default for existing PAM configurations,
+    # while refusing a missing configuration or an explicit local-password one.
+    if not isinstance(server, dict) or server.get('auth_mode', 'pam') != 'pam':
+        raise SetupError('The connector private setup runtime is missing. Reopen the complete app bundle.')
+    # The existing Linux PAM installer intentionally uses its system Python.
+    # It must not be redirected to an absent bundled runtime. The project script
+    # is still fixed relative to the same private cwd.
+    return shlex.join([sys.executable, '-I', '-B', '-X', 'utf8', './hooks.py', action])
 
 
 HOOK = '''import json, os, pathlib, sys
@@ -231,13 +408,24 @@ def execute(home, action, body):
             pending = read(folder / 'pending.json', {})
             challenge = body.get('challenge', '').strip()
             if pending.get('expires_at', 0) <= time.time():
-                raise SetupError('That authorization attempt expired. Start authorization again.')
+                raise ConfirmationRefusal('authorization_expired')
             if not re.fullmatch(r'[A-Za-z0-9_-]{4,256}', challenge):
-                raise SetupError('Enter the confirmation code Slack showed after you approved access.')
+                raise ConfirmationRefusal('invalid_confirmation_format')
             staging = folder / 'pending-auth'
             staging.mkdir(mode=0o700, exist_ok=True)
             (staging / 'credentials.json').unlink(missing_ok=True)
-            cli(folder, 'auth', 'login', '--ticket', pending['ticket'], '--challenge', challenge, auth_dir=staging)
+            try:
+                cli(folder, 'auth', 'login', '--ticket', pending['ticket'], '--challenge', challenge, auth_dir=staging)
+            except ConfirmationRefusal as error:
+                if error.code != 'invalid_challenge' or os.path.lexists(staging / 'credentials.json'):
+                    raise SetupError('Slack authorization was not confirmed. Check saved setup before continuing.')
+                # This known Slack rejection expires this ticket. Retire only
+                # the exact pending ticket under our existing installation lock;
+                # creating a replacement still requires explicit authorize.
+                if read(folder / 'pending.json', {}) != pending:
+                    raise SetupError('Slack authorization changed. Check saved setup before continuing.')
+                (folder / 'pending.json').unlink()
+                raise
             auth = authorization(folder, staging)
             if body.get('team_id') and auth['team_id'] != body['team_id']:
                 # Slack consumed the ticket for this approval. Drop both, so the next
@@ -290,6 +478,8 @@ def main():
         request = json.load(sys.stdin)
         value = execute(Path(sys.argv[1]), request['action'], request.get('body', {}))
         print(json.dumps({'ok': True, 'result': value}))
+    except ConfirmationRefusal as error:
+        print(json.dumps({'ok': False, 'error': str(error), 'confirmation_refusal': {'schema': 1, 'action': 'confirm', 'code': error.code}}))
     except SetupError as error:
         print(json.dumps({'ok': False, 'error': str(error)}))
     except Exception:

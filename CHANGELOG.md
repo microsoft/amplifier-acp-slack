@@ -1,5 +1,26 @@
 # Release notes
 
+## 0.18.3
+
+Read macOS native connector status from the service's own launchd properties,
+without confusing nested resource-coalition fields with its state. The native
+platform pin also carries the accepted Windows hostname and hidden utility
+launch corrections. See [release notes](docs/releases/0.18.3.md) for scope.
+
+## 0.18.2
+
+Wait for readiness on the proved local HTTP connection before each management
+request, preserving the same socket, credential checks and existing time limits.
+See [release notes](docs/releases/0.18.2.md) for scope.
+
+## 0.18.1
+
+Keep native guided-setup hook paths independent of spaces and shell characters
+in the installation's home. Preserve the explicit Linux PAM route and existing
+authorization, deadlines and unknown outcomes. Also includes the accepted named
+attachment and owner-message eligibility corrections. See
+[release notes](docs/releases/0.18.1.md) for qualification scope.
+
 ## 0.17.8
 
 Close a withdrawn approval card when the connected agent cancels that exact request, without ending the conversation or affecting another pending request. Late clicks cannot approve the withdrawn request; decisions already recorded remain intact. See [release notes](docs/releases/0.17.8.md).

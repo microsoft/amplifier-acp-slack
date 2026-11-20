@@ -4,7 +4,7 @@ The app runs on Windows x64, Windows 11 ARM64, Mac Intel, Apple silicon, and Lin
 
 The app opens its own first-account screen in your browser. Choose a connector password, then use the existing [Slack authorization](onboarding.md) and agent connection screens. A native installation starts without a declared Slack workspace, so authorization shows the workspace Slack approved and asks before creating the agent’s app there; its [configuration](installation.md#operate-without-the-browser) can name one workspace beforehand. It does not choose an agent runtime, create a conversation session, or start work. The optional startup checkbox registers only this connector for the current user. Settings includes a control to change that choice later.
 
-Guided Slack authorization downloads the fixed, checksum-verified official Slack CLI when needed. Slack's Windows CLI is x64; Windows 11 ARM uses the operating system's x64 compatibility for that vendor tool. The connector and private Python are ARM64 on that platform. Actual workspace authorization remains subject to Slack permissions and administrator approval. Manual app credentials remain available in the existing setup screen.
+On Mac and Linux, guided Slack authorization downloads the fixed, checksum-verified official Slack CLI when needed. Windows bundles a pinned Slack CLI 4.12.0 source build with one startup guard: it skips console-colour detection when colour is explicitly disabled. The source revision, patch, compiler settings, binary checksum and upstream license are retained with that private tool. This is a Constellation-derived build, not the official Slack release binary. Windows 11 ARM uses x64 compatibility for this setup tool; the connector and private Python remain ARM64. Existing official CLI caches stay intact for rollback. Actual workspace authorization remains subject to Slack permissions and administrator approval. Manual app credentials remain available in the existing setup screen.
 
 ## Existing installations
 
@@ -23,6 +23,38 @@ Reopening an interrupted installation keeps its management and recovery controls
 An installation with externally enrolled saved-connection/update controls keeps that owner; this native updater does not compete with it. Existing Linux systemd update controls are unchanged. No separate fleet service or new scheduler is required.
 
 ## Management surface
+
+### Finite installation for a local setup app
+
+An owner-local setup app such as Observatory can run the verified download's
+`acp-slack-adapter --home NEW_PRIVATE_HOME native-setup`. This creates the same
+private native installation as first launch and then exits. It does not start
+the server, open a browser, register startup, select an agent, authorize Slack,
+or send a message. Every existing destination is refused without replacement.
+The JSON result uses `com.microsoft.amplifier.slack-native-setup/1` and reports
+the installation `id`, canonical `home`, installed `executable`, `version`,
+`created: true`, `serving: false`, and an `installation-local-cli` management
+descriptor. It contains no first-account URL or credential. A lost result is
+not evidence of an absent installation: inspect the saved identity before
+continuing; do not delete and recreate the home.
+
+The local setup app then launches that installation with `--home HOME
+--no-browser`, retaining its normal background lifecycle. It invokes the
+installed executable's `api METHOD PATH --body-file PRIVATE_FILE` for management.
+The existing local API client proves the exact installation and origin on the
+same connection before sending a credential. Keep private request files and
+credentials on the host, out of browser state, command-line arguments and logs.
+This does not relax HTTPS requirements for ordinary remote management providers.
+
+Bind the selected agent through the existing revision-checked configuration API
+and private credential references. Present the normal `setup/slack` next-action
+flow, including Slack's approval/code and explicit confirmation of an undeclared
+workspace. Workspace mismatch and administrator approval remain enforced.
+The connector retains ownership of its credentials, app, renewal and updates;
+Observatory need not be present during later operation. Standalone first-account
+sign-in remains available; a setup client must not invent an owner password.
+An ACP connection check creates a session but sends no prompt. Neither that
+check nor connected Socket Mode proves the first human conversation succeeded.
 
 Existing authenticated management APIs remain available. Native additions are:
 

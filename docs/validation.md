@@ -13,6 +13,7 @@ python3 tests/media.py
 python3 tests/client_capabilities.py
 python3 tests/morning_reliability.py
 python3 tests/slack_huddles.py
+python3 tests/owner_message.py
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
@@ -28,6 +29,27 @@ prevents continuation, and reconnect recovers unseen messages without repeating
 accepted work. It sends no messages to a real Slack workspace. The automatic
 approval tests also exercise concurrent activity writes so a database lock is
 not misreported to the agent as a user rejecting an action.
+
+The owner-message fixture uses the actual adapter, its granted MCP tools and
+ordinary ACP with a local Slack substitute. It checks that the only possible
+recipient is the configured owner's direct conversation, that nothing is sent
+about a conversation the owner is not in, from a direct conversation or in
+answer to another agent, the
+bound per response, and recovery of a send whose acknowledgment was lost. It
+compares the tools offered to a person's message, then another agent's, then a
+person's again in one conversation, definition for definition, and checks that
+the other agent's call is refused with nothing opened, saved or queued. It
+also holds accepted messages in the journal and changes the answer Slack gives
+before they are sent: the owner leaves the source before the first send, or
+between a rate-limited send and its retry, whether a colleague or the owner
+asked; and Slack cannot give the members, then can. Nothing may be sent in the
+first three, and exactly one message in the last. Unit tests cover what needs no
+Slack answer: a changed owner, installation, direct-message setting, listed
+conversations or queued destination cancels the owner message alone, and a
+message that stays unconfirmed is given up after its bound. The fixture
+does not establish that a real workspace lets a given app open that
+conversation, or a real model's judgment about what deserves its owner's
+attention.
 
 The [Actions page](https://github.com/microsoft/amplifier-acp-slack/actions) records checks
 against the published source. Earlier private deployment reports and their

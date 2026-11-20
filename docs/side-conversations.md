@@ -64,6 +64,74 @@ Disconnection, revoked access and changed/deleted sources continue to use the
 existing controls. Reconnecting does not invent a replacement request, revive
 expired work or turn an unknown effect into a successful one.
 
+## A private message to the owner
+
+An agent answering in a channel or group conversation can also send its configured
+owner a private message with `slack_owner_message`: for example when the owner
+asks in a channel to be told something privately, or when a discussion needs the
+owner's decision and that should not be said in the room. The reply to the room
+remains an ordinary reply.
+
+| Argument | Meaning |
+| --- | --- |
+| `request_id` | A new UUID for a new message; the same one to check a message already asked for. |
+| `text` | The message, in standard Markdown, at most 8,000 characters. |
+
+The connector fixes the recipient: the owner Slack ID in the connection's context
+settings, in that person's one-to-one conversation with the agent, which the
+connector opens if it does not exist. No argument names a person or conversation,
+and a call carrying any other argument is refused. Each message ends with a link
+to the message that prompted it.
+
+The tool is listed for every response in a group conversation, when an owner is
+configured and direct messages are enabled for the connection. The list does not
+depend on who spoke last: a runtime keeps its compacted history for one exact
+tool list, so a tool that came and went between a person's message and another
+agent's would cost a long conversation that history each time. Only a person's
+request can use it. A call from a response to another agent's message is refused
+in words, before anything is opened, saved or queued. Each call checks
+with Slack that the source message is unchanged and that the owner is a member
+of the source conversation, so a private message tells the owner nothing they
+could not already read there. In a direct conversation with someone else, or in
+the owner's own, the tool is absent and a call is refused. A connection limited
+to listed conversations must list the owner's direct conversation. One response
+can send at most three such messages.
+
+Delivery uses the same journal and publisher as other messages. Repeating a
+`request_id` reports the saved message and its receipts, whatever text the
+repeat carries; it never sends again. A send whose acknowledgment was lost stays
+uncertain until Slack's history confirms it. A changed or deleted source cancels
+what has not been sent. A refusal says why in words meant for the agent, for
+example that the app was not granted `im:write`.
+
+The journal can hold an accepted message, for reply pacing or a Slack rate
+limit, so acceptance does not decide delivery. The connector saves what the
+message was accepted for: this installation, the configured owner, that owner's
+direct conversation and the source message. Immediately before every send,
+including the retry of a rate-limited one, it checks that record against the
+current configuration and the queued destination, and asks Slack again whether
+the owner is a member of the source conversation and the source is unchanged.
+It does not open the direct conversation again, and it never repeats a send
+whose outcome is uncertain.
+
+| What the check finds | What happens |
+| --- | --- |
+| The owner is no longer a member of the source conversation | The message is cancelled and not sent. |
+| The configured owner, the installation, the direct-message setting, the listed conversations or the queued destination no longer match | The message is cancelled and not sent. |
+| Slack cannot confirm the members or the source | The message is not sent and is checked again every 15 seconds. After two minutes without confirmation, counted from its first claim for sending, it is cancelled. |
+
+Only the owner message is cancelled; the response's reply in the room is
+unaffected. Messages of one response are sent in order, so an owner message that
+is waiting for confirmation holds back what the response says after it for at
+most those two minutes. The receipt's note says why a message was not sent.
+When the person who asked is no longer in the conversation, the connector stops
+serving that response's tools, so the agent cannot read the receipt; the message
+is withheld all the same.
+
+A message Slack accepted is not proof that the owner read it. The message appears
+in the owner's direct conversation as the agent's own; a later reply there starts
+that conversation's ordinary turn with its own session.
+
 See [conversation continuity](conversation-continuity.md) for source grants and
 [validation](validation.md) for the actual-adapter fixture. The umbrella owns the
 [shared attention and interaction promises](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/interaction.md).

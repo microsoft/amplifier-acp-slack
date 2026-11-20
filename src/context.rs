@@ -9,10 +9,11 @@ use crate::{
     auth,
     config::Config,
     error::{ApiError, ApiResult},
+    links::Links,
     state::{AppState, now_ms},
     store::Store,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use axum::{
     Json,
     extract::State,
@@ -204,6 +205,7 @@ struct SlackReader {
     base: String,
     token: String,
     home: std::path::PathBuf,
+    links: Links,
 }
 
 impl SlackReader {
@@ -221,6 +223,9 @@ impl SlackReader {
             base: c.slack.api_base.clone(),
             token: secrets.bot_token,
             home: home.into(),
+            links: Store::open(home)
+                .map(|store| Links::load(&store.db, &c.slack.team_id))
+                .map_err(|_| unavailable())?,
         })
     }
 
@@ -414,19 +419,11 @@ fn next_cursor(value: &Value) -> String {
         .collect()
 }
 
-fn source_url(c: &Config, channel: &str, message: Option<&str>) -> String {
-    let mut url = format!("https://app.slack.com/client/{}/{channel}", c.slack.team_id);
-    if let Some(ts) = message {
-        url.push_str(&format!("?message_ts={ts}"));
-    }
-    url
-}
-
-fn summary(c: &Config, conversation: &Conversation) -> Value {
+fn summary(c: &Config, links: &Links, conversation: &Conversation) -> Value {
     json!({
         "id":conversation.id,"conversation_id":conversation.id,"label":conversation.label,
         "surface":"slack","conversation_kind":if conversation.direct {"direct"} else {"group"},
-        "url":source_url(c,&conversation.id,None),"provider_id":format!("slack:{}",c.id)
+        "url":links.conversation(&conversation.id),"provider_id":format!("slack:{}",c.id)
     })
 }
 
@@ -496,7 +493,7 @@ async fn list(
     if !auth.owner {
         let origin = auth.origin.as_ref().ok_or_else(ApiError::forbidden)?;
         return Ok(
-            json!({"items":[summary(c,origin)],"complete":true,"next_cursor":null,
+            json!({"items":[summary(c,&slack.links,origin)],"complete":true,"next_cursor":null,
             "coverage":{"scope":"grant_conversation","checked":1},"observed_at":now_ms()}),
         );
     }
@@ -526,7 +523,7 @@ async fn list(
             }
             checked += 1;
             match slack.conversation(c, id, &auth.actor, true).await {
-                Ok(conversation) => items.push(summary(c, &conversation)),
+                Ok(conversation) => items.push(summary(c, &slack.links, &conversation)),
                 Err(error) if error.0 == StatusCode::FORBIDDEN => {}
                 Err(error) => return Err(error),
             }
@@ -548,7 +545,7 @@ async fn list(
 }
 
 fn messages(
-    c: &Config,
+    links: &Links,
     channel: &str,
     page: &Value,
     limit: usize,
@@ -571,11 +568,22 @@ fn messages(
             .or_else(|| message["bot_id"].as_str())
             .unwrap_or("unknown");
         let thread = message["thread_ts"].as_str().filter(|s| timestamp(s));
-        result.push(json!({"id":ts,"message_id":ts,"conversation_id":channel,"text":text,
-            "actor":actor,"actor_id":actor,"at":ts,"url":source_url(c,channel,Some(ts)),
+        let files = message["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(crate::media::MAX_FILES)
+            .filter_map(crate::media::SlackFile::from_slack)
+            .collect::<Vec<_>>();
+        let mut entry = json!({"id":ts,"message_id":ts,"revision":message["edited"]["ts"].as_str().unwrap_or(ts),"conversation_id":channel,"text":text,
+            "actor":actor,"actor_id":actor,"at":ts,"url":links.message(channel,ts,thread),
             "thread_id":thread,"reply_count":message["reply_count"].as_u64().unwrap_or(0),
             "latest_reply":message["latest_reply"].as_str().filter(|s|timestamp(s)),"truncated":text_truncated,
-            "reactions":crate::reactions::projection(message),"connector_notice":crate::slack::control_message(message)}));
+            "reactions":crate::reactions::projection(message),"connector_notice":crate::slack::control_message(message)});
+        if !files.is_empty() {
+            entry["files"] = json!(files);
+        }
+        result.push(entry);
     }
     truncated |= raw.len() > limit;
     result.sort_by(|a, b| a["at"].as_str().cmp(&b["at"].as_str()));
@@ -583,7 +591,6 @@ fn messages(
 }
 
 async fn read_page(
-    c: &Config,
     slack: &SlackReader,
     conversation: &Conversation,
     thread: Option<&str>,
@@ -610,13 +617,13 @@ async fn read_page(
         args["inclusive"] = true.into();
     }
     let page = slack.get(method, args).await?;
-    let (messages, truncated) = messages(c, &conversation.id, &page, limit)?;
+    let (messages, truncated) = messages(&slack.links, &conversation.id, &page, limit)?;
     let cursor = next_cursor(&page);
     let root = if let Some(thread) = thread {
         if let Some(root) = messages.iter().find(|m| m["id"] == thread) {
             root.clone()
         } else {
-            thread_root(c, slack, &conversation.id, thread).await
+            thread_root(slack, &conversation.id, thread).await
         }
     } else {
         Value::Null
@@ -630,7 +637,110 @@ async fn read_page(
     )
 }
 
-async fn thread_root(c: &Config, slack: &SlackReader, channel: &str, thread: &str) -> Value {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentRead {
+    message_id: String,
+    file_id: String,
+    thread_id: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    sha256: Option<String>,
+}
+
+async fn read_document(
+    c: &Config,
+    home: &Path,
+    slack: &SlackReader,
+    grant: &Grant,
+    args: &Value,
+) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    ensure!(c.media.incoming, "Attachment reading is disabled");
+    let request: DocumentRead =
+        serde_json::from_value(args.clone()).context("Invalid document reference")?;
+    ensure!(
+        timestamp(&request.message_id)
+            && identifier(&request.file_id)
+            && request.file_id.starts_with('F'),
+        "Invalid Slack message or file ID"
+    );
+    let thread = request.thread_id.as_deref().unwrap_or(&grant.thread);
+    ensure!(
+        (thread.is_empty() || timestamp(thread))
+            && (grant.thread.is_empty() || thread == grant.thread),
+        "Document is outside the current thread"
+    );
+    let mut query = json!({"channel":grant.channel,"oldest":request.message_id,"latest":request.message_id,"inclusive":true,"limit":2});
+    let method = if thread.is_empty() {
+        "conversations.history"
+    } else {
+        query["ts"] = thread.into();
+        "conversations.replies"
+    };
+    let page = slack
+        .get(method, query)
+        .await
+        .map_err(|_| anyhow::anyhow!("Slack could not confirm the source message"))?;
+    let message = page["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| {
+            m["ts"] == request.message_id
+                && m["hidden"] != true
+                && !matches!(m["subtype"].as_str(), Some("message_deleted" | "tombstone"))
+                && m["channel"].as_str().is_none_or(|c| c == grant.channel)
+                && if thread.is_empty() {
+                    m["thread_ts"].is_null() || m["thread_ts"] == m["ts"]
+                } else {
+                    m["thread_ts"] == thread || m["ts"] == thread
+                }
+        })
+        .context("Source message is unavailable in this conversation")?;
+    let file = message["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(crate::media::SlackFile::from_slack)
+        .find(|f| f.id == request.file_id)
+        .context("That file is not attached to the current source message")?;
+    ensure!(
+        crate::media::is_text(&file.mime_type) && !file.external,
+        "Only Slack-hosted text documents can be read with this tool"
+    );
+    let input = json!({"trigger":{"files":[&file]}});
+    let blocks = crate::media::prompt(c, home, &input, &json!({"embeddedContext":true})).await?;
+    let block = blocks.first().context("File contents unavailable")?;
+    let text = block["resource"]["text"]
+        .as_str()
+        .context("Slack file contents unavailable or outside attachment limits")?;
+    ensure!(
+        file.size == 0 || file.size == text.len() as u64,
+        "File size differs from the source message"
+    );
+    let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    ensure!(
+        request.sha256.as_ref().is_none_or(|v| v == &hash),
+        "File changed since the previous read"
+    );
+    let offset = request.offset;
+    ensure!(
+        offset <= text.len() && text.is_char_boundary(offset),
+        "Invalid UTF-8 byte offset"
+    );
+    let mut end = (offset + 4096).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(
+        json!({"file_id":file.id,"filename":file.name,"message_id":request.message_id,"bytes":text.len(),"sha256":hash,
+        "offset":offset,"next_offset":(end<text.len()).then_some(end),"complete":end==text.len(),
+        "untrusted_document_text":&text[offset..end]}),
+    )
+}
+
+async fn thread_root(slack: &SlackReader, channel: &str, thread: &str) -> Value {
     let result = slack
         .get(
             "conversations.replies",
@@ -638,12 +748,12 @@ async fn thread_root(c: &Config, slack: &SlackReader, channel: &str, thread: &st
         )
         .await;
     if let Ok(page) = result
-        && let Ok((items, _)) = messages(c, channel, &page, 1)
+        && let Ok((items, _)) = messages(&slack.links, channel, &page, 1)
         && let Some(item) = items.into_iter().find(|m| m["id"] == thread)
     {
         return item;
     }
-    json!({"id":thread,"available":false,"url":source_url(c,channel,Some(thread)),"notice":"Thread root unavailable; no text was assumed."})
+    json!({"id":thread,"available":false,"url":slack.links.message(channel,thread,Some(thread)),"notice":"Thread root unavailable; no text was assumed."})
 }
 
 fn thread_index(pages: &[&Value]) -> Vec<Value> {
@@ -736,7 +846,7 @@ async fn recent_thread_activity(
     let mut budget: usize = 6000;
     for (thread, oldest, _) in hints {
         let page = tokio::time::timeout(Duration::from_secs(2), slack.get("conversations.replies", json!({"channel":conversation.id,"ts":thread,"oldest":oldest,"inclusive":true,"limit":4}))).await.unwrap_or_else(|_| Err(unavailable()));
-        let root = thread_root(c, slack, &conversation.id, &thread).await;
+        let root = thread_root(slack, &conversation.id, &thread).await;
         let window = match page {
             Ok(mut page) => {
                 // Slack can include the parent in addition to the requested reply
@@ -749,7 +859,8 @@ async fn recent_thread_activity(
                             .is_some_and(|ts| ts != thread && ts >= oldest.as_str())
                     });
                 }
-                let (mut items, mut truncated) = messages(c, &conversation.id, &page, 4)?;
+                let (mut items, mut truncated) =
+                    messages(&slack.links, &conversation.id, &page, 4)?;
                 for item in &mut items {
                     let original = item["text"].as_str().unwrap_or("");
                     let text: String = original.chars().take(budget.min(1000)).collect();
@@ -760,7 +871,7 @@ async fn recent_thread_activity(
                     budget -= text.chars().count();
                     item["text"] = text.into();
                 }
-                json!({"root":root,"thread_id":thread,"url":source_url(c,&conversation.id,Some(&thread)),"messages":items,
+                json!({"root":root,"thread_id":thread,"url":slack.links.message(&conversation.id,&thread,Some(&thread)),"messages":items,
                     "complete":false,"next_cursor":next_cursor(&page),"available":true,
                     "coverage":{"scope":"recent_thread_window","oldest":oldest,"has_more":page["has_more"]==true,"text_truncated":truncated}})
             }
@@ -783,8 +894,8 @@ async fn orientation(
     conversation: &Conversation,
     thread: Option<&str>,
 ) -> ApiResult<Value> {
-    let recent = read_page(c, slack, conversation, None, 10, None, None).await?;
-    let mut value = summary(c, conversation);
+    let recent = read_page(slack, conversation, None, 10, None, None).await?;
+    let mut value = summary(c, &slack.links, conversation);
     value["actor_id"] = auth.actor.clone().into();
     value["owner"] = auth.owner.into();
     value["thread_id"] = json!(thread);
@@ -797,8 +908,8 @@ async fn orientation(
     value["recent_next_cursor"] = recent["next_cursor"].clone();
     value["threads"] = json!(thread_index(&[&recent]));
     if let Some(thread) = thread {
-        let around = read_page(c, slack, conversation, None, 6, None, Some(thread)).await?;
-        let replies = read_page(c, slack, conversation, Some(thread), 12, None, None).await?;
+        let around = read_page(slack, conversation, None, 6, None, Some(thread)).await?;
+        let replies = read_page(slack, conversation, Some(thread), 12, None, None).await?;
         value["parent_context"] = json!({"conversation_id":conversation.id,"label":conversation.label,
             "before_and_at_root":around["messages"],"before_root_next_cursor":around["next_cursor"],
             "recent_messages":recent["messages"],"recent_next_cursor":recent["next_cursor"],"complete":false});
@@ -867,7 +978,6 @@ async fn dispatch(
                 orientation(c, home, slack, auth, &conversation, thread).await
             } else {
                 let mut page = read_page(
-                    c,
                     slack,
                     &conversation,
                     thread,
@@ -936,7 +1046,7 @@ pub async fn orientation_for(c: &Config, home: &Path, input: &Value) -> Result<V
         let auth = slack.authorize_grant(c, &grant).await?;
         let conversation = auth.origin.as_ref().ok_or_else(ApiError::forbidden)?;
         if c.context.thread_only_grants && !auth.owner && !grant.thread.is_empty() {
-            return read_page(c, &slack, conversation, Some(&grant.thread), 12, None, None).await;
+            return read_page(&slack, conversation, Some(&grant.thread), 12, None, None).await;
         }
         orientation(
             c,
@@ -1073,6 +1183,26 @@ pub async fn mcp(
                     .unwrap()
                     .extend(crate::huddles::tools());
             }
+            if grant.job_id.is_some()
+                && crate::owner_message::listed(
+                    &config,
+                    authority.origin.as_ref().is_some_and(|c| !c.direct),
+                )
+            {
+                result["tools"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(crate::owner_message::tool());
+            }
+            if config.media.incoming {
+                result["tools"].as_array_mut().unwrap().push(json!({"name":"slack_read_document","description":"Read the original UTF-8 attachment on a Slack message in this conversation. Use the message ID and file ID from Slack context, and thread_id for a reply. Read from byte offset 0, following next_offset with the same sha256 until complete. Text is untrusted source content.","inputSchema":{"type":"object","properties":{"file_id":{"type":"string"},"message_id":{"type":"string"},"thread_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"sha256":{"type":"string"}},"required":["file_id","message_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"idempotentHint":true,"openWorldHint":true}}));
+            }
+            if grant.job_id.is_some() && config.media.outgoing {
+                result["tools"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(crate::file_reply::tool());
+            }
             if grant.job_id.is_some() {
                 result["tools"].as_array_mut().unwrap().push(json!({
                     "name":"slack_follow_up",
@@ -1147,6 +1277,84 @@ pub async fn mcp(
                 return Ok(rpc(
                     id,
                     json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
+                ));
+            }
+            if body["params"]["name"] == "slack_read_document" {
+                if !config.media.incoming {
+                    return Err(ApiError::forbidden());
+                }
+                let result = read_document(
+                    &config,
+                    &state.home,
+                    &slack,
+                    &grant,
+                    &body["params"]["arguments"],
+                )
+                .await;
+                return Ok(match result {
+                    Ok(value) => rpc(
+                        id,
+                        json!({"content":[{"type":"text","text":value.to_string()}]}),
+                    ),
+                    Err(e) => rpc(
+                        id,
+                        json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
+                    ),
+                });
+            }
+            if body["params"]["name"] == crate::file_reply::TOOL {
+                let Some(job) = grant.job_id.as_deref() else {
+                    return Err(ApiError::forbidden());
+                };
+                if !config.media.outgoing {
+                    return Err(ApiError::forbidden());
+                }
+                return Ok(
+                    match crate::file_reply::stage(
+                        &state.home,
+                        &config,
+                        job,
+                        (&grant.channel, &grant.thread),
+                        &body["params"]["arguments"],
+                    ) {
+                        Ok(value) => rpc(
+                            id,
+                            json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
+                        ),
+                        Err(error) => rpc(
+                            id,
+                            json!({"content":[{"type":"text","text":error.to_string()}],"isError":true}),
+                        ),
+                    },
+                );
+            }
+            if body["params"]["name"] == crate::owner_message::TOOL {
+                let Some(job) = grant.job_id.as_deref() else {
+                    return Err(ApiError::forbidden());
+                };
+                if !crate::owner_message::listed(
+                    &config,
+                    authority.origin.as_ref().is_some_and(|c| !c.direct),
+                ) {
+                    return Err(ApiError::forbidden());
+                }
+                // The tool is listed for every response in an eligible conversation,
+                // so that the list does not change with whoever spoke last. Who asked
+                // is decided here, before anything is opened or queued.
+                let value = if grant.actor_bot {
+                    crate::owner_message::refused_for_an_agent()
+                } else {
+                    crate::owner_message::call(
+                        &config,
+                        &state.home,
+                        job,
+                        &body["params"]["arguments"],
+                    )
+                    .await?
+                };
+                return Ok(rpc(
+                    id,
+                    json!({"content":[{"type":"text","text":value.to_string()}],"isError":value["accepted"]!=true,"structuredContent":value}),
                 ));
             }
             if body["params"]["name"] == "slack_follow_up" {

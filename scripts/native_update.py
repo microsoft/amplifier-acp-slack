@@ -1,11 +1,29 @@
 """Fixed native Slack release worker. Private stdin-free invocation: home + plan UUID.
 No arbitrary commands, URLs, host operations, model calls, or state rollback.
 """
-import contextlib, hashlib, hmac, http.client, io, json, os, platform, shutil, sqlite3, subprocess, sys, tarfile, time, urllib.request, uuid, zipfile
+import contextlib, hashlib, hmac, http.client, io, json, ntpath, os, platform, shutil, sqlite3, subprocess, sys, tarfile, time, urllib.request, uuid, zipfile
 from pathlib import Path, PurePosixPath
 REPO='microsoft/amplifier-acp-slack'
 CRITICAL={'stopping','swapping','verifying','rolling_back','recovery_required'}
 MAX_ARCHIVE=384*1024*1024
+MANAGER_OWNER='slack-native-manager/1'
+MANAGER_SCHEMA='com.microsoft.amplifier.slack-native-status/1'
+
+class ManagedUnknown(RuntimeError):
+    """An owned manager operation was not confirmed; never fall back or replay."""
+
+def native_path_matches(value,expected):
+    if not isinstance(value,str):return False
+    expected=str(expected)
+    if os.name!='nt':return value==expected
+    # Rust canonical paths retain the extended prefix; pathlib may remove it.
+    # Normalize only that spelling and Windows case/separators, not parent
+    # traversal, links, short names, or an arbitrary different installation.
+    def spelling(path):
+        if path.startswith('\\\\?\\UNC\\'):path='\\\\'+path[8:]
+        elif path.startswith('\\\\?\\'):path=path[4:]
+        return ntpath.normcase(path)
+    return spelling(value)==spelling(expected)
 
 def _windows_path(path):
     value=os.path.abspath(path)
@@ -158,6 +176,11 @@ class Worker:
         cfg=read(self.home/'adapter.json');marker=read(self.home/'native-installation.json')
         if cfg['server'].get('auth_mode')!='local_password' or cfg['server'].get('web_transport')!='local_http' or marker.get('id')!=cfg['id'] or marker.get('update_owner')!='installation':raise RuntimeError('native_owner_required')
         if (self.home/'saved-connections.json').exists() or (self.home/'updates/registered-service.json').exists():raise RuntimeError('externally_managed_update')
+        owner=marker.get('manager_owner')
+        if owner is not None and owner!=MANAGER_OWNER:raise RuntimeError('native_manager_owner_unknown')
+        managed=owner==MANAGER_OWNER
+        if hasattr(self,'managed') and self.managed!=managed:raise RuntimeError('native_manager_owner_changed')
+        self.managed=managed
     def save(self,state=None,**values):
         if state:self.job['state']=state
         self.job.update(values,updated_at=int(time.time()*1000));write(self.file,self.job)
@@ -177,6 +200,101 @@ class Worker:
             return value
         finally:connection.close()
     def gate(self):write(self.home/'updates/drain.json',{'plan_id':self.id,'expires_at':int(time.time()*1000)+120000})
+    def manager_call(self,action,args,deadline):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise ManagedUnknown('native_manager_budget_exhausted')
+        command=[str(self.binary),'--home',str(self.home),action,*args]
+        options={'stdin':subprocess.DEVNULL,'capture_output':True,'text':True,'encoding':'utf-8','timeout':remaining}
+        if os.name=='nt':options['creationflags']=subprocess.CREATE_NO_WINDOW
+        try:
+            reply=subprocess.run(command,**options)
+            if reply.returncode!=0 or len(reply.stdout.encode('utf-8'))>2*1024*1024:raise ValueError('unconfirmed_manager_response')
+            value=json.loads(reply.stdout)
+            if not isinstance(value,dict):raise ValueError('unconfirmed_manager_response')
+            return value
+        except (OSError,subprocess.SubprocessError,ValueError) as error:
+            raise ManagedUnknown('native_manager_response_unknown') from error
+    def managed_ready(self,value,request,generation=None):
+        process=value.get('process_identity')
+        observed_request=value.get('request')
+        if (value.get('schema')!=MANAGER_SCHEMA or value.get('id')!=self.config['id']
+            or not native_path_matches(value.get('home'),self.home) or not native_path_matches(value.get('executable'),self.binary)
+            or value.get('state')!='ready' or value.get('request_current') is not True
+            or value.get('profile_matches') is not True or value.get('launch_observed') is not True
+            or value.get('autostart') is not False or not isinstance(observed_request,dict) or observed_request.get('request_id')!=request
+            or not isinstance(value.get('service'),dict) or not value['service']
+            or not isinstance(process,dict) or type(process.get('pid')) is not int or process['pid']<=0
+            or len(process)<2 or value.get('pid')!=process['pid']
+            or generation is not None and process!=generation):
+            raise ManagedUnknown('native_manager_generation_unconfirmed')
+        return process
+    def managed_current_launch(self):
+        root=self.home/'native-manager'
+        try:
+            pointer=read(root/'active.json');identifier=pointer['request_id']
+            if str(uuid.UUID(identifier))!=identifier:raise ValueError('invalid_native_request')
+            request=read(root/'requests'/(identifier+'.json'));binding=request['binding']
+            if (request['request_id']!=identifier or binding['id']!=self.config['id']
+                or not native_path_matches(binding['home'],self.home) or not native_path_matches(binding['profile']['executable'],self.binary)
+                or not native_path_matches(binding['profile']['cwd'],self.home)
+                or not isinstance(binding['profile']['args'],list) or len(binding['profile']['args'])!=3
+                or binding['profile']['args'][0]!='--home' or binding['profile']['args'][2]!='native-serve'
+                or not native_path_matches(binding['profile']['args'][1],self.home)
+                or binding['profile']['autostart'] is not False):raise ValueError('native_profile_changed')
+            try:witness=read(root/'requests'/(identifier+'.launched.json'))
+            except FileNotFoundError:witness=None
+            process=None
+            if witness is not None:
+                process=witness['process']
+                if (witness['request_id']!=identifier or witness['binding']!=binding
+                    or not isinstance(process,dict) or type(process.get('pid')) is not int
+                    or process['pid']<=0 or len(process)<2):raise ValueError('native_generation_changed')
+            if read(root/'active.json')!=pointer or read(root/'requests'/(identifier+'.json'))!=request:
+                raise ValueError('native_request_changed')
+            return {'start_request_id':identifier,'process_identity':process,'service':binding['service']}
+        except (OSError,ValueError,KeyError,TypeError) as error:
+            raise ManagedUnknown('native_manager_launch_unconfirmed') from error
+    def managed_stopped(self,value,intent,*,status=False):
+        control=value.get('control')
+        current=(value.get('request_current') is True and value.get('profile_matches') is True
+                 and isinstance(value.get('request'),dict) and value['request'].get('request_id')==intent['start_request_id']) if status else value.get('control_current') is True
+        if (value.get('schema')!=MANAGER_SCHEMA or value.get('id')!=self.config['id']
+            or not native_path_matches(value.get('home'),self.home) or not native_path_matches(value.get('executable'),self.binary)
+            or value.get('state')!='inactive' or not current or value.get('autostart') is not False
+            or value.get('service')!=intent['service'] or not isinstance(control,dict)
+            or control.get('request_id')!=intent['request_id'] or control.get('action')!='stop'
+            or control.get('phase')!='inactive' or control.get('start_request_id')!=intent['start_request_id']
+            or control.get('update_plan')!=self.id or control.get('process_absent') is not True
+            or 'process_identity' not in control or control['process_identity']!=intent['process_identity']
+            or control.get('observation')!='exact_profile_inactive_and_service_lock_available'):
+            raise ManagedUnknown('native_manager_stop_unconfirmed')
+        return control
+    def managed_stop(self):
+        self.guard_ownership()
+        if self.job['state'] not in {'stopping','rolling_back'}:raise ManagedUnknown('native_manager_stop_phase_invalid')
+        deadline=time.monotonic()+60
+        captured=self.managed_current_launch();prior=self.job.get('manager_stop')
+        if prior:
+            if prior.get('dispatch')!='confirmed':raise ManagedUnknown('native_manager_stop_already_unconfirmed')
+            if prior.get('start_request_id')==captured['start_request_id']:
+                if any(prior.get(key)!=captured[key] for key in captured):raise ManagedUnknown('native_manager_stop_generation_changed')
+                # A prior confirmed stop of this same launch may be observed;
+                # it is never dispatched again, including during recovery.
+                observed=self.manager_call('native-status',[],deadline)
+                self.managed_stopped(observed,prior,status=True)
+                return
+        intent={'request_id':str(uuid.uuid4()),'dispatch':'intent',
+                'config_sha256':digest(self.home/'adapter.json'),**captured}
+        self.save(manager_stop=intent)
+        try:
+            result=self.manager_call('native-stop',['--request-id',intent['request_id'],'--update-plan',self.id],deadline)
+            control=self.managed_stopped(result,intent)
+        except ManagedUnknown as error:
+            try:self.save(manager_stop={**intent,'dispatch':'unknown'})
+            except Exception:raise error
+            raise
+        try:self.save(manager_stop={**intent,'dispatch':'confirmed','control':control})
+        except Exception as error:raise ManagedUnknown('native_manager_stop_journal_unknown') from error
     def check(self):
         self.save('checking')
         release=json.loads(fetch('https://api.github.com/repos/'+REPO+'/releases/latest',2*1024*1024))
@@ -202,10 +320,13 @@ class Worker:
         if not binary.is_file() or digest(binary)!=metadata['binary_sha256']:raise RuntimeError('release_binary_mismatch')
         resources=binary.parent.parent/'Resources' if sys.platform=='darwin' else binary.parent
         validate_runtime(resources)
-        result=subprocess.run([str(binary),'--version'],capture_output=True,text=True,timeout=15)
+        version_options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+        result=subprocess.run([str(binary),'--version'],capture_output=True,text=True,timeout=15,**version_options)
         if result.returncode or result.stdout.strip()!='acp-slack-adapter '+version:raise RuntimeError('candidate_version_mismatch')
         self.save('ready',version=version,tag=release['tag_name'],release_id=release['id'],release_url=release['html_url'],archive_sha256=digest(archive),entry=metadata['entry'],binary_sha256=metadata['binary_sha256'],installed_sha256=digest(self.binary),config_sha256=digest(self.home/'adapter.json'),up_to_date=digest(self.binary)==metadata['binary_sha256'])
     def stop(self):
+        if self.managed:
+            return self.managed_stop()
         handle=None
         if os.name=='nt':
             # Hold the actual authenticated service process before requesting exit.
@@ -232,11 +353,33 @@ class Worker:
         finally:
             if handle:kernel.CloseHandle(handle)
     def start(self):
+        self.guard_ownership()
         mode={'verifying':'candidate','rolling_back':'rollback'}.get(self.job['state'])
         if mode is None:raise RuntimeError('replacement_launch_phase_invalid')
         nonce=str(uuid.uuid4());expected=self.job['binary_sha256' if mode=='candidate' else 'previous_sha256']
         if digest(self.binary)!=expected:raise RuntimeError('replacement_launch_bytes_changed')
-        self.save(launch={'nonce':nonce,'mode':mode,'binary_sha256':expected})
+        launch={'nonce':nonce,'mode':mode,'binary_sha256':expected}
+        if self.managed:
+            prior=self.job.get('launch')
+            if isinstance(prior,dict) and prior.get('mode')==mode and prior.get('manager_request_id'):
+                raise ManagedUnknown('native_manager_start_already_recorded')
+            request=str(uuid.uuid4());launch.update(manager_request_id=request,manager_dispatch='intent')
+            self.save(launch=launch)
+            # Manager dispatch and subsequent health share the existing 60-second
+            # replacement window. No second child or alternate startup path.
+            self.managed_deadline=time.monotonic()+60
+            try:
+                value=self.manager_call('native-start',['--request-id',request,'--update-plan',self.id,'--update-launch',nonce],self.managed_deadline)
+                process=self.managed_ready(value,request)
+            except ManagedUnknown as error:
+                try:self.save(launch={**launch,'manager_dispatch':'unknown'})
+                except Exception:raise error
+                raise
+            self.started_pid=process['pid'];self.started_generation=process
+            try:self.save(launch={**launch,'manager_dispatch':'confirmed','process_identity':process,'service':value.get('service')})
+            except Exception as error:raise ManagedUnknown('native_manager_start_journal_unknown') from error
+            return
+        self.save(launch=launch)
         env={**os.environ,'ACP_SLACK_UPDATE_PLAN':self.id,'ACP_SLACK_UPDATE_LAUNCH':nonce}
         kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL,'env':env}
         if os.name=='nt':kwargs['creationflags']=subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP
@@ -244,13 +387,23 @@ class Worker:
         self.started_process=subprocess.Popen([str(self.binary),'--home',str(self.home),'serve'],**kwargs)
         self.started_pid=self.started_process.pid
     def health(self,expected):
-        expected_version=subprocess.check_output([str(self.binary),'--version'],text=True,timeout=15).strip().split()[-1]
-        deadline=time.monotonic()+60
+        deadline=self.managed_deadline if self.managed else time.monotonic()+60
+        version_timeout=min(15,deadline-time.monotonic()) if self.managed else 15
+        if version_timeout<=0:raise ManagedUnknown('native_manager_budget_exhausted')
+        version_options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+        expected_version=subprocess.check_output([str(self.binary),'--version'],text=True,timeout=version_timeout,**version_options).strip().split()[-1]
+        if not self.managed:deadline=time.monotonic()+60
         while time.monotonic()<deadline:
             self.gate()
             try:
+                if self.managed:
+                    value=self.manager_call('native-status',[],deadline)
+                    self.managed_ready(value,self.job['launch']['manager_request_id'],self.started_generation)
+                    if value.get('service')!=self.job['launch']['service']:raise ManagedUnknown('native_manager_profile_changed')
+                    if deadline-time.monotonic()<6:raise ManagedUnknown('native_manager_budget_exhausted')
                 result=self.api('status');runtime=result.get('runtime',{});socket=result.get('state',{}).get('slack_connection',{})
                 if digest(self.binary)==expected and result['id']==self.config['id'] and result.get('version')==expected_version and result.get('addresses',{}).get('pid')==self.started_pid and (not self.config['enabled'] or runtime.get('state')=='running' and (socket if isinstance(socket,str) else socket.get('state'))=='connected'):return
+            except ManagedUnknown:raise
             except Exception:pass
             time.sleep(.3)
         raise RuntimeError('candidate_health_failed')
@@ -272,7 +425,9 @@ class Worker:
         # died. The service validates this journal under service.lock before state.
         self.save('rolling_back',reason=reason,launch=None);self.gate()
         try:self.stop()
+        except ManagedUnknown:raise
         except (OSError,RuntimeError):
+            if self.managed:raise ManagedUnknown('native_manager_stop_unconfirmed')
             # Our candidate may own the lock before its API is listening. Reconcile
             # that same known child briefly; never terminate or replace an unknown process.
             child=getattr(self,'started_process',None)
@@ -341,6 +496,10 @@ class Worker:
         try:
             if self.job['action']=='check':self.check()
             else:self.apply()
+        except ManagedUnknown:
+            # The manager may have accepted the effect. Preserve its durable
+            # request and this update; a free lock is not an exit/rollback proof.
+            self.save('recovery_required',reason='native_manager_operation_unknown')
         except Exception:
             if self.job.get('state') in CRITICAL and (self.folder/'backup/binary').exists():
                 try:self.rollback('candidate_failed_verification')
@@ -350,9 +509,51 @@ class Worker:
             gate=self.home/'updates/drain.json'
             if self.job.get('state') not in CRITICAL and gate.exists() and read(gate).get('plan_id')==self.id:gate.unlink()
 
+def managed_job(home,identifier,request):
+    root=home/'native-updates';folder=root/identifier
+    job=read(folder/'plan.json');dispatch=read(folder/('worker-dispatch-'+request+'.json'))
+    if (read(root/'active.json').get('id')!=identifier or job.get('id')!=identifier
+        or job.get('request_id')!=request or dispatch.get('plan_id')!=identifier
+        or dispatch.get('request_id')!=request or dispatch.get('phase') not in {'start_intent','accepted','unknown'}):
+        raise RuntimeError('managed_worker_request_changed')
+    return job
+
+def create_worker_receipt(path,value):
+    # An entered receipt is a one-shot fence, including after partial failure.
+    # A duplicate launch must not replace it or replay the request's effects.
+    with open(path,'x',opener=lambda p,f:os.open(p,f,0o600)) as target:
+        json.dump(value,target,indent=2);target.flush();os.fsync(target.fileno())
+    if os.name!='nt':
+        descriptor=os.open(path.parent,os.O_RDONLY)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+
+def run_managed_worker(home,identifier,request):
+    if str(uuid.UUID(request))!=request:raise RuntimeError('invalid_managed_worker_request')
+    job=managed_job(home,identifier,request)
+    if job.get('state') not in {'queued','checking','draining',*CRITICAL}:return
+    worker=Worker(home,identifier)
+    if not worker.managed:raise RuntimeError('managed_worker_owner_required')
+    folder=worker.folder;entered=folder/('worker-entered-'+request+'.json')
+    receipt={'schema':1,'plan_id':identifier,'request_id':request,'pid':os.getpid()}
+    try:create_worker_receipt(entered,receipt)
+    except FileExistsError:return
+    if managed_job(home,identifier,request)!=job:raise RuntimeError('managed_worker_request_changed')
+    worker.execute()
+    # Completion records durable terminal state, never exit or outcome proof
+    # inferred from a released lock. Exceptions/unknowns leave only entered.
+    final=managed_job(home,identifier,request)
+    if final.get('state') not in {'ready','deferred','succeeded','rolled_back','failed'}:return
+    create_worker_receipt(folder/('worker-finished-'+request+'.json'),{**receipt,'state':final['state']})
+
 def main():
     os.umask(0o077);home=Path(sys.argv[1]);identifier=str(uuid.UUID(sys.argv[2]));root=home/'native-updates'
     with locked(root/'worker.lock',True):
+        if len(sys.argv)==4:
+            run_managed_worker(home,identifier,sys.argv[3]);return
+        if len(sys.argv)!=3:raise RuntimeError('invalid_worker_arguments')
+        if read(home/'native-installation.json').get('manager_owner') is not None:
+            raise RuntimeError('managed_worker_request_required')
         # A delayed child from an acknowledged interrupted request must not run it again.
         if read(root/identifier/'plan.json').get('state') not in {'queued','checking','draining',*CRITICAL}:return
         try:Worker(home,identifier).execute()

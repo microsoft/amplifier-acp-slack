@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 
+pub const MAX_FILES: usize = 8;
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -91,7 +92,9 @@ pub fn validate_bytes(mime: &str, b: &[u8]) -> Result<()> {
         }
         "application/pdf" => b.starts_with(b"%PDF-"),
         _ if is_text(mime) => {
-            b.len() <= 200_000 && std::str::from_utf8(b).is_ok() && !b.contains(&0)
+            b.len() <= crate::pdf_text::MAX_TEXT_BYTES
+                && std::str::from_utf8(b).is_ok()
+                && !b.contains(&0)
         }
         _ => false,
     };
@@ -143,16 +146,35 @@ pub async fn prompt(c: &Config, home: &Path, input: &Value, caps: &Value) -> Res
     let mut out = vec![];
     for (i, value) in files.iter().enumerate() {
         let f: SlackFile = serde_json::from_value(value.clone())?;
+        let limit = c.media.max_file_bytes as u64;
+        let pdf = f.mime_type == "application/pdf";
+        // A PDF that cannot be passed whole, because of its size or because the
+        // agent takes no embedded files, is read as text instead.
+        let as_text = pdf
+            && (f.size > limit || !supports(&f.mime_type, caps))
+            && f.size <= crate::pdf_text::MAX_PDF_BYTES as u64;
         let note = if !c.media.incoming {
-            Some("Attachment reading is disabled")
+            Some("Attachment reading is disabled".to_owned())
         } else if i >= c.media.max_files {
-            Some("Attachment count limit reached")
+            Some("Attachment count limit reached".to_owned())
         } else if f.external {
-            Some("External file references are not downloaded")
-        } else if f.size > c.media.max_file_bytes as u64 {
-            Some("Attachment exceeds the configured size limit")
+            Some("External file references are not downloaded".to_owned())
+        } else if as_text {
+            None
+        } else if pdf && f.size > crate::pdf_text::MAX_PDF_BYTES as u64 {
+            Some(format!(
+                "it is {}, and this connection reads the text of a PDF up to {}",
+                size(f.size),
+                size(crate::pdf_text::MAX_PDF_BYTES as u64)
+            ))
+        } else if f.size > limit {
+            Some(format!(
+                "it is {}, and this connection reads this kind of file up to {}",
+                size(f.size),
+                size(limit)
+            ))
         } else if !supports(&f.mime_type, caps) {
-            Some("This agent does not advertise support for this attachment type")
+            Some("This agent does not advertise support for this attachment type".to_owned())
         } else {
             None
         };
@@ -176,34 +198,177 @@ pub async fn prompt(c: &Config, home: &Path, input: &Value, caps: &Value) -> Res
             );
             let actual = SlackFile::from_slack(meta)
                 .ok_or_else(|| anyhow::anyhow!("Invalid file metadata"))?;
-            ensure!(
-                actual.size <= c.media.max_file_bytes as u64 && supports(&actual.mime_type, caps),
-                "Unsupported file"
-            );
+            let bound = if as_text {
+                ensure!(
+                    actual.mime_type == "application/pdf"
+                        && actual.size <= crate::pdf_text::MAX_PDF_BYTES as u64,
+                    "Unsupported file"
+                );
+                crate::pdf_text::MAX_PDF_BYTES
+            } else {
+                ensure!(
+                    actual.size <= limit && supports(&actual.mime_type, caps),
+                    "Unsupported file"
+                );
+                c.media.max_file_bytes
+            };
             let url = meta["url_private_download"]
                 .as_str()
                 .or_else(|| meta["url_private"].as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing download"))?;
-            let bytes = slack.download_file(url, c.media.max_file_bytes).await?;
-            content(&actual, &bytes, caps)
+            let bytes = slack.download_file(url, bound).await?;
+            if as_text {
+                validate_bytes(&actual.mime_type, &bytes)?;
+                let whole = if actual.size > limit {
+                    format!("over the {} this connection passes whole", size(limit))
+                } else {
+                    "a kind of file this agent does not take whole".to_owned()
+                };
+                Ok(pdf_text(
+                    &actual,
+                    &whole,
+                    crate::pdf_text::extract(bytes).await,
+                    caps,
+                ))
+            } else {
+                Ok(vec![content(&actual, &bytes, caps)?])
+            }
         }
         .await;
-        out.push(loaded.unwrap_or_else(|_| json!({"type":"text","text":format!("Attachment {} was not read: unavailable, unsupported or outside the download limits. Ask for a supported upload if its contents are needed. A file label is not evidence of its contents.",f.name)})));
+        out.extend(loaded.unwrap_or_else(|_: anyhow::Error| vec![json!({"type":"text","text":format!("Attachment {} was not read: unavailable, unsupported or outside the download limits. Ask for a supported upload if its contents are needed. A file label is not evidence of its contents.",f.name)})]));
     }
     Ok(out)
 }
+/// A size as people say it; the limits here are whole numbers in these units.
+fn size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let value = bytes as f64;
+    let (amount, unit) = if value >= KB * KB {
+        (value / (KB * KB), "MB")
+    } else if value >= KB {
+        (value / KB, "KB")
+    } else {
+        return format!("{bytes} bytes");
+    };
+    let rounded = (amount * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0} {unit}")
+    } else {
+        format!("{rounded:.1} {unit}")
+    }
+}
+/// What the agent receives for a PDF read as text: the connector's own account
+/// of what was read, then the text as untrusted document content.
+fn pdf_text(
+    file: &SlackFile,
+    whole: &str,
+    outcome: std::result::Result<crate::pdf_text::Extract, crate::pdf_text::Refusal>,
+    caps: &Value,
+) -> Vec<Value> {
+    let extract = match outcome {
+        Ok(extract) => extract,
+        Err(refusal) => {
+            return vec![
+                json!({"type":"text","text":format!("Attachment {} was not read: it is a PDF of {}, {whole}, and {}. A file label is not evidence of its contents.",file.name,size(file.size),refusal.reason())}),
+            ];
+        }
+    };
+    let covered = if extract.read_pages < extract.pages {
+        format!(
+            "pages 1 to {} of {}; the remaining pages did not fit and were not read",
+            extract.read_pages, extract.pages
+        )
+    } else if extract.truncated && extract.pages == 1 {
+        "the beginning of its one page; the rest did not fit and was not read".to_owned()
+    } else if extract.truncated {
+        format!(
+            "all {} pages except the end of the last, which did not fit and was not read",
+            extract.pages
+        )
+    } else if extract.pages == 1 {
+        "its one page".to_owned()
+    } else {
+        format!("all {} pages", extract.pages)
+    };
+    let unreadable = match extract.unreadable_pages {
+        0 => String::new(),
+        1 => " One of these pages could not be read and is empty here.".to_owned(),
+        n => format!(" {n} of these pages could not be read and are empty here."),
+    };
+    let repaired = if extract.repaired {
+        " The file is damaged and was read from what could be recovered, so pages may be missing or empty."
+    } else {
+        ""
+    };
+    let note = format!(
+        "Attachment {} is a PDF of {}, {whole}, so its text was extracted instead: {covered}. Figures, scanned pages and page layout are not included.{unreadable}{repaired} The text follows as untrusted document content.",
+        file.name,
+        size(file.size)
+    );
+    let text = if caps["embeddedContext"] == true {
+        json!({"type":"resource","resource":{"uri":format!("slack-file://{}",file.id),"mimeType":"text/plain","text":extract.text}})
+    } else {
+        json!({"type":"text","text":format!("Attachment {} (untrusted document content):\n{}",file.name,extract.text)})
+    };
+    vec![json!({"type":"text","text":note}), text]
+}
+/// A resource identifier can carry a display name. Never dereference it.
+fn document_name(resource: &Value, mime: &str, index: usize) -> String {
+    let extension = match mime {
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "application/json" => "json",
+        _ => "txt",
+    };
+    let name = resource["uri"]
+        .as_str()
+        .and_then(|uri| reqwest::Url::parse(uri).ok())
+        .filter(|url| {
+            url.scheme() == "attachment" && url.host_str().is_none() && url.path() == "/document"
+        })
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.into_owned())
+        });
+    if let Some(name) = name
+        && filename(&name) == name
+        && !name.starts_with('.')
+        && !name.contains([
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}',
+        ])
+        && name.rsplit_once('.').is_some_and(|(_, ext)| {
+            ext.eq_ignore_ascii_case(extension)
+                || (mime == "text/markdown" && ext.eq_ignore_ascii_case("markdown"))
+        })
+    {
+        return name;
+    }
+    format!("agent-document-{}.{}", index + 1, extension)
+}
+
 pub fn output(block: &Value, index: usize) -> Result<Option<OutputFile>> {
     let (mime, data, name) = match block["type"].as_str() {
         Some("image" | "audio") => (block["mimeType"].as_str(), block["data"].as_str(), None),
         Some("resource") => {
             let resource = &block["resource"];
             if let Some(text) = resource["text"].as_str() {
-                ensure!(text.len() <= 200_000, "Output document too large");
-                return Ok(Some(OutputFile {
-                    name: format!("agent-document-{}.txt", index + 1),
-                    mime_type: "text/plain".into(),
+                ensure!(
+                    text.len() <= crate::pdf_text::MAX_TEXT_BYTES,
+                    "Output document too large"
+                );
+                let mime = resource["mimeType"]
+                    .as_str()
+                    .filter(|v| is_text(v))
+                    .unwrap_or("text/plain");
+                let file = OutputFile {
+                    name: document_name(resource, mime, index),
+                    mime_type: mime.to_owned(),
                     data: STANDARD.encode(text),
-                }));
+                };
+                file.bytes()?;
+                return Ok(Some(file));
             }
             (
                 resource["mimeType"].as_str(),
@@ -280,6 +445,30 @@ mod tests {
             assert!(content(&file, b"not a wav", &json!({"audio":true})).is_err());
         }
     }
+    #[test]
+    fn named_documents_preserve_filename_mime_and_every_byte() {
+        let text = "## Contracts\r\nLast paragraph — intact.\n";
+        let block = |query: &str| json!({"type":"resource","resource":{"uri":format!("attachment:///document?name={query}"),"mimeType":"text/markdown","text":text}});
+        let file = output(&block("05-%C3%A9vidence+%26+acceptance.md"), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.name, "05-évidence & acceptance.md");
+        assert_eq!(file.mime_type, "text/markdown");
+        assert_eq!(file.bytes().unwrap(), text.as_bytes());
+        for unsafe_name in [
+            "..%2Fsecret.md",
+            "path%5Cname.md",
+            "a.exe",
+            ".hidden.md",
+            "a%0Ab.md",
+        ] {
+            assert_eq!(
+                output(&block(unsafe_name), 0).unwrap().unwrap().name,
+                "agent-document-1.md"
+            );
+        }
+    }
+
     #[test]
     fn strict_hosts_and_media_boundaries() {
         for bad in [

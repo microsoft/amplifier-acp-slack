@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "distribution": "constellation-headless-1",
+  "upstream_repository": "slackapi/slack-cli",
+  "upstream_source": "91df4803911140c5a6da56e88ecd04e25c9c7515",
+  "upstream_version": "4.12.0",
+  "source_archive_url": "https://codeload.github.com/slackapi/slack-cli/tar.gz/91df4803911140c5a6da56e88ecd04e25c9c7515",
+  "source_archive_sha256": "fd7b3dd775897f86c7716df3a6653fcd2525bf7469733c7168a6238f4a1db9a2",
+  "source_archive_size": 756861,
+  "source_archive_root": "slack-cli-91df4803911140c5a6da56e88ecd04e25c9c7515",
+  "source_files": {
+    "internal/style/colors.go": "a5a70690d1ef87689b36163d901a0836384f5284edce69ec14a40227e9b9173b",
+    "go.mod": "654c618c72e4df2664860ea2d408c0de12d5d12736594fce54b494f1dc3b822b",
+    "go.sum": "89d24d05164e888738abc429ff7c78da5ad6eb4f17a373939bbb24fe0f082308",
+    "LICENSE": "a65d087cf010a52f8736da6b387df1feb7089e2c0636ef21cb86bef05940e0a4",
+    ".goreleaser.yml": "3cbfe83743a4a45a2c7c4007cc10a7ebf17d835ebd81b056cc2e435ebd5d6802",
+    ".circleci/config.yml": "d5ce318fd124943d4df2dcde8cceb84918fedd1de5ea5acedce8848f436c6f36",
+    "Makefile": "d99681035c6a0d6237a3e23c2e15c02108a0a3b9fd28e5043bcfc7b78f886d3c"
+  },
+  "patch_file": "windows-no-color.patch",
+  "patch_sha256": "a5122ebf2ea5a7c012f7205ed477eef4795f3a53260f3c310a12980df80a9476",
+  "patched_file": "internal/style/colors.go",
+  "patched_file_sha256": "ea0a529a447d6452d920df94205935ff05a6b4ad542e42917d608382b5435b14",
+  "go_version": "go1.27.3",
+  "goos": "windows",
+  "goarch": "amd64",
+  "goamd64": "v1",
+  "cgo_enabled": false,
+  "build_flags": [
+    "-mod=readonly",
+    "-trimpath",
+    "-buildvcs=false",
+    "-ldflags",
+    "-s -w -X github.com/slackapi/slack-cli/internal/version.Version=v4.12.0"
+  ],
+  "build_flags_origin": {
+    "upstream": [
+      ".goreleaser.yml",
+      ".circleci/config.yml:129",
+      "Makefile"
+    ],
+    "upstream_ldflags": "-s -w -X github.com/slackapi/slack-cli/internal/version.Version=v4.12.0",
+    "additional_reproducibility_flags": [
+      "-mod=readonly",
+      "-trimpath",
+      "-buildvcs=false"
+    ]
+  }
+}

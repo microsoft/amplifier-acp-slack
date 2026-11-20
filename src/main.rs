@@ -24,6 +24,41 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Create a new private native installation and exit without starting it.
+    NativeSetup,
+    /// Start this native installation through its own per-user manager.
+    NativeStart {
+        #[arg(long)]
+        request_id: uuid::Uuid,
+        #[arg(long, requires = "update_launch")]
+        update_plan: Option<uuid::Uuid>,
+        #[arg(long, requires = "update_plan")]
+        update_launch: Option<uuid::Uuid>,
+    },
+    /// Stop only this exact native profile through its current-user manager.
+    NativeStop {
+        #[arg(long)]
+        request_id: uuid::Uuid,
+        #[arg(long)]
+        update_plan: Option<uuid::Uuid>,
+    },
+    /// Retire only this stopped native profile, preserving its home and data.
+    NativeRetire {
+        #[arg(long)]
+        request_id: uuid::Uuid,
+    },
+    /// Retire only this finished update worker's inactive native profile.
+    NativeWorkerRetire {
+        #[arg(long)]
+        plan_id: uuid::Uuid,
+        #[arg(long)]
+        request_id: uuid::Uuid,
+    },
+    /// Observe the owned native manager and proved connector identity.
+    NativeStatus,
+    /// Fixed service-manager entry point; not an installation or restart action.
+    #[command(hide = true)]
+    NativeServe,
     Init {
         #[arg(long, default_value = "Slack connection")]
         label: String,
@@ -121,8 +156,16 @@ enum ConfigAction {
     },
 }
 
+fn main() {
+    // The PDF text child reads one file from its input and exits. It builds no
+    // runtime, parses no other arguments and opens no installation.
+    if std::env::args().nth(1).as_deref() == Some(acp_slack_adapter::pdf_text::COMMAND) {
+        std::process::exit(acp_slack_adapter::pdf_text::child());
+    }
+    start();
+}
 #[tokio::main]
-async fn main() {
+async fn start() {
     let cli = Cli::parse();
     let show_error = cli.command.is_none() && !cli.no_browser;
     if let Err(error) = run(cli).await {
@@ -148,6 +191,44 @@ async fn run(cli: Cli) -> Result<()> {
         .home
         .context("Supply --home with this adapter installation folder")?;
     match cli.command.expect("Command checked above") {
+        Action::NativeSetup => print(acp_slack_adapter::desktop::setup(&home)?)?,
+        Action::NativeStart {
+            request_id,
+            update_plan,
+            update_launch,
+        } => {
+            let update = update_plan.zip(update_launch).map(|(plan, nonce)| {
+                acp_slack_adapter::native_manager::UpdateLaunch {
+                    plan: plan.to_string(),
+                    nonce: nonce.to_string(),
+                }
+            });
+            print(acp_slack_adapter::native_manager::start(&home, request_id, update).await?)?;
+        }
+        Action::NativeStop {
+            request_id,
+            update_plan,
+        } => {
+            let result = match update_plan {
+                Some(plan) => {
+                    acp_slack_adapter::native_manager::stop_for_update(&home, request_id, plan)
+                        .await?
+                }
+                None => acp_slack_adapter::native_manager::stop(&home, request_id).await?,
+            };
+            print(result)?
+        }
+        Action::NativeRetire { request_id } => {
+            print(acp_slack_adapter::native_manager::retire(&home, request_id).await?)?
+        }
+        Action::NativeWorkerRetire {
+            plan_id,
+            request_id,
+        } => print(acp_slack_adapter::native_update::retire_managed_worker(
+            &home, plan_id, request_id,
+        )?)?,
+        Action::NativeStatus => print(acp_slack_adapter::native_manager::status(&home).await?)?,
+        Action::NativeServe => acp_slack_adapter::server::serve_managed(home).await?,
         Action::Init {
             label,
             owner,

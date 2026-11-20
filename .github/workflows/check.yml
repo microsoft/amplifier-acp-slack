@@ -35,6 +35,7 @@ jobs:
       - run: /tmp/adapter-tests/bin/python tests/scoped_work.py
       - run: /tmp/adapter-tests/bin/python tests/followthrough.py
       - run: /tmp/adapter-tests/bin/python tests/slack_huddles.py
+      - run: /tmp/adapter-tests/bin/python tests/owner_message.py
       - run: /tmp/adapter-tests/bin/python tests/morning_reliability.py
       - run: /tmp/adapter-tests/bin/python tests/steering.py
       - run: /tmp/adapter-tests/bin/python tests/peer_awareness.py
@@ -73,6 +74,7 @@ jobs:
         working-directory: ui/tests
       - run: npm test
         working-directory: ui/tests
+      - run: node tests/native-update-ui.mjs
   native:
     strategy:
       fail-fast: false
@@ -121,12 +123,27 @@ jobs:
       - run: python tests/slack_setup.py
       - run: python tests/native_update.py
       - run: python tests/native_startup_observation.py
+      - run: python tests/slack_hook_process.py --self-test
+      - run: python tests/slack_cli_build.py
+      - run: python tests/native_cli_package.py
+      - run: python tests/native_update_process.py --self-test
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        if: startsWith(matrix.os, 'windows')
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Build pinned Windows Slack CLI with headless colour guard
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: python scripts/build-slack-cli.py --output "$RUNNER_TEMP/slack-cli-build"
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package private runtime and verify platform binary
         shell: bash
         run: |
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          python scripts/package-native.py --binary target/${{ matrix.target }}/release/acp-slack-adapter${{ matrix.suffix }} --target ${{ matrix.target }} --version "$VERSION"
+          CLI_ARGS=()
+          if [[ "${{ matrix.os }}" == windows* ]]; then CLI_ARGS=(--slack-cli-build "$RUNNER_TEMP/slack-cli-build"); fi
+          python scripts/package-native.py --binary target/${{ matrix.target }}/release/acp-slack-adapter${{ matrix.suffix }} --target ${{ matrix.target }} --version "$VERSION" "${CLI_ARGS[@]}"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: matrix.os == 'ubuntu-24.04'
         with:
@@ -144,13 +161,42 @@ jobs:
           if [[ "${{ matrix.os }}" == windows* || "${{ matrix.os }}" == macos* ]]; then EXTRA="--verify-startup"; fi
           python tests/native_launch.py --package "$ARCHIVE" --verify-setup-tool $EXTRA --result ${{ matrix.target }}-native-launch-result.json
           python tests/native_update_process.py --package "$ARCHIVE" --result ${{ matrix.target }}-native-update-result.json
+      - name: Retain bounded pinned CLI build diagnostics inside artifact root
+        if: ${{ always() && startsWith(matrix.os, 'windows') }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, stat
+          temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
+          output = pathlib.Path('slack-cli-build-diagnostics')
+          output.mkdir()
+          for folder, name in [('slack-cli-build', 'provenance.json'), ('slack-cli-build.work', 'build.stdout'), ('slack-cli-build.work', 'build.stderr')]:
+              source = temporary / folder / name
+              if not os.path.lexists(source):
+                  continue
+              info = source.lstat()
+              if not stat.S_ISREG(info.st_mode) or source.is_symlink() or info.st_size > 4 * 1024 * 1024:
+                  raise ValueError('Unexpected build diagnostic file')
+              with source.open('rb') as src:
+                  data = src.read(4 * 1024 * 1024 + 1)
+              if len(data) > 4 * 1024 * 1024:
+                  raise ValueError('Build diagnostic grew beyond bound')
+              with (output / name).open('xb') as dst:
+                  dst.write(data)
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
         with:
           name: native-slack-${{ matrix.target }}-${{ github.sha }}
           path: |
             dist/*
             *-native-launch-result.json
+            *-native-hook-cli-evidence.json
+            *-native-manager-result.json
             *-native-update-result.json
+            *-native-update-result-managed.json
+            *-native-update-result.phases.json
+            slack-cli-build-diagnostics/*
           if-no-files-found: error
   publish:
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'microsoft/amplifier-acp-slack'

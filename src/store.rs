@@ -93,12 +93,14 @@ impl Store {
                 }
             }
         }
+        crate::file_reply::initialize(&store)?;
         crate::permissions::initialize(&store)?;
         crate::followup::initialize(&store)?;
         crate::handoff::initialize(&store)?;
         crate::steering::initialize(&store)?;
         crate::public_speech::initialize(&store)?;
         crate::huddles::initialize(&store)?;
+        crate::owner_message::initialize(&store)?;
         Ok(store)
     }
     pub fn recover(&mut self) -> Result<()> {
@@ -451,10 +453,11 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for item in &mut items {
             let job = item["job_id"].as_str().unwrap_or("");
-            let mut parts=self.db.prepare("SELECT p.part,p.status,p.slack_ts,json_extract(j.trigger,'$.team'),o.channel FROM outbox_parts p JOIN outbox o ON o.id=p.outbox_id JOIN jobs j ON j.id=o.job_id WHERE j.id=?1 ORDER BY p.part")?;
+            let mut parts=self.db.prepare("SELECT p.part,p.status,p.slack_ts,json_extract(j.trigger,'$.team'),o.channel,o.thread FROM outbox_parts p JOIN outbox o ON o.id=p.outbox_id JOIN jobs j ON j.id=o.job_id WHERE j.id=?1 ORDER BY p.part")?;
             let receipts=parts.query_map([job],|r|{
-                let ts:Option<String>=r.get(2)?; let team:String=r.get(3)?;let channel:String=r.get(4)?;
-                Ok(json!({"part":r.get::<_,i64>(0)?+1,"status":r.get::<_,String>(1)?,"slack_message_id":ts,"url":ts.as_ref().map(|ts|format!("https://app.slack.com/client/{team}/{channel}?message_ts={ts}"))}))
+                let ts:Option<String>=r.get(2)?; let team:String=r.get(3)?;let channel:String=r.get(4)?;let thread:String=r.get(5)?;
+                let links=crate::links::Links::load(&self.db,&team);
+                Ok(json!({"part":r.get::<_,i64>(0)?+1,"status":r.get::<_,String>(1)?,"slack_message_id":ts,"url":ts.as_ref().map(|ts|links.message(&channel,ts,Some(thread.as_str()).filter(|t|!t.is_empty())))}))
             })?.collect::<rusqlite::Result<Vec<_>>>()?;
             if !receipts.is_empty() {
                 let delivered = receipts.iter().filter(|p| p["status"] == "sent").count();

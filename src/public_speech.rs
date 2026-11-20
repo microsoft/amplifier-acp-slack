@@ -129,6 +129,13 @@ pub fn claim(s: &mut Store, c: &Config) -> Result<Option<Outgoing>> {
     let source = source
         .map(|raw| serde_json::from_str::<Message>(&raw))
         .transpose()?;
+    // An owner message whose saved recipient, destination or installation no
+    // longer holds is withdrawn alone, before the rule below can cancel the
+    // rest of the response for a destination that is not the response's own.
+    if !crate::owner_message::claimable(&tx, c, &out.id)? {
+        tx.commit()?;
+        return Ok(None);
+    }
     let allowed = crate::huddles::delivery_current(&tx, c, &out.id)?
         && c.enabled
         && c.allows(&out.channel, "")
@@ -208,6 +215,11 @@ pub async fn pump(
             "Original huddle source or audience could not be verified; not sent",
             30_000,
         )?;
+        return Ok(true);
+    }
+    // An owner message is sent only while Slack confirms that its owner can
+    // still read its source. Anything else was settled without sending.
+    if !crate::owner_message::authorize_delivery(home, c, &out.id, client).await? {
         return Ok(true);
     }
     let metadata = {

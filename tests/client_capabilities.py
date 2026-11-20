@@ -10,13 +10,23 @@ from process_integration import SlackFixture, until, rows, count, private_json, 
 
 class InteractiveSlack(SlackFixture):
     def __init__(self):
-        super().__init__();self.approvals=[];self.updated=[];self.views=[]
+        super().__init__();self.approvals=[];self.updated=[];self.views=[];self.view_attempts=[];self.ephemeral=[];self.view_error=None;self.ephemeral_error=None
     async def api(self,request):
-        if request.method=='POST' and request.match_info['method'] in ('chat.postMessage','chat.update','views.open'):
+        if request.method=='POST' and request.match_info['method'] in ('chat.postMessage','chat.update','views.open','chat.postEphemeral'):
             body=await request.json()
             if body.get('metadata',{}).get('event_type')=='acp_work_status':
                 return await super().api(request)
+            if request.match_info['method']=='chat.postEphemeral':
+                self.ephemeral.append(body)
+                if self.ephemeral_error:
+                    error=self.ephemeral_error;self.ephemeral_error=None
+                    return web.json_response({'ok':False,'error':error})
+                return web.json_response({'ok':True,'message_ts':self.timestamp()})
             if request.match_info['method']=='views.open':
+                self.view_attempts.append(body)
+                if self.view_error:
+                    error=self.view_error;self.view_error=None
+                    return web.json_response({'ok':False,'error':error})
                 self.views.append(body);return web.json_response({'ok':True,'view':{'id':'Vfixture'}})
             if 'blocks' in body:
                 if request.match_info['method']=='chat.update':
@@ -66,22 +76,33 @@ async def main():
             return m,post
         try:
             await start()
-            await fixture.send('Dtools','callbacks check')
-            await until(lambda:any(p.get('markdown_text')=='callbacks verified' for p in fixture.posts),'client callbacks',timeout=30)
-            assert (workspace/'client-file.txt').read_text()=='first\nsecond\n';assert not (home/'no.txt').exists()
-            passed('Filesystem line ranges, cross-root and symlink rejection; terminal isolation, output, release and concurrent wait/kill')
+            if '--details-only' not in sys.argv:
+                await fixture.send('Dtools','callbacks check')
+                await until(lambda:any(p.get('markdown_text')=='callbacks verified' for p in fixture.posts),'client callbacks',timeout=30)
+                assert (workspace/'client-file.txt').read_text()=='first\nsecond\n';assert not (home/'no.txt').exists()
+                passed('Filesystem line ranges, cross-root and symlink rejection; terminal isolation, output, release and concurrent wait/kill')
             _,post=await permission('Dapproval')
             buttons=[b['elements'][0] for b in post['blocks'] if b.get('type')=='actions']
-            assert [b['text']['text'] for b in buttons]==['Allow once','Deny once','Always allow','Always reject','Cancel request']
-            assert 'remembered by the agent, not Slack' in json.dumps(post)
+            assert [b['text']['text'] for b in buttons]==['Allow this request','Deny','Remember matching action','Block matching action','Cancel request']
+            assert 'Remember covers matching requests' in json.dumps(post)
+            assert 'not the permission duration' in json.dumps(post)
+            assert 'Explicitly approved' not in json.dumps(post) and str(workspace) not in json.dumps(post)
+            assert all(len(b['text']['text'])<=30 for b in buttons)
             for override in ({'user':{'id':'UOTHER'}},{'container':{'channel_id':'Dother','message_ts':post['ts']}},{'container':{'channel_id':post['channel'],'message_ts':'wrong-message'}},{'team':{'id':'Tother'}},{'api_app_id':'Aother'}):
                 await fixture.action(post,2,**override)
                 assert count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='pending'",(post['client_msg_id'],))==1
             assert not (workspace/'approved.txt').exists()
             await fixture.action(post,0,action_id='permission_details',user={'id':'UOTHER'})
-            await asyncio.sleep(.1);assert not fixture.views
+            await until(lambda:bool(fixture.views),'private explanation for another member',timeout=2)
+            assert 'Only the person who received this request' in json.dumps(fixture.views[-1])
+            assert 'Explicitly approved' not in json.dumps(fixture.views[-1])
+            assert str(workspace) not in json.dumps(fixture.views[-1])
+            assert post['client_msg_id'] not in json.dumps(fixture.views[-1])
+            assert 'UHUMAN' not in json.dumps(fixture.views[-1])
+            assert count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='pending'",(post['client_msg_id'],))==1
+            views_before=len(fixture.views)
             await fixture.action(post,0,action_id='permission_details')
-            await until(lambda:bool(fixture.views),'private review modal')
+            await until(lambda:len(fixture.views)>views_before,'private review modal')
             assert 'Explicitly approved' in json.dumps(fixture.views[-1])
             await fixture.action(post,0)
             await until(lambda:(workspace/'approved.txt').exists(),'approved tool performed')
@@ -91,11 +112,57 @@ async def main():
             closed=next(p for p in fixture.updated if p['channel']=='Dapproval')
             assert 'Create the harmless approval-check file' in json.dumps(closed),closed
             assert 'permission_details' in json.dumps(closed) and 'acp_permission' not in json.dumps(closed)
-            assert 'not whether the action ran' in json.dumps(closed)
+            assert 'Execution is not confirmed here' in json.dumps(closed)
             views_before=len(fixture.views)
             await fixture.action(post,0,action_id='permission_details')
             await until(lambda:len(fixture.views)>views_before,'closed request details available')
             passed('Private Slack details show merged tool-call arguments only to the initiating human')
+            assert 'This request is closed' in json.dumps(fixture.views[-1])
+            assert 'Explicitly approved' in json.dumps(fixture.views[-1])
+            views_before=len(fixture.views)
+            await fixture.action(post,0,action_id='permission_details',user={'id':'UOTHER'})
+            await until(lambda:len(fixture.views)>views_before,'closed request private explanation')
+            assert 'Only the person who received this request' in json.dumps(fixture.views[-1])
+            assert 'Explicitly approved' not in json.dumps(fixture.views[-1])
+            passed('Other members get a private explanation for pending and closed cards, without request contents or a decision')
+            for actor in ('UHUMAN','UOTHER'):
+                before=len(fixture.ephemeral);attempts=len(fixture.view_attempts)
+                fixture.view_error='expired_trigger_id'
+                await fixture.action(post,0,action_id='permission_details',user={'id':actor})
+                await until(lambda:len(fixture.ephemeral)>before,'private notice when Slack rejects modal')
+                notice=fixture.ephemeral[-1]
+                assert notice['user']==actor and notice['channel']==post['channel']
+                assert ('try View request again' if actor=='UHUMAN' else 'Only the person who received this request') in notice['text']
+                assert all(value not in json.dumps(notice) for value in ('Explicitly approved',str(workspace),post['client_msg_id'],'expired_trigger_id'))
+                assert len(fixture.view_attempts)==attempts+1,'Failed modal must not be retried'
+                assert notice['mrkdwn'] is False
+            for trigger in (None,'',123):
+                before=len(fixture.ephemeral);attempts=len(fixture.view_attempts)
+                await fixture.action(post,0,action_id='permission_details',trigger_id=trigger)
+                await until(lambda:len(fixture.ephemeral)>before,'missing trigger private notice')
+                assert len(fixture.view_attempts)==attempts,'An invalid trigger must not be sent to views.open'
+            passed('Expired or absent modal triggers give one private generic notice, without retrying the modal or exposing details')
+            untouched=(len(fixture.view_attempts),len(fixture.ephemeral))
+            for override in ({'user':{'id':'UOTHER','is_bot':True}}, {'user':{}}, {'user':{'id':''}}, {'container':{'channel_id':'Dother','message_ts':post['ts']}}, {'container':{'channel_id':post['channel'],'message_ts':'wrong-message'}}, {'team':{'id':'Tother'}}, {'api_app_id':'Aother'}, {'type':'view_submission'}, {'actions':[{'action_id':'permission_details','value':post['client_msg_id']},{'action_id':'permission_details','value':post['client_msg_id']}]}, {'actions':[{'action_id':'permission_details','value':'missing-request'}]}):
+                await fixture.action(post,0,action_id='permission_details',**override)
+            await asyncio.sleep(.1)
+            assert (len(fixture.view_attempts),len(fixture.ephemeral))==untouched,'Foreign or malformed bindings must not send a modal or notice'
+            assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0]==('approved','yes')
+            passed('Foreign app, workspace, message, channel, bot and malformed callbacks remain refused without new effects')
+            before=len(fixture.ephemeral);attempts=len(fixture.view_attempts)
+            unavailable=count(home,"SELECT COUNT(*) FROM audit WHERE kind='permission_details_unavailable'")
+            fixture.view_error='internal_error';fixture.ephemeral_error='internal_error'
+            await fixture.action(post,0,action_id='permission_details')
+            await until(lambda:count(home,"SELECT COUNT(*) FROM audit WHERE kind='permission_details_unavailable'")>unavailable,'failed notice retained in audit')
+            assert len(fixture.view_attempts)==attempts+1 and len(fixture.ephemeral)==before+1
+            views_before=len(fixture.views)
+            await fixture.action(post,0,action_id='permission_details')
+            await until(lambda:len(fixture.views)>views_before,'later explicit click still opens details')
+            assert 'Explicitly approved' in json.dumps(fixture.views[-1])
+            assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0]==('approved','yes')
+            passed('Uncertain modal and notice delivery is audited once without retries; a later explicit click remains available')
+            if '--details-only' in sys.argv:
+                print(json.dumps({'passed':len(checks),'checks':checks},indent=2));return
             passed('Approval requires the initiating human and exact app/workspace/message; foreign persistent choices and replay are refused')
             (workspace/'approved.txt').unlink()
             _,post=await permission('Dalways')
@@ -105,8 +172,8 @@ async def main():
             assert rows(home,'SELECT status,option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0]==('approved','forever')
             await until(lambda:any(p.get('channel')=='Dalways' for p in fixture.updated),'persistent allow card closed')
             closed=next(p for p in fixture.updated if p['channel']=='Dalways')
-            assert 'Always allow selected' in json.dumps(closed)
-            assert 'agent owns the remembered rule and its scope' in json.dumps(closed)
+            assert 'Remember matching action selected' in json.dumps(closed)
+            assert "Manage the rule in the agent's settings" in json.dumps(closed)
             (workspace/'approved.txt').unlink()
             await fixture.action(post,2)
             assert not (workspace/'approved.txt').exists()
@@ -119,7 +186,7 @@ async def main():
             assert rows(home,'SELECT option_id FROM permissions WHERE id=?',(post['client_msg_id'],))[0][0]=='never'
             await until(lambda:any(p.get('channel')=='Dalways' and p.get('markdown_text')=='permission '+json.dumps({'outcome':'selected','optionId':'never'}) for p in fixture.posts),'exact persistent rejection returned to peer')
             assert not (workspace/'approved.txt').exists()
-            await until(lambda:any(p.get('channel')=='Dalways' and 'Always reject selected' in json.dumps(p) for p in fixture.updated),'persistent reject card closed')
+            await until(lambda:any(p.get('channel')=='Dalways' and 'Block matching action selected' in json.dumps(p) for p in fixture.updated),'persistent reject card closed')
             passed('Always choices return exact endpoint IDs; the agent owns remembered scope and the connector grants no inferred future permission')
             _,post=await permission('Ddenial');await fixture.action(post,1)
             await until(lambda:count(home,"SELECT COUNT(*) FROM permissions WHERE id=? AND status='denied'",(post['client_msg_id'],))==1,'denial recorded')
@@ -198,7 +265,7 @@ async def main():
             assert second_row[1]-second_row[0]==remaining
             assert 0 < remaining < 2500
             label='less than a second' if remaining<1000 else ('1 second' if remaining<2000 else f'{remaining//1000} seconds')
-            assert f'About {label} remains' in json.dumps(second),second
+            assert f'Respond within about {label}.' in json.dumps(second),second
             await until(lambda:any(p.get('channel')=='Dsuccessive' for p in fixture.posts),'successive permissions finish')
             output=next(p['markdown_text'] for p in fixture.posts if p.get('channel')=='Dsuccessive')
             outcomes=json.loads(output.removeprefix('successive permissions '))

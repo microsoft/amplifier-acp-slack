@@ -53,6 +53,7 @@ async fn run(home: PathBuf, mut changes: tokio::sync::watch::Receiver<u64>) -> R
     client.verify(&c).await?;
     let store = Arc::new(Mutex::new(store::Store::open(&home)?));
     store.lock().unwrap().bind_identity(&c)?;
+    crate::links::remember(&store.lock().unwrap(), client.workspace_url().as_deref())?;
     store.lock().unwrap().recover()?;
     store.lock().unwrap().apply_scope(&c)?;
     runtime_status(

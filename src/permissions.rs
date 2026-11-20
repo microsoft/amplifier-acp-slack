@@ -233,68 +233,347 @@ pub fn action(store: &Store, c: &Config, payload: &Value) -> Result<()> {
     )
 }
 pub async fn details(home: &Path, c: &Config, slack: &Slack, payload: &Value) -> Result<()> {
-    let view = {
+    // A neutral explanation still requires an authentic click on this exact card.
+    // It grants neither request visibility nor permission to decide for its recipient.
+    ensure!(
+        payload["type"] == "block_actions"
+            && payload["actions"].as_array().is_some_and(|a| a.len() == 1)
+            && payload["actions"][0]["action_id"] == "permission_details"
+            && payload["team"]["id"] == c.slack.team_id
+            && payload["api_app_id"] == c.slack.app_id
+            && payload["user"]["id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+            && matches!(
+                payload["user"].get("is_bot"),
+                None | Some(Value::Bool(false))
+            ),
+        "Invalid permission details interaction"
+    );
+    let (view, notice) = {
         let store = Store::open(home)?;
         let id = payload["actions"][0]["value"]
             .as_str()
             .context("Missing request")?;
         let p = current(&store, id)?.context("Permission not found")?;
         ensure!(
-            payload["team"]["id"] == c.slack.team_id
-                && payload["api_app_id"] == c.slack.app_id
-                && payload["user"]["id"] == p["approver"]
-                && payload["container"]["channel_id"] == p["channel"]
+            payload["container"]["channel_id"] == p["channel"]
                 && payload["container"]["message_ts"] == p["slack_ts"]
-                && p["slack_ts"].is_string()
-                && payload["user"].get("is_bot") != Some(&json!(true)),
-            "Permission details belong to another person or conversation"
+                && p["slack_ts"].is_string(),
+            "Permission details belong to another conversation"
         );
-        let raw = serde_json::to_string_pretty(&p["request"]["toolCall"])?;
-        let text: Vec<char> = raw.chars().take(24000).collect();
-        let mut blocks = vec![
-            json!({"type":"section","text":{"type":"plain_text","text":format!("Status: {}. {}",p["status"].as_str().unwrap_or("closed"),if p["status"] == "pending" {"Close this window to decide on the original request. Allow once applies only to this request."} else {"This request is closed. These are the original action details; approval is not an execution result."})}}),
-        ];
-        if has_remembered_options(&p["request"]["options"]) {
-            blocks.push(json!({"type":"section","text":{"type":"plain_text","text":REMEMBERED_OPTIONS_HELP}}));
+        if payload["user"]["id"] == p["approver"] {
+            (
+                details_view(&p),
+                "If the request window didn't open, try View request again.",
+            )
+        } else {
+            let notice = "Only the person who received this request can view its details.";
+            (
+                json!({"type":"modal","title":{"type":"plain_text","text":"Private request"},"close":{"type":"plain_text","text":"Close"},"blocks":[section(notice)]}),
+                notice,
+            )
         }
-        for chunk in text.chunks(2800) {
-            blocks.push(json!({"type":"section","text":{"type":"plain_text","text":chunk.iter().collect::<String>()}}));
-        }
-        if raw.chars().count() > 24000 {
-            blocks.push(json!({"type":"section","text":{"type":"plain_text","text":"Details shortened. Do not approve unless this shows enough information to understand the action. The connector owner can inspect the complete request in its dashboard."}}));
-        }
-        json!({"type":"modal","title":{"type":"plain_text","text":"Review agent action"},"close":{"type":"plain_text","text":"Back to request"},"blocks":blocks})
     };
+    if let Some(trigger) = payload["trigger_id"].as_str().filter(|s| !s.is_empty())
+        && slack
+            .call(
+                "views.open",
+                json!({"trigger_id":trigger,"view":view}),
+                false,
+            )
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+    // An expired or missing trigger cannot open a modal. Attempt one private,
+    // content-free notice to the clicking member; never retry either delivery.
     slack
         .call(
-            "views.open",
-            json!({"trigger_id":payload["trigger_id"],"view":view}),
+            "chat.postEphemeral",
+            json!({"channel":payload["container"]["channel_id"],"user":payload["user"]["id"],"text":notice,"mrkdwn":false}),
             false,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Could not open permission details"))?;
+        .map_err(|_| anyhow::anyhow!("Could not deliver the private permission details notice"))?;
     Ok(())
 }
+// Display-only helpers. Producer text is inert plain_text, never parsed into
+// approval authority. Raw arguments, locations and scope stay in the existing
+// requester-only modal, not the originating (potentially public) Slack room.
 fn summary(tool: &Value) -> String {
-    let title = tool["title"].as_str().unwrap_or("Agent tool request");
-    let mut text = format!(
-        "{}\nType: {}",
-        title,
-        tool["kind"].as_str().unwrap_or("other")
-    );
-    // Full details are private to the authenticated management view. Only a
-    // supplied description and locations appear in the originating Slack room.
-    for location in tool["locations"].as_array().into_iter().flatten().take(8) {
-        if let Some(path) = location["path"].as_str() {
-            text.push_str(&format!("\nFile: {path}"));
-        }
-    }
-    text.chars().take(1600).collect()
+    tool["title"]
+        .as_str()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("Agent action")
+        .chars()
+        .take(1600)
+        .collect()
+}
+fn section(text: impl Into<String>) -> Value {
+    json!({"type":"section","text":{"type":"plain_text","text":text.into()}})
 }
 fn details_button(id: &str) -> Value {
-    json!({"type":"section","text":{"type":"plain_text","text":"Action details are available to the person who was asked."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}})
+    json!({"type":"section","text":{"type":"plain_text","text":"View the request details privately."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"View request"},"value":id}})
 }
-const REMEMBERED_OPTIONS_HELP: &str = "Always choices are offered and remembered by the agent, not Slack. Review the agent's stated scope before deciding; manage or revoke remembered rules in the agent's settings.";
+const REMEMBERED_OPTIONS_HELP: &str = "Remember covers matching requests. Different commands can still ask. To stop individual prompts, choose Automatic in your agent's approval settings, when supported.";
+const DETAILS_LIMIT: usize = 24000;
+const DETAILS_SHORTENED: &str = "Some details are shortened. Do not approve unless you can understand the complete request. The connector owner can inspect the full request in its dashboard.";
+
+fn option_label(option: &Value, options: &[Value], index: usize) -> String {
+    let label = match option["kind"].as_str() {
+        Some("allow_once") => "Allow this request",
+        Some("reject_once") => "Deny",
+        Some("allow_always") => "Remember matching action",
+        Some("reject_always") => "Block matching action",
+        _ => "Review choice",
+    };
+    // Do not collapse multiple producer choices of the same kind. The number
+    // matches the complete, unshortened choice wording in the private modal.
+    if options
+        .iter()
+        .filter(|v| v["kind"] == option["kind"])
+        .count()
+        > 1
+    {
+        format!("{label} · {}", index + 1)
+    } else {
+        label.into()
+    }
+}
+
+fn named_fields(value: &Value, depth: usize) -> String {
+    let indent = "  ".repeat(depth.min(8));
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) if depth < 8 => items
+            .iter()
+            .map(|v| format!("{indent}• {}", named_fields(v, depth + 1)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(fields) if depth < 8 => fields
+            .iter()
+            .map(|(key, v)| {
+                let separator = if v.is_object() || v.is_array() {
+                    "\n"
+                } else {
+                    " "
+                };
+                format!("{indent}{key}:{separator}{}", named_fields(v, depth + 1))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn readable_text(text: &str) -> (String, Option<i64>) {
+    // ACP text remains text. A fully valid JSON object at the end is display
+    // data only: show every field without inventing semantics from its labels.
+    let split = text.rsplit_once("\n\n").unwrap_or(("", text));
+    match serde_json::from_str::<Value>(split.1) {
+        Ok(mut value @ Value::Object(_)) => {
+            // Only format an explicit numeric Expires at field for reading.
+            // This does not set or validate any authority/deadline. Keep the
+            // original epoch in the private technical section.
+            let epoch = value["Expires at"]
+                .as_i64()
+                .filter(|epoch| (0..=253402300799).contains(epoch));
+            if let Some(epoch) = epoch
+                && let Ok(date) = time::OffsetDateTime::from_unix_timestamp(epoch)
+            {
+                value["Expires at"] = json!(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                    date.year(),
+                    date.month() as u8,
+                    date.day(),
+                    date.hour(),
+                    date.minute(),
+                    date.second()
+                ));
+            }
+            let fields = named_fields(&value, 0);
+            if split.0.is_empty() {
+                (fields, epoch)
+            } else {
+                (format!("{}\n\n{fields}", split.0), epoch)
+            }
+        }
+        _ => (text.into(), None),
+    }
+}
+
+fn private_details(tool: &Value) -> (Vec<String>, Value, Vec<i64>) {
+    let mut readable = Vec::new();
+    let mut epochs = Vec::new();
+    let mut remaining = tool.clone();
+    if tool["title"]
+        .as_str()
+        .is_some_and(|title| title.chars().count() <= 1600)
+    {
+        remaining.as_object_mut().unwrap().remove("title");
+    }
+    if let Some(content) = tool["content"].as_array() {
+        let mut unrendered = Vec::new();
+        for item in content {
+            if item["type"] == "content"
+                && item["content"]["type"] == "text"
+                && let Some(text) = item["content"]["text"].as_str()
+            {
+                if !text.trim().is_empty() {
+                    let (text, epoch) = readable_text(text);
+                    readable.push(text);
+                    if let Some(epoch) = epoch {
+                        epochs.push(epoch);
+                    }
+                }
+                // Unknown annotations/fields are not silently discarded.
+                let mut extra = item.clone();
+                extra.as_object_mut().unwrap().remove("type");
+                let nested = extra["content"].as_object_mut().unwrap();
+                nested.remove("type");
+                nested.remove("text");
+                if nested.is_empty() {
+                    extra.as_object_mut().unwrap().remove("content");
+                }
+                if extra.as_object().is_some_and(|v| !v.is_empty()) {
+                    unrendered.push(extra);
+                }
+            } else {
+                unrendered.push(item.clone());
+            }
+        }
+        if unrendered.is_empty() {
+            remaining.as_object_mut().unwrap().remove("content");
+        } else {
+            remaining["content"] = json!(unrendered);
+        }
+    }
+    (readable, remaining, epochs)
+}
+
+fn details_view(p: &Value) -> Value {
+    let tool = &p["request"]["toolCall"];
+    let pending = p["status"] == "pending";
+    let mut blocks = vec![
+        section(summary(tool)),
+        section(if pending {
+            "Waiting for your decision. Close this view to choose on the original message. Any permission duration is described by the agent below."
+        } else {
+            "This request is closed. These are the details originally supplied by the agent. Approval records permission, not whether the action ran or succeeded."
+        }),
+    ];
+    let mut budget = DETAILS_LIMIT;
+    let mut shortened = false;
+    let mut append = |blocks: &mut Vec<Value>, text: &str| {
+        let chars: Vec<_> = text.chars().take(budget).collect();
+        if chars.len() < text.chars().count() {
+            shortened = true;
+        }
+        budget -= chars.len();
+        for chunk in chars.chunks(2800) {
+            if blocks.len() >= 40 {
+                shortened = true;
+                break;
+            }
+            blocks.push(section(chunk.iter().collect::<String>()));
+        }
+    };
+    let (readable, technical, epochs) = private_details(tool);
+    let mut extra_options = Vec::new();
+    if readable.is_empty() {
+        append(
+            &mut blocks,
+            "The agent supplied technical details only. Review them below before deciding.",
+        );
+    } else {
+        append(&mut blocks, "Request details supplied by the agent");
+        for text in readable {
+            append(&mut blocks, &text);
+        }
+    }
+    if let Some(options) = p["request"]["options"].as_array() {
+        if has_remembered_options(&p["request"]["options"]) {
+            append(&mut blocks, REMEMBERED_OPTIONS_HELP);
+        }
+        append(
+            &mut blocks,
+            "What your choice means — full wording from the agent",
+        );
+        for (index, option) in options.iter().enumerate() {
+            let name = option["name"].as_str().unwrap_or("Unnamed choice");
+            let label = option_label(option, options, index);
+            let text = if name == label {
+                format!("{}. {name}", index + 1)
+            } else {
+                format!("{}. {label}\n{name}", index + 1)
+            };
+            append(&mut blocks, &text);
+            let mut extra = option.clone();
+            if let Some(fields) = extra.as_object_mut() {
+                for name in ["optionId", "kind", "name"] {
+                    fields.remove(name);
+                }
+                if !fields.is_empty() {
+                    extra_options.push(json!({"choice":index+1,"fields":extra}));
+                }
+            }
+        }
+    }
+    if !epochs.is_empty()
+        || !extra_options.is_empty()
+        || technical.as_object().is_none_or(|v| !v.is_empty())
+    {
+        append(&mut blocks, "Technical details");
+        append(
+            &mut blocks,
+            &serde_json::to_string_pretty(&technical).unwrap_or_default(),
+        );
+        if !epochs.is_empty() {
+            append(
+                &mut blocks,
+                &format!(
+                    "Original numeric Expires at values (Unix seconds): {}",
+                    json!(epochs)
+                ),
+            );
+        }
+        if !extra_options.is_empty() {
+            append(
+                &mut blocks,
+                &format!(
+                    "Additional choice fields: {}",
+                    serde_json::to_string_pretty(&extra_options).unwrap_or_default()
+                ),
+            );
+        }
+    }
+    if shortened {
+        blocks.push(section(DETAILS_SHORTENED));
+    }
+    json!({"type":"modal","title":{"type":"plain_text","text":"Review request"},"close":{"type":"plain_text","text":"Back to request"},"blocks":blocks})
+}
+
+fn pending_blocks(id: &str, tool: &Value, options: &[Value], remaining: i64) -> Vec<Value> {
+    let mut blocks = vec![
+        section(format!("Approval needed\n{}", summary(tool))),
+        details_button(id),
+        section(format!(
+            "Respond within about {}. This is the time to answer, not the permission duration. Requests in this turn share the same response time.",
+            remaining_wait_label(remaining)
+        )),
+    ];
+    if has_remembered_options(&json!(options)) {
+        blocks.push(section(REMEMBERED_OPTIONS_HELP));
+    }
+    for (index, option) in options.iter().enumerate() {
+        let label = option_label(option, options, index);
+        blocks.push(json!({"type":"actions","elements":[{"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":label},"accessibility_label":label,"value":format!("{id}:{index}")}]}));
+    }
+    blocks.push(json!({"type":"actions","elements":[{"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":"Cancel request"},"value":format!("{id}:cancel")}]}));
+    blocks
+}
 
 fn has_remembered_options(options: &Value) -> bool {
     options.as_array().is_some_and(|options| {
@@ -315,14 +594,12 @@ fn closed_card(
 ) -> (String, Vec<Value>) {
     let outcome = match (status, selected_kind) {
         ("approved", Some("allow_always")) => {
-            "Always allow selected. The agent owns the remembered rule and its scope. This records permission, not whether the action ran or succeeded."
+            "Remember matching action selected. Manage the rule in the agent's settings."
         }
         ("denied", Some("reject_always")) => {
-            "Always reject selected. The agent owns the remembered rule and its scope. This request granted no permission."
+            "Block matching action selected. No permission granted."
         }
-        ("approved", _) => {
-            "Approved. This records permission, not whether the action ran or succeeded."
-        }
+        ("approved", _) => "Approved for this request. Execution is not confirmed here.",
         ("denied", _) => "Declined. This request granted no permission.",
         ("expired", _) => {
             "Expired without approval. Ask the agent to try again when you are ready; a fresh request is required."
@@ -333,8 +610,7 @@ fn closed_card(
     (
         text.clone(),
         vec![
-            json!({"type":"section","text":{"type":"plain_text","text":text}}),
-            details_button(id),
+            json!({"type":"section","text":{"type":"plain_text","text":text},"accessory":details_button(id)["accessory"]}),
         ],
     )
 }
@@ -544,21 +820,7 @@ pub async fn request(
     };
     crate::work_status::changed(home);
     let slack = Slack::new(c, c.secrets(home)?)?;
-    let mut buttons:Vec<Value>=options.iter().enumerate().map(|(i,o)|json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":o["name"].as_str().unwrap().chars().take(60).collect::<String>()},"value":format!("{id}:{i}")})).collect();
-    buttons.push(json!({"type":"button","action_id":"acp_permission","text":{"type":"plain_text","text":"Cancel request"},"value":format!("{id}:cancel")}));
-    // Slack requires action_id uniqueness within a block. Each option gets its own block.
-    let mut blocks = vec![
-        json!({"type":"section","text":{"type":"plain_text","text":format!("Permission needed\n{}\nAbout {} remains to decide. Approval requests in this turn share the same time budget. Allow once applies only to this request.",summary(&params["toolCall"]),remaining_wait_label(remaining))}}),
-    ];
-    blocks.push(json!({"type":"section","text":{"type":"plain_text","text":"Review the action details privately before deciding."},"accessory":{"type":"button","action_id":"permission_details","text":{"type":"plain_text","text":"Review details"},"value":id}}));
-    if has_remembered_options(&body["options"]) {
-        blocks.push(
-            json!({"type":"section","text":{"type":"plain_text","text":REMEMBERED_OPTIONS_HELP}}),
-        );
-    }
-    for button in buttons {
-        blocks.push(json!({"type":"actions","elements":[button]}));
-    }
+    let blocks = pending_blocks(&id, &params["toolCall"], &options, remaining);
     let mut post = json!({"channel":channel,"client_msg_id":id,"text":"Agent permission needs your decision","blocks":blocks,"metadata":{"event_type":"acp_permission","event_payload":{"id":id}},"unfurl_links":false,"unfurl_media":false});
     if !thread.is_empty() {
         post["thread_ts"] = json!(thread);
@@ -615,13 +877,173 @@ mod tests {
         assert!(
             closed_card("id", "approved", &tool, None)
                 .0
-                .contains("not whether the action ran")
+                .contains("Execution is not confirmed here")
         );
         assert!(
             closed_card("id", "expired", &tool, None)
                 .0
                 .contains("fresh request")
         );
+    }
+    fn example_permission() -> Value {
+        let scope = json!({"Changes":["Change file-access settings"],"Scopes":["local"],"Applies to":"This conversation only, until Stop, revocation, or expiry.","Expires at":1794868606});
+        json!({"status":"pending","request":{
+            "toolCall":{"toolCallId":"capability:example","title":"Allow configuration changes?","kind":"other","content":[{"type":"content","content":{"type":"text","text":format!("Approval-flow check only. Request temporary permission for this conversation's local file-access settings for two minutes. Do not change settings or read/write files. Revoke this exact grant after approval.\n\n{scope}")}}]},
+            "options":[{"optionId":"once-exact","kind":"allow_once","name":"Allow this request"},{"optionId":"deny-exact","kind":"reject_once","name":"Deny"},{"optionId":"always-exact","kind":"allow_always","name":"Always allow matching requests across this agent's chats"}]
+        }})
+    }
+    #[test]
+    fn permission_card_and_modal_render_fixture() {
+        let permission = example_permission();
+        let options = permission["request"]["options"].as_array().unwrap();
+        let pending = pending_blocks(
+            "request",
+            &permission["request"]["toolCall"],
+            options,
+            900000,
+        );
+        let card = json!(pending).to_string();
+        assert!(card.contains("not the permission duration"));
+        assert!(!card.contains("Type: other"));
+        assert!(!card.contains("file-access settings"));
+        let buttons: Vec<_> = pending
+            .iter()
+            .filter(|v| v["type"] == "actions")
+            .map(|v| &v["elements"][0])
+            .collect();
+        assert_eq!(
+            buttons
+                .iter()
+                .map(|v| v["text"]["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Allow this request",
+                "Deny",
+                "Remember matching action",
+                "Cancel request"
+            ]
+        );
+        for (index, button) in buttons.iter().take(3).enumerate() {
+            assert_eq!(button["value"], format!("request:{index}"));
+            assert_eq!(button["action_id"], "acp_permission");
+            assert!(button["text"]["text"].as_str().unwrap().chars().count() <= 30);
+            assert_eq!(button["accessibility_label"], button["text"]["text"]);
+        }
+        let modal = details_view(&permission);
+        let text = modal["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"]["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Changes:\n  • Change file-access settings"));
+        assert!(text.contains("Applies to: This conversation only"));
+        assert!(text.contains("2026-11-16 22:36:46 UTC"));
+        assert!(text.contains("Original numeric Expires at values (Unix seconds): [1794868606]"));
+        assert!(text.contains("Always allow matching requests across this agent's chats"));
+        assert_eq!(text.matches("Approval-flow check only").count(), 1);
+        assert!(!text.contains("\\n"));
+        let (_, approved) = closed_card(
+            "request",
+            "approved",
+            &permission["request"]["toolCall"],
+            Some("allow_once"),
+        );
+        println!(
+            "PERMISSION_UI_RENDER {}",
+            json!({"pending":pending,"modal":modal,"approved":approved,"scope":"Locally generated Block Kit, not a real Slack screenshot"})
+        );
+    }
+    #[test]
+    fn private_details_preserve_unknown_data_and_malformed_text_without_public_leaks() {
+        let mut p = example_permission();
+        p["request"]["toolCall"]["rawInput"] = json!({"secret":"PRIVATE_SECRET"});
+        p["request"]["toolCall"]["title"] =
+            json!(format!("{} IMPORTANT_TITLE_TAIL", "x".repeat(1700)));
+        p["request"]["options"][0]["futureRisk"] = json!("PRIVATE_CHOICE_RISK");
+        p["request"]["toolCall"]["locations"] = json!([{"path":"/private/PRIVATE_PATH"}]);
+        p["request"]["toolCall"]["content"][0]["content"]["annotations"] =
+            json!({"extra":"PRIVATE_ANNOTATION"});
+        p["request"]["toolCall"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"future-content","risk":"PRIVATE_RISK"}));
+        p["request"]["toolCall"]["content"].as_array_mut().unwrap().push(json!({"type":"content","content":{"type":"text","text":"Literal <@everyone> & café 🛟\n\n{malformed JSON"}}));
+        let modal = details_view(&p);
+        let raw = modal.to_string();
+        for marker in [
+            "PRIVATE_SECRET",
+            "IMPORTANT_TITLE_TAIL",
+            "PRIVATE_CHOICE_RISK",
+            "PRIVATE_PATH",
+            "PRIVATE_ANNOTATION",
+            "PRIVATE_RISK",
+            "<@everyone>",
+            "café 🛟",
+            "{malformed JSON",
+        ] {
+            assert!(raw.contains(marker), "{marker}");
+        }
+        for block in modal["blocks"].as_array().unwrap() {
+            assert_eq!(block["text"]["type"], "plain_text");
+        }
+        let public = json!(pending_blocks(
+            "id",
+            &p["request"]["toolCall"],
+            p["request"]["options"].as_array().unwrap(),
+            1000
+        ))
+        .to_string();
+        assert!(!public.contains("PRIVATE_"));
+        assert!(!public.contains("<@everyone>"));
+    }
+    #[test]
+    fn custom_choices_keep_distinct_positions_and_full_private_wording() {
+        let mut p = example_permission();
+        p["request"]["options"] = json!([
+            {"optionId":"narrow","kind":"allow_once","name":"Only allow the selected private file α"},
+            {"optionId":"broad","kind":"allow_once","name":"Allow this request including its private folder β"},
+            {"optionId":"never","kind":"reject_always","name":"Never allow this exact scope again"}
+        ]);
+        let opts = p["request"]["options"].as_array().unwrap();
+        let blocks = pending_blocks("id", &p["request"]["toolCall"], opts, 1000);
+        let buttons: Vec<_> = blocks.iter().filter(|b| b["type"] == "actions").collect();
+        assert_eq!(
+            buttons[0]["elements"][0]["text"]["text"],
+            "Allow this request · 1"
+        );
+        assert_eq!(
+            buttons[1]["elements"][0]["text"]["text"],
+            "Allow this request · 2"
+        );
+        assert_eq!(buttons[1]["elements"][0]["value"], "id:1");
+        let modal = details_view(&p).to_string();
+        for option in opts {
+            assert!(modal.contains(option["name"].as_str().unwrap()));
+        }
+        assert!(!json!(blocks).to_string().contains("private file"));
+    }
+    #[test]
+    fn private_details_are_bounded_with_explicit_truncation_and_utf8_safe_sections() {
+        let mut p = example_permission();
+        p["request"]["toolCall"]["content"] =
+            json!([{"type":"content","content":{"type":"text","text":"🛟".repeat(25000)}}]);
+        let modal = details_view(&p);
+        let blocks = modal["blocks"].as_array().unwrap();
+        assert!(modal.to_string().contains(DETAILS_SHORTENED));
+        assert!(blocks.len() <= 41);
+        for block in blocks {
+            assert!(block["text"]["text"].as_str().unwrap().chars().count() <= 3000);
+        }
+        p["request"]["toolCall"]["content"] = json!(
+            (0..500)
+                .map(|_| json!({"type":"content","content":{"type":"text","text":"short"}}))
+                .collect::<Vec<_>>()
+        );
+        let modal = details_view(&p);
+        assert!(modal["blocks"].as_array().unwrap().len() <= 41);
+        assert!(modal.to_string().contains(DETAILS_SHORTENED));
     }
     #[test]
     fn pending_human_decision_survives_peer_reply_and_preserves_requester() {

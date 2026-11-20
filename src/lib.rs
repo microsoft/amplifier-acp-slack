@@ -11,11 +11,14 @@ pub mod driver;
 pub mod elicitation;
 pub mod error;
 pub mod identity;
+pub mod links;
 pub mod media;
 mod message_content;
 pub mod model;
+pub mod pdf_text;
 pub mod permissions;
 pub mod process;
+mod projection;
 pub mod provisioning;
 pub mod questions;
 pub mod relocation;
@@ -29,6 +32,7 @@ pub mod updates;
 pub mod views;
 pub mod work_status;
 
+pub mod file_reply;
 pub mod followup;
 
 pub mod delivery_recovery;
@@ -36,6 +40,8 @@ pub mod delivery_recovery;
 pub mod handoff;
 
 pub mod huddles;
+
+pub mod owner_message;
 
 pub mod reconnect;
 
@@ -49,6 +55,7 @@ pub mod public_speech;
 
 pub mod connection;
 
+pub mod native_manager;
 pub mod native_update;
 
 pub mod submissions;

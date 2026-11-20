@@ -138,10 +138,25 @@ fn status_creation_updates_and_deletion_never_change_conversation() {
 
 #[tokio::test]
 async fn automatic_approvals_survive_activity_writes_and_still_reject_stale_sources() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+    struct ActivityWriter {
+        rounds: Option<SyncSender<usize>>,
+        results: Option<Receiver<(usize, anyhow::Result<()>)>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl ActivityWriter {
+        fn finish(&mut self) -> std::thread::Result<()> {
+            // Release either rendezvous before joining, also on caller panic.
+            self.rounds.take();
+            self.results.take();
+            self.thread.take().map_or(Ok(()), |thread| thread.join())
+        }
+    }
+    impl Drop for ActivityWriter {
+        fn drop(&mut self) {
+            let _ = self.finish();
+        }
+    }
     let home = tempfile::tempdir().unwrap();
     let mut c = config();
     c.acp.client.approvals_required = false;
@@ -152,29 +167,66 @@ async fn automatic_approvals_survive_activity_writes_and_still_reject_stale_sour
     let job = s.claim(&attention()).unwrap().unwrap();
     let input = json!({"job_id":job.id,"conversation":{"context":job.context,"channel":first.channel,"thread":first.thread},"trigger":first});
     let params = json!({"sessionId":"session","toolCall":{"toolCallId":"tool","title":"Build"},"options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]});
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = done.clone();
     let other = Store::open(home.path()).unwrap();
-    let writer = std::thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            other
-                .audit("activity_fixture", json!({"working":true}))
-                .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1));
+    let (round_tx, round_rx) = sync_channel(0);
+    let (result_tx, result_rx) = sync_channel(0);
+    let thread = std::thread::spawn(move || {
+        while let Ok(round) = round_rx.recv() {
+            let result = other.audit("activity_fixture", json!({"working":true,"round":round}));
+            if result_tx.send((round, result)).is_err() {
+                break;
+            }
         }
     });
+    let mut writer = ActivityWriter {
+        rounds: Some(round_tx),
+        results: Some(result_rx),
+        thread: Some(thread),
+    };
     let mut outcomes = Vec::new();
-    for _ in 0..100 {
-        outcomes.push(
+    let mut dispatch_error = None;
+    for round in 0..100 {
+        if let Err(error) = writer.rounds.as_ref().unwrap().send(round) {
+            dispatch_error = Some((round, error));
+            break;
+        }
+        // Both operations may run now. Finish both before the next pair, so
+        // this tests contention without assuming fairness during a hot loop.
+        let permission =
             acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)
-                .await,
-        );
+                .await;
+        let activity = writer.results.as_ref().unwrap().recv();
+        let connected = activity.is_ok();
+        outcomes.push((round, permission, activity));
+        if !connected {
+            break;
+        }
     }
-    done.store(true, Ordering::Relaxed);
-    writer.join().unwrap();
-    for outcome in outcomes {
-        assert_eq!(outcome.unwrap()["outcome"]["outcome"], "selected");
-    }
+    let joined = writer.finish();
+    let first_failure = outcomes.iter().find(|(round, permission, activity)| {
+        !permission
+            .as_ref()
+            .is_ok_and(|value| value["outcome"]["outcome"] == "selected")
+            || !activity
+                .as_ref()
+                .is_ok_and(|(returned, result)| returned == round && result.is_ok())
+    });
+    assert!(
+        joined.is_ok()
+            && dispatch_error.is_none()
+            && outcomes.len() == 100
+            && first_failure.is_none(),
+        "Paired activity/permission failure: joined={joined:?}, dispatch={dispatch_error:?}, first={first_failure:?}, all={outcomes:?}"
+    );
+    let activity_rounds: Vec<i64> = s
+        .db
+        .prepare("SELECT json_extract(data,'$.round') FROM audit WHERE kind='activity_fixture' ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(activity_rounds, (0..100).collect::<Vec<_>>());
     s.ingest("followup", &message("2.000001", "How is it going?"), true)
         .unwrap();
     let live = acp_slack_adapter::permissions::request(&c, home.path(), &input, "session", &params)

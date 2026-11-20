@@ -26,6 +26,8 @@ struct FakeSlack {
     history: HashMap<String, Vec<Value>>,
     replies: HashMap<(String, String), Vec<Value>>,
     calls: Vec<(String, String)>,
+    files: HashMap<String, Value>,
+    document: Vec<u8>,
     unavailable_members: bool,
     unavailable_replies: bool,
     reaction_writes: Vec<Value>,
@@ -54,6 +56,7 @@ async fn slack_api(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let value = match method.as_str() {
+        "files.info" => json!({"ok":true,"file":fake.files.get(&args["file"])}),
         "reactions.get" => {
             let item = fake
                 .history
@@ -205,6 +208,12 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let router = Router::new()
             .route("/api/{method}", get(slack_api).post(slack_write))
+            .route(
+                "/download",
+                get(|State(f): State<Arc<Mutex<FakeSlack>>>| async move {
+                    f.lock().unwrap().document.clone()
+                }),
+            )
             .with_state(fake.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -709,6 +718,65 @@ async fn thread_orientation_contains_parent_predecessor_latest_parent_and_thread
 }
 
 #[tokio::test]
+async fn results_carry_the_address_slack_gives_out_once_the_workspace_is_known() {
+    let f = Fixture::new().await;
+    {
+        let mut fake = f.fake.lock().unwrap();
+        let mut root = message("1000.000002", "UBOT", "The answer that opened this thread");
+        root["thread_ts"] = "1000.000002".into();
+        root["reply_count"] = 1.into();
+        let mut reply = message("1000.000004", "UOWNER", "A reply in the thread");
+        reply["thread_ts"] = "1000.000002".into();
+        fake.history.insert(
+            "CSHARED".into(),
+            vec![
+                message("1000.000001", "UOWNER", "A message in the channel"),
+                root.clone(),
+            ],
+        );
+        fake.replies
+            .insert(("CSHARED".into(), "1000.000002".into()), vec![root, reply]);
+    }
+    let read = json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED"});
+    let (_, before) = f.query(read.clone()).await;
+    assert_eq!(
+        before["messages"][0]["url"],
+        "https://app.slack.com/client/TTEST/CSHARED?message_ts=1000.000001"
+    );
+    acp_slack_adapter::links::remember(
+        &Store::open(f.home.path()).unwrap(),
+        Some("https://example-team.slack.com/"),
+    )
+    .unwrap();
+    let (_, channel) = f.query(read).await;
+    assert_eq!(
+        channel["messages"][0]["url"],
+        "https://example-team.slack.com/archives/CSHARED/p1000000001"
+    );
+    assert_eq!(
+        channel["messages"][1]["url"],
+        "https://example-team.slack.com/archives/CSHARED/p1000000002?thread_ts=1000.000002&cid=CSHARED"
+    );
+    let (_, thread) = f
+        .query(json!({"operation":"read","access":{"mode":"owner"},"conversation_id":"CSHARED","thread_id":"1000.000002"}))
+        .await;
+    assert_eq!(
+        thread["messages"][1]["url"],
+        "https://example-team.slack.com/archives/CSHARED/p1000000004?thread_ts=1000.000002&cid=CSHARED"
+    );
+    let (_, list) = f
+        .query(json!({"operation":"list","access":{"mode":"owner"}}))
+        .await;
+    assert!(
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["url"] == "https://example-team.slack.com/archives/CSHARED" })
+    );
+}
+
+#[tokio::test]
 async fn mcp_requires_grant_and_exposes_scoped_tools_with_current_permissions() {
     let f = Fixture::new().await;
     let request = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}});
@@ -729,7 +797,7 @@ async fn mcp_requires_grant_and_exposes_scoped_tools_with_current_permissions() 
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
     let search = tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -1708,4 +1776,157 @@ async fn reactions_are_current_scoped_and_writes_only_use_the_bots_identity() {
         "{r}"
     );
     assert_eq!(f.fake.lock().unwrap().reaction_writes.len(), 1);
+}
+
+#[tokio::test]
+async fn document_read_reconstructs_full_utf8_only_from_current_source() {
+    let f = Fixture::new().await;
+    let config = f.state.instance_config();
+    let url = format!(
+        "{}/download",
+        config.slack.api_base.trim_end_matches("/api/")
+    );
+    let text = format!(
+        "{}é\r\n{}\nfinal line\r\n",
+        "a".repeat(4095),
+        "資料".repeat(801)
+    );
+    let mut message = message("1000.000001", "UPEER", "Design draft");
+    let file = json!({"id":"FDOC","name":"03-lifecycle.md","mimetype":"text/markdown","size":text.len(),"url_private_download":url});
+    message["files"] = json!([file]);
+    {
+        let mut fake = f.fake.lock().unwrap();
+        fake.files.insert("FDOC".into(), file);
+        fake.document = text.as_bytes().to_vec();
+        fake.history.insert("CSHARED".into(), vec![message.clone()]);
+    }
+    let grant = f.grant("CSHARED", "", "UPEER", false);
+    let request = |args: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slack_read_document","arguments":args}});
+    let mut args = json!({"message_id":"1000.000001","file_id":"FDOC"});
+    let mut got = String::new();
+    loop {
+        let (_, out) = f
+            .call("/context/mcp", Some(&grant), request(args.clone()))
+            .await;
+        assert_ne!(out["result"]["isError"], true, "{out}");
+        let page: Value =
+            serde_json::from_str(out["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(page["offset"], got.len());
+        got.push_str(page["untrusted_document_text"].as_str().unwrap());
+        if page["complete"] == true {
+            assert!(page["next_offset"].is_null());
+            break;
+        }
+        args["offset"] = page["next_offset"].clone();
+        args["sha256"] = page["sha256"].clone();
+    }
+    assert_eq!(got, text);
+    for changes in [
+        json!({"sha256":"modified"}),
+        json!({"file_id":"FOTHER"}),
+        json!({"thread_id":"1001.000001"}),
+    ] {
+        let mut denied = args.clone();
+        denied
+            .as_object_mut()
+            .unwrap()
+            .extend(changes.as_object().unwrap().clone());
+        assert_eq!(
+            f.call("/context/mcp", Some(&grant), request(denied))
+                .await
+                .1["result"]["isError"],
+            true
+        );
+    }
+    message["hidden"] = true.into();
+    f.fake
+        .lock()
+        .unwrap()
+        .history
+        .insert("CSHARED".into(), vec![message]);
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), request(args)).await.1["result"]["isError"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn reply_attachments_are_idempotent_and_scoped_to_the_running_job() {
+    use acp_slack_adapter::{config::Attention, model::Message};
+    let f = Fixture::new().await;
+    let mut config = f.state.instance_config();
+    config.enabled = true;
+    *f.state.config.write().unwrap() = config.clone();
+    config.save(f.home.path()).unwrap();
+    let mut store = Store::open(f.home.path()).unwrap();
+    let m = Message {
+        team: "TTEST".into(),
+        channel: "CSHARED".into(),
+        thread: String::new(),
+        ts: "1000.000001".into(),
+        revision: "1000.000001".into(),
+        sender: "UPEER".into(),
+        bot: false,
+        text: "<@UBOT> Please attach the draft".into(),
+        deleted: false,
+        files: vec![],
+    };
+    store.ingest("doc-source", &m, true).unwrap();
+    let job = store
+        .claim(&Attention {
+            settle_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+    let grant_for = |channel| {
+        let mut input = Fixture::input(channel, "", "UPEER", false);
+        input["job_id"] = json!(job.id);
+        context::issue_grant(&config, f.home.path(), &input).unwrap()
+    };
+    let grant = grant_for("CSHARED");
+    let send = |text: &str| json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"slack_attach_file","arguments":{"filename":"review.md","mime_type":"text/markdown","text":text}}});
+    let body = "# draft\r\nlast line.\r\n";
+    for _ in 0..2 {
+        let (_, result) = f.call("/context/mcp", Some(&grant), send(body)).await;
+        assert_eq!(
+            result["result"]["structuredContent"]["status"], "staged_for_reply",
+            "{result}"
+        );
+    }
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), send("different"))
+            .await
+            .1["result"]["isError"],
+        true
+    );
+    let mut mismatch = send(body);
+    mismatch["params"]["arguments"]["sha256"] = "0000".into();
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), mismatch).await.1["result"]["isError"],
+        true
+    );
+    let other = grant_for("CPRIVATE");
+    assert_eq!(
+        f.call("/context/mcp", Some(&other), send(body)).await.1["result"]["isError"],
+        true
+    );
+    let count = || {
+        store
+            .db
+            .query_row("SELECT COUNT(*) FROM reply_files", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(count(), 1);
+    store
+        .db
+        .execute("UPDATE jobs SET status='failed' WHERE id=?1", [&job.id])
+        .unwrap();
+    assert_eq!(count(), 0);
+    assert_eq!(
+        f.call("/context/mcp", Some(&grant), send(body)).await.1["result"]["isError"],
+        true
+    );
 }

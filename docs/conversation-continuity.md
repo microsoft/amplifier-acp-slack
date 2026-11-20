@@ -80,6 +80,20 @@ the number of scanned messages, and the original message IDs and source links.
 Conversation-root searches do not implicitly search thread replies. Search does
 not alter the audience rules or invoke Slack's workspace-wide search API.
 
+A source link is the address Slack itself gives for that conversation or message
+(Copy link, `chat.getPermalink`):
+`https://<workspace>.slack.com/archives/<conversation>/p<timestamp digits>`, with
+`?thread_ts=<root>&cid=<conversation>` for a message in a thread. Slack opens that
+form in the client a reader is using, and shows it as a message reference when it
+is written into a message. The workspace address comes from `auth.test` at
+startup and is kept with the installation's state. Until a start has recorded
+it, links keep the web client's form,
+`https://app.slack.com/client/<workspace ID>/<conversation>?message_ts=<timestamp>`.
+Delivery receipts use the same links. Once the address is known, each prompt also
+carries `links` for the conversation, its thread and the triggering message, and
+tells the agent that Slack shows its reply as standard Markdown, so
+`[words](address)` is a link.
+
 Each prompt and the `context_tools_setup` activity record distinguish disabled
 context, a peer without HTTP MCP, and a supplied descriptor. Supplying a descriptor
 does not verify that the peer registered the tools or successfully authenticated
@@ -176,3 +190,20 @@ Slack does not provide an all-recent-thread-replies endpoint: a new reply on an
 old root that this installation has never observed may remain undiscoverable.
 This is bounded recovery, not a guarantee that every offline event is delivered.
 See [Slack's thread history API](https://docs.slack.dev/reference/methods/conversations.replies/).
+
+## Prompt projection composition
+
+Context message excerpts include their Slack message ID, channel and source
+revision. Within a prompt, an orientation excerpt whose ID, revision, actor and
+text match the fuller `history` entry uses `text_in_history` to reference it.
+Truncated excerpts can reference a matching full prefix; changed, unverified or
+deleted messages are never elided. Coverage and source links remain present.
+This only changes prompt presentation, not durable messages or retrieval tools.
+
+An Instance advertising `continuity.connectorProjectionVersion: 1` may receive
+`_meta["com.microsoft.amplifier.conversation-projection"]` with `version: 1`,
+`provider_id`, `conversation_id` and `thread_id` (null for the main conversation).
+Slack supplies this only when its authorized orientation is present. Instance
+validates the existing lease and exact binding before omitting its second
+provider orientation fetch; its own memory, responsibilities and authorized
+activity remain. Older endpoints receive the ordinary self-contained projection.

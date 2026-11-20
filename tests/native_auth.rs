@@ -269,3 +269,125 @@ async fn spoofed_local_http_listener_never_receives_control_credential() {
     assert!(request.starts_with("GET /api/v1/local-proof?nonce="));
     assert!(!request.to_lowercase().contains("authorization"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_api_waits_for_the_proved_connection_before_get_and_put() {
+    local_api_connection_sequence(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_api_never_reconnects_after_the_proved_connection_closes() {
+    local_api_connection_sequence(true).await;
+}
+
+async fn local_api_connection_sequence(close_after_proof: bool) {
+    use axum::{extract::ConnectInfo, middleware};
+    use std::{net::SocketAddr, sync::Mutex, time::Duration};
+    let (dir, state) = fixture();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut config = state.instance_config();
+    config.server.port = port;
+    config.server.public_url = Some(format!("http://127.0.0.1:{port}"));
+    config.save(dir.path()).unwrap();
+    *state.config.write().unwrap() = config.clone();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = observed.clone();
+    let app = server::router(state.clone()).layer(middleware::from_fn(
+        move |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+              request: Request<Body>,
+              next: middleware::Next| {
+            let recorded = recorded.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                recorded.lock().unwrap().push((
+                    peer,
+                    request.method().clone(),
+                    path.clone(),
+                    request.headers().contains_key("authorization"),
+                ));
+                let mut response = next.run(request).await;
+                if close_after_proof && path == "/api/v1/local-proof" {
+                    response
+                        .headers_mut()
+                        .insert("connection", "close".parse().unwrap());
+                }
+                response
+            }
+        },
+    ));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let get = tokio::time::timeout(
+        Duration::from_secs(5),
+        acp_slack_adapter::desktop::local_api(dir.path(), "GET", "config", None),
+    )
+    .await;
+    config.label = "Changed through the proved connection".into();
+    let put = if !close_after_proof {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                acp_slack_adapter::desktop::local_api(
+                    dir.path(),
+                    "PUT",
+                    "config",
+                    Some(json!({"expected_revision":config.revision,"config":config})),
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let _ = stop.send(());
+    let joined = serving.await;
+    assert!(joined.unwrap().is_ok());
+    let rows = observed.lock().unwrap();
+    if close_after_proof {
+        assert!(get.unwrap().is_err());
+        assert_eq!(
+            rows.len(),
+            1,
+            "No reconnect or authenticated request after proof socket closes"
+        );
+        assert_eq!(rows[0].2, "/api/v1/local-proof");
+        assert!(!rows[0].3);
+        assert_eq!(state.instance_config().revision, config.revision);
+    } else {
+        assert_eq!(get.unwrap().unwrap()["id"], config.id);
+        assert!(put.unwrap().unwrap().is_ok());
+        assert_eq!(
+            rows.len(),
+            4,
+            "Each operation has one proof and one request, with no replay"
+        );
+        for (pair, method) in rows.as_chunks::<2>().0.iter().zip(["GET", "PUT"]) {
+            assert_eq!(
+                pair[0].0, pair[1].0,
+                "Credential must stay on the proved TCP connection"
+            );
+            assert_eq!(pair[0].1, "GET");
+            assert_eq!(pair[0].2, "/api/v1/local-proof");
+            assert!(!pair[0].3);
+            assert_eq!(pair[1].1, method);
+            assert_eq!(pair[1].2, "/api/v1/config");
+            assert!(pair[1].3);
+        }
+        assert_eq!(state.instance_config().label, config.label);
+        assert_eq!(state.instance_config().revision, config.revision + 1);
+        assert_eq!(
+            Config::load(dir.path()).unwrap().revision,
+            config.revision + 1
+        );
+    }
+}

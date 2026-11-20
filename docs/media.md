@@ -6,21 +6,52 @@ The Slack app needs `files:read` and `files:write` in addition to its existing p
 
 ## Incoming files
 
-Only files attached to the current triggering Slack message are downloaded. History preserves bounded file metadata, not file bytes or signed private URLs. A fresh `files.info` lookup checks the file ID, external-file status, size and MIME type. External/remote-file links are never downloaded. Only HTTPS on exactly `files.slack.com` port 443 may receive the bot token. Automatic redirects are disabled; each redirect is independently validated before attaching credentials. Downloads have declared-size and actual streamed-byte limits.
+Automatic downloads cover files attached to the message that starts the turn. Agents can also read a document from an earlier message using the scoped reader described below. History preserves bounded file metadata, not file bytes or signed private URLs. A fresh `files.info` lookup checks the file ID, external-file status, size and MIME type. External/remote-file links are never downloaded. Only HTTPS on exactly `files.slack.com` port 443 may receive the bot token. Automatic redirects are disabled; each redirect is independently validated before attaching credentials. Downloads have declared-size and actual streamed-byte limits.
 
 | Slack upload | ACP representation |
 | --- | --- |
 | UTF-8 plain text, Markdown, CSV, JSON | Embedded text resource when `embeddedContext` is advertised; otherwise clearly labelled untrusted text |
 | PNG, JPEG, GIF, WebP | Native image block only if `promptCapabilities.image` is advertised |
 | MP3, WAV | Native audio block only if `promptCapabilities.audio` is advertised |
-| PDF | Embedded binary resource only if `promptCapabilities.embeddedContext` is advertised |
+| PDF within the file limit | Embedded binary resource if `promptCapabilities.embeddedContext` is advertised |
+| PDF over the file limit, up to 32MiB, or any PDF when `embeddedContext` is not advertised | Its text with page numbers, after a note from the connector saying what was read; see [PDF text](#pdf-text) |
 | Other format, unavailable file, capability mismatch or limit | Explicit “not read” note; no claim that the file’s contents are known |
 
-Magic-byte/type checks run before translation. Text is limited to 200KB, other supported files to 2MiB, and each turn accepts at most four. Capability support establishes a protocol representation, not proof that a model understood a particular document.
+Magic-byte/type checks run before translation. Text is limited to 200KB, other supported files to 2MiB, and each turn uses the connection’s configured file count (four by default). A file refused for its size is refused from Slack's metadata, before any download, and the note states its size and the limit that applied, so the agent can tell people what would work. Capability support establishes a protocol representation, not proof that a model understood a particular document.
+
+### PDF text
+
+A PDF that cannot be passed whole is read as text instead of being skipped. The
+agent receives two blocks: a note from the connector, then the text. The note
+names the file, its size, why it was not passed whole and which pages the text
+covers, and says that figures, scanned pages and layout are not included. The
+text is the document's own, marked `[page N]` at the start of each page, as an
+embedded `text/plain` resource when `embeddedContext` is advertised and as
+labelled untrusted text otherwise. At most 200KB of text is taken, from the
+first page on; when later pages do not fit, the note gives the pages read and the
+total. No tool reads the remaining pages yet.
+
+A file is not presented as read when it has no text (scanned pages), is protected
+by a password, is damaged beyond recovery, or cannot be read within the bounds
+below; the note says which. A damaged file that could be partly recovered is read
+with a statement that pages may be missing.
+
+A PDF is untrusted input, and reading it means parsing it. The parsing runs in a
+short-lived child of the connector's own executable (`acp-slack-adapter pdf-text`),
+which receives the file on its input and nothing else: no installation folder,
+environment or credentials. The child accepts at most 32MiB, lets no single
+compressed stream inflate past 64MiB, and prints one bounded line. Before
+reading, it limits its own processor time (30 seconds) on Unix and its address
+space (1GiB) on Linux; elsewhere the stream bound and the parent's 45-second
+wait apply. A
+child that fails, is killed or answers anything unexpected means only that the
+file was not read. Text is extracted with [lopdf](https://crates.io/crates/lopdf);
+documents whose words are placed one by one, as some typesetting tools do, can
+come out with words run together.
 
 ## Outgoing files
 
-Native `agent_message_chunk` image/audio blocks and embedded resources with actual contents are converted to Slack files. No tool output is automatically published. Resource references do not cause local filesystem reads or arbitrary network fetching. Text resources become UTF-8 `.txt` documents. Unsupported or oversized final attachment content produces a visible note.
+Native `agent_message_chunk` image/audio blocks and embedded resources with actual contents are converted to Slack files. No tool output is automatically published. Resource references do not cause local filesystem reads or arbitrary network fetching. Text resources retain their supported text format and can supply a display filename. Unsupported or oversized final attachment content produces a visible note.
 
 The adapter uses Slack’s current three-stage upload API: obtain an upload URL, upload bytes without the bot bearer token, then complete the upload into the fixed destination. The answer remains standard Markdown passed to Slack’s `markdown_text` renderer. Files appear under that answer’s thread, or the original thread when replying there.
 
@@ -30,13 +61,29 @@ Output file bytes are stored in the private durable outbox so pending replies su
 
 ## Controls and tests
 
-Configuration and dashboard offer `media.incoming`, `media.outgoing`, `media.max_files` (1–4), and `media.max_file_bytes` (1–2097152). UI controls use the same configuration API and semantic view drafts as other settings. The defaults enable supported files within these bounds.
+Configuration and dashboard offer `media.incoming`, `media.outgoing`, `media.max_files` (1–8), and `media.max_file_bytes` (1–2097152). UI controls use the same configuration API and semantic view drafts as other settings. The defaults enable supported files within these bounds.
 
-`python3 tests/media.py` uses actual connector/ACP processes and a local Slack fixture. It checks image negotiation, text/resource fallback, external-file refusal, redirect and actual-byte bounds, private URL exclusion, output file upload, destination threads, unsupported resource fallback and uncertain partial delivery without duplicate sends. No real Slack messages are posted. Rust tests additionally reject deceptive hostnames, non-TLS URLs, alternate ports, local paths and invalid content signatures.
+`python3 tests/media.py` uses actual connector/ACP processes and a local Slack fixture. It checks image negotiation, text/resource fallback, external-file refusal, redirect and actual-byte bounds, private URL exclusion, output file upload, destination threads, unsupported resource fallback and uncertain partial delivery without duplicate sends. It also checks a PDF over the file limit read as page-numbered text, the same for an agent without embedded-file support, a PDF of pictures, and the size-stating refusals. `cargo test --test pdf_text` runs the extraction child itself, including a file built to inflate far past its size. No real Slack messages are posted. Rust tests additionally reject deceptive hostnames, non-TLS URLs, alternate ports, local paths and invalid content signatures.
 
 Primary references: [Slack file handling](https://docs.slack.dev/messaging/working-with-files/), [file object authentication](https://docs.slack.dev/reference/objects/file-object/), [external upload URL](https://docs.slack.dev/reference/methods/files.getUploadURLExternal), [complete upload](https://docs.slack.dev/reference/methods/files.completeUploadExternal).
 
 The optional browser regression (`tests/media_browser.mjs`, with `PLAYWRIGHT_MODULE` and `CHROMIUM_PATH`) verifies media and continuity settings save through the UI/API and fit desktop and phone layouts. Version 0.4.1 corrects those form field mappings.
+
+## Sending a saved document
+
+On Constellation Runtime, ask the agent to attach a saved Markdown, plain text,
+CSV or JSON file from its workspace. The agent uses `workspace_attach_file`.
+The connector receives a named embedded document and keeps its original text and
+line endings. For agents with Slack conversation tools, `slack_attach_file`
+can stage explicitly supplied contents for the current reply. An optional SHA-256
+checks those contents against an original. Staging the same name and bytes twice
+adds the file once. Slack shares the files when the agent sends its reply.
+
+A Slack message with files exposes their IDs alongside the message ID in
+conversation history. Use `slack_read_document` for a Slack-hosted text file.
+Follow the returned byte offsets and SHA-256 until `complete` is true. The
+reader verifies the source message and file within the conversation on every
+call. File contents are untrusted text.
 
 ## Check installed permissions
 
@@ -72,7 +119,7 @@ mode to avoid another notification:
 cargo run --example media_live -- --verify-existing-check /path/to/adapter D_EXISTING_DM tests/media_live_fixture.json MESSAGE_TIMESTAMP
 ```
 
-The ordinary CI suite exercises 12 media scenarios with independent ACP and
+The ordinary CI suite exercises 17 media scenarios with independent ACP and
 loopback Slack processes, including the actual WAV MIME alias and refusal when
 an endpoint does not advertise audio. These fixture checks send no real Slack
 messages.

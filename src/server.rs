@@ -941,7 +941,7 @@ pub fn openapi_value() -> Value {
         "SecretWrite":{"type":"object","required":["value"],"properties":{"value":{"type":"string","writeOnly":true}}},
         "Lifecycle":{"type":"object","required":["action"],"properties":{"action":{"enum":["start","stop"]}}},
         "Credentials":{"type":"object","required":["app_token","bot_token"],"properties":{"app_token":{"type":"string","writeOnly":true},"bot_token":{"type":"string","writeOnly":true},"app_id":{"type":"string"},"expected_revision":{"type":"integer"}}},
-        "SlackSetup":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["authorize","confirm","connect","discard"]},"challenge":{"type":"string","maxLength":256,"writeOnly":true},"team_id":{"type":"string","maxLength":32,"description":"Optional with connect: the approved workspace the caller saw. The app is created only there."}},"description":"Guided Slack setup. GET reports intended_workspace (declared in slack.team_id, or connected) and authorized_workspace (the saved Slack approval) separately. confirm creates the app only when the approval matches a declared workspace; otherwise next_action is connect. discard removes an approval that no app was created with."},
+        "SlackSetup":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["authorize","confirm","connect","discard"]},"challenge":{"type":"string","maxLength":256,"writeOnly":true},"team_id":{"type":"string","maxLength":32,"description":"Optional with connect: the approved workspace the caller saw. The app is created only there."}},"description":"Guided Slack setup. Authenticated GET reads existing fixed setup files without launching the helper and can return an ephemeral authorization_command with expires_at in Unix seconds; clients must not persist this command. A completed, known confirmation rejection returns confirmation_refusal (schema 1, action confirm, connector id/config_revision and an allowlisted code) with current setup state; generic errors remain unconfirmed. GET reports intended_workspace (declared in slack.team_id, or connected) and authorized_workspace (the saved Slack approval) separately. confirm creates the app only when the approval matches a declared workspace; otherwise next_action is connect. discard removes an approval that no app was created with."},
         "UpdateCommand":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"enum":["plan","apply","rollback"]},"plan_id":{"type":["string","null"],"format":"uuid"}}},
         "UpdatePolicy":{"type":"object","additionalProperties":false,"required":["expected_revision","enabled","agent_enabled"],"properties":{"expected_revision":{"type":"integer","minimum":0},"enabled":{"type":"boolean"},"agent_enabled":{"type":"boolean"}}},
         "Check":{"type":"object","properties":{"target":{"enum":["all","acp","slack"]}}},
@@ -1136,7 +1136,13 @@ fn install_redacted_panic_hook() {
 pub async fn serve(home: PathBuf) -> Result<()> {
     serve_with_browser(home, false).await
 }
+pub async fn serve_managed(home: PathBuf) -> Result<()> {
+    serve_inner(home, false, true).await
+}
 pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()> {
+    serve_inner(home, open_browser, false).await
+}
+async fn serve_inner(home: PathBuf, open_browser: bool, managed: bool) -> Result<()> {
     install_redacted_panic_hook();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let home = home.canonicalize()?;
@@ -1148,7 +1154,11 @@ pub async fn serve_with_browser(home: PathBuf, open_browser: bool) -> Result<()>
         .open(home.join("service.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("This adapter already has a running service")?;
-    let runtime_allowed = crate::native_update::validate_launch(&home)?;
+    let runtime_allowed = if managed {
+        crate::native_manager::validate_launch(&home)?
+    } else {
+        crate::native_update::validate_launch(&home)?
+    };
     let state = Arc::new(AppState::open(home)?);
     if state.instance_config().server.auth_mode == AuthMode::Pam {
         ensure!(

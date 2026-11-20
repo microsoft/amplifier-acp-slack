@@ -24,7 +24,7 @@ for line in sys.stdin:
     elif m in ('session/new','session/load'):
         sid=p.get('sessionId',str(uuid.uuid4()));cwd=Path(p['cwd'])
         if caps.get('fs',{}).get('writeTextFile'):
-            base={'sessionId':sid};path=str(cwd/'lifecycle.txt')
+            base={'sessionId':sid};path=str(cwd/f'lifecycle-{sid}.txt')
             assert call('fs/write_text_file',{**base,'path':path,'content':'lifecycle callback'})['result']=={}
             assert call('fs/read_text_file',{**base,'path':path})['result']['content']=='lifecycle callback'
             assert 'error' in call('fs/read_text_file',{**base,'sessionId':'foreign','path':path})
@@ -47,7 +47,7 @@ for line in sys.stdin:
                 if stage=='foreign':
                     # A real callback response fences processing of the earlier
                     # unrelated notification without a timing-based assertion.
-                    assert call('fs/read_text_file',{'sessionId':sid,'path':str(cwd/'lifecycle.txt')})['result']['content']=='lifecycle callback'
+                    assert call('fs/read_text_file',{'sessionId':sid,'path':str(cwd/f'lifecycle-{sid}.txt')})['result']['content']=='lifecycle callback'
                 record('withdraw_sent',stage=stage,request_id=request_id)
             response=json.loads(sys.stdin.readline())
             assert response['id']==rid and response['result']['outcome']=={'outcome':'cancelled'},response

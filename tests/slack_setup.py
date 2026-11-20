@@ -1,5 +1,6 @@
 """Guided setup lifecycle, with the official CLI's boundary replaced by a fixture."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,145 @@ class InstallerWorkspaceTests(unittest.TestCase):
             with self.assertRaises(ValueError,msg=mistaken):installer.workspace_arguments(mistaken,None)
         with self.assertRaises(ValueError):installer.workspace_arguments(None,'Example Workspace')
 
+class SetupChildTests(unittest.TestCase):
+    def test_vendor_cli_is_hidden_on_windows_without_changing_its_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary)
+            for platform in ['win32','linux','darwin']:
+                with self.subTest(platform=platform), patch.object(s,'ensure_cli',return_value=folder/'slack'), patch.object(s.sys,'platform',platform), patch.object(s.subprocess,'CREATE_NO_WINDOW',0x08000000,create=True), patch.object(s.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='done',stderr='')) as child:
+                    self.assertEqual(s.cli(folder,'auth','login','--no-prompt'),'done')
+                    args,kwargs=child.call_args
+                    self.assertEqual(args[0][-3:],['auth','login','--no-prompt'])
+                    self.assertEqual(kwargs['timeout'],120)
+                    self.assertEqual(kwargs['input'],'')
+                    self.assertTrue(kwargs['capture_output'])
+                    if platform=='win32':self.assertEqual(kwargs['creationflags'],0x08000000)
+                    else:self.assertNotIn('creationflags',kwargs)
+
+class BundledWindowsCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = self.root / 'runtime/python'
+        self.tool = self.runtime / 'slack-cli'
+        self.tool.mkdir(parents=True)
+        self.python = self.runtime / 'python.exe'
+        self.python.write_bytes(b'private interpreter fixture')
+        self.data = b'non-executable derived CLI fixture'
+        self.metadata = {'schema': 1, 'distribution': s.WINDOWS_CLI_DISTRIBUTION,
+                         'upstream_version': s.VERSION, 'upstream_source': s.WINDOWS_CLI_SOURCE,
+                         'patch_sha256': s.WINDOWS_CLI_PATCH, 'goos': 'windows', 'goarch': 'amd64',
+                         'cgo_enabled': False, 'binary_size': len(self.data),
+                         'binary_sha256': hashlib.sha256(self.data).hexdigest()}
+        (self.tool / 'slack.exe').write_bytes(self.data)
+        self.save_metadata()
+        for item in [patch.object(s.sys, 'platform', 'win32'),
+                     patch.object(s.sys, 'executable', str(self.python))]:
+            item.start(); self.addCleanup(item.stop)
+        self.folder = self.root / 'secrets/slack-setup'
+        self.folder.mkdir(parents=True)
+
+    def save_metadata(self):
+        (self.tool / 'provenance.json').write_text(json.dumps(self.metadata))
+
+    def test_materializes_derived_tool_and_reuses_only_exact_cache(self):
+        with patch.object(s.urllib.request, 'urlopen', side_effect=AssertionError('network forbidden')):
+            binary = s.ensure_cli(self.folder)
+            self.assertEqual(binary.read_bytes(), self.data)
+            receipt = s.read(self.folder / s.WINDOWS_CLI_RECEIPT)
+            self.assertEqual(receipt['distribution'], s.WINDOWS_CLI_DISTRIBUTION)
+            self.assertEqual(receipt['upstream_source'], s.WINDOWS_CLI_SOURCE)
+            self.assertEqual(receipt['patch_sha256'], s.WINDOWS_CLI_PATCH)
+            self.assertEqual(receipt['size'], len(self.data))
+            original = binary.stat()
+            self.assertEqual(s.ensure_cli(self.folder), binary)
+            self.assertEqual(binary.stat().st_mtime_ns, original.st_mtime_ns)
+
+    def test_old_official_cache_does_not_mask_new_derived_build(self):
+        binary = self.folder / 'bin/slack.exe'
+        binary.parent.mkdir(); binary.write_bytes(b'old official bytes')
+        s.write(self.folder / 'cli.json', {'version': s.VERSION, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()})
+        auth = self.folder / 'auth/credentials.json'
+        auth.parent.mkdir(); auth.write_bytes(b'fixture credential preserved')
+        with patch.object(s.urllib.request, 'urlopen', side_effect=AssertionError('network forbidden')):
+            self.assertEqual(s.ensure_cli(self.folder).read_bytes(), self.data)
+        self.assertEqual(binary.read_bytes(), b'old official bytes')
+        self.assertEqual(set(s.read(self.folder / 'cli.json')), {'version', 'sha256'})
+        self.assertEqual(auth.read_bytes(), b'fixture credential preserved')
+
+    def test_missing_or_wrong_bundle_refuses_without_using_old_cache(self):
+        for key, value in [('distribution', 'official'), ('upstream_source', '0' * 40),
+                           ('patch_sha256', '0' * 64), ('goarch', 'arm64'),
+                           ('cgo_enabled', 0), ('binary_size', True),
+                           ('binary_size', 150 * 1024 * 1024 + 1), ('binary_sha256', '0' * 64)]:
+            with self.subTest(key=key, value=value):
+                old = self.metadata[key]; self.metadata[key] = value; self.save_metadata()
+                with patch.object(s.urllib.request, 'urlopen', side_effect=AssertionError('network forbidden')):
+                    with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+                self.assertFalse((self.folder / 'bin').exists())
+                self.metadata[key] = old
+        self.save_metadata(); (self.tool / 'slack.exe').unlink()
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+
+    def test_corrupt_bundle_cannot_be_hidden_by_a_valid_cache(self):
+        binary = s.ensure_cli(self.folder)
+        before = binary.read_bytes()
+        (self.tool / 'slack.exe').write_bytes(b'changed')
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+        self.assertEqual(binary.read_bytes(), before)
+
+    def test_oversize_metadata_and_symlink_refuse(self):
+        metadata = self.tool / 'provenance.json'
+        metadata.write_bytes(b' ' * (64 * 1024 + 1))
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+        self.save_metadata()
+        if os.name != 'nt':
+            binary = self.tool / 'slack.exe'; binary.unlink(); binary.symlink_to(self.python)
+            with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+
+    def test_pending_derived_files_are_preserved_without_replacing_old_tools(self):
+        for name in ['bin/slack-headless-1.new', 'cli-headless-1.tmp']:
+            with self.subTest(name=name):
+                pending = self.folder / name; pending.parent.mkdir(exist_ok=True)
+                pending.write_bytes(b'retained unknown preparation')
+                with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+                self.assertEqual(pending.read_bytes(), b'retained unknown preparation')
+                self.assertFalse((self.folder / 'bin' / s.WINDOWS_CLI_BINARY).exists())
+                pending.unlink()
+
+    def test_oversized_derived_receipt_refuses_before_materialization(self):
+        receipt = self.folder / s.WINDOWS_CLI_RECEIPT
+        receipt.write_bytes(b' ' * (64 * 1024 + 1))
+        with self.assertRaises(s.SetupError): s.ensure_cli(self.folder)
+        self.assertFalse((self.folder / 'bin').exists())
+
+class ConfirmationRefusalTests(unittest.TestCase):
+    exact = ('The following error was returned by the apps.hosted.exchangeAuthTicket Slack API method\n\n'
+             'The challenge code is invalid (invalid_challenge)\n')
+    def test_only_exact_completed_exchange_rejection_is_typed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary); args=('auth','login','--ticket','fixture-ticket','--challenge','fixture-code')
+            result=SimpleNamespace(returncode=1,stdout='',stderr=self.exact)
+            self.assertTrue(s.explicit_invalid_challenge(result,args,folder))
+            for output in ['invalid_challenge', 'example '+self.exact,
+                           self.exact.replace('apps.hosted.exchangeAuthTicket','other.method'),
+                           self.exact+'Another failure (request_timeout)\n']:
+                with self.subTest(output=output):self.assertFalse(s.explicit_invalid_challenge(SimpleNamespace(returncode=1,stdout='',stderr=output),args,folder))
+            for code in [0,-9]:self.assertFalse(s.explicit_invalid_challenge(SimpleNamespace(returncode=code,stdout='',stderr=self.exact),args,folder))
+            self.assertFalse(s.explicit_invalid_challenge(result,('deploy',),folder))
+            (folder/'credentials.json').write_text('{}')
+            self.assertFalse(s.explicit_invalid_challenge(result,args,folder))
+
+    def test_cli_preserves_generic_unknowns_and_never_returns_raw_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary)
+            for output,kind in [(self.exact,s.ConfirmationRefusal),('private external failure invalid_challenge',s.SetupError)]:
+                with self.subTest(known=kind is s.ConfirmationRefusal), patch.object(s,'ensure_cli',return_value=folder/'slack'), patch.object(s.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr=output)):
+                    with self.assertRaises(kind) as error:s.cli(folder,'auth','login','--ticket','fixture-ticket','--challenge','fixture-code',auth_dir=folder/'pending-auth')
+                    if kind is s.SetupError:self.assertNotIsInstance(error.exception,s.ConfirmationRefusal)
+                    self.assertNotIn('private external failure',str(error.exception))
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -35,6 +175,11 @@ class SetupTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.folder = self.home/'secrets/slack-setup'
         self.folder.mkdir(parents=True)
+        # These lifecycle cases replace the CLI boundary; select a fictional
+        # private interpreter rather than borrowing the controller's Python.
+        interpreter=self.home/'runtime/python'/('python.exe' if s.sys.platform=='win32' else 'bin/python3')
+        interpreter.parent.mkdir(parents=True);interpreter.write_bytes(b'private fixture interpreter')
+        runtime=patch.object(s.sys,'executable',str(interpreter));runtime.start();self.addCleanup(runtime.stop)
         self.team = 'TONE'
         self.created = 0
         self.calls = []
@@ -71,6 +216,30 @@ class SetupTests(unittest.TestCase):
         self.assertFalse((self.folder/'pending.json').exists())
         for p in self.folder.rglob('*.json'):
             self.assertNotIn('secret-code',p.read_text())
+
+    def test_invalid_format_and_expiry_refuse_without_cli_dispatch(self):
+        self.auth();saved=(self.folder/'auth/credentials.json').read_bytes()
+        s.execute(self.home,'authorize',{});pending=(self.folder/'pending.json').read_bytes();calls=list(self.calls)
+        with self.assertRaises(s.ConfirmationRefusal) as error:s.execute(self.home,'confirm',{'challenge':'bad code with spaces'})
+        self.assertEqual(error.exception.code,'invalid_confirmation_format');self.assertEqual(calls,self.calls)
+        self.assertEqual(pending,(self.folder/'pending.json').read_bytes());self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes())
+        s.write(self.folder/'pending.json',{'ticket':'expired','expires_at':0})
+        with self.assertRaises(s.ConfirmationRefusal) as error:s.execute(self.home,'confirm',{'challenge':'code'})
+        self.assertEqual(error.exception.code,'authorization_expired');self.assertEqual(calls,self.calls)
+
+    def test_known_invalid_challenge_retires_only_exact_pending_and_new_authorize_is_explicit(self):
+        self.auth();saved=(self.folder/'auth/credentials.json').read_bytes();s.execute(self.home,'authorize',{})
+        def refused(*args,**kwargs):raise s.ConfirmationRefusal('invalid_challenge')
+        calls=list(self.calls)
+        with patch.object(s,'cli',refused), self.assertRaises(s.ConfirmationRefusal):s.execute(self.home,'confirm',{'challenge':'wrong-code'})
+        self.assertFalse((self.folder/'pending.json').exists());self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes());self.assertEqual(calls,self.calls)
+        self.assertFalse((self.folder/'project').exists());self.assertEqual(self.created,0)
+        s.execute(self.home,'authorize',{});self.assertEqual(len(self.calls),len(calls)+1)
+
+    def test_generic_confirmation_timeout_preserves_pending_and_saved_access(self):
+        self.auth();saved=(self.folder/'auth/credentials.json').read_bytes();s.execute(self.home,'authorize',{});pending=(self.folder/'pending.json').read_bytes()
+        with patch.object(s,'cli',side_effect=s.subprocess.TimeoutExpired('fixture',120)), self.assertRaises(s.subprocess.TimeoutExpired):s.execute(self.home,'confirm',{'challenge':'code'})
+        self.assertEqual(pending,(self.folder/'pending.json').read_bytes());self.assertEqual(saved,(self.folder/'auth/credentials.json').read_bytes());self.assertEqual(self.created,0)
 
     def test_wrong_workspace_reauthorization_preserves_previous_credentials(self):
         self.auth()
@@ -220,11 +389,11 @@ class SetupTests(unittest.TestCase):
         with self.assertRaises(s.SetupError):s.execute(self.home,'token',{'team_id':'TTWO'})
         self.assertEqual(s.execute(self.home,'token',{'team_id':'TONE'})['token'],'private-access')
 
-    def test_hook_uses_current_private_python_and_handles_spaces(self):
-        project=self.folder/'project with spaces'
-        project.mkdir()
+    def test_hook_uses_fixed_private_python_from_the_project_cwd(self):
+        project=self.folder/'project'
         command=s.hook_command(project,'manifest')
-        self.assertIn(s.sys.executable,command)
+        self.assertNotIn(s.sys.executable,command)
+        self.assertIn('runtime',command);self.assertIn('hooks.py',command)
         self.assertIn('-I',command);self.assertIn('-B',command);self.assertIn('-X',command);self.assertIn('utf8',command)
         prepared=s.prepare_project(self.folder,{},'',{'team_id':'TONE'})
         compile((prepared/'hooks.py').read_text(),'hooks.py','exec')
@@ -238,7 +407,7 @@ class SetupTests(unittest.TestCase):
                 member=tarfile.TarInfo(name);member.size=6;bundle.addfile(member,io.BytesIO(b'native'))
             data=archive.getvalue();target=('macOS_arm64',hashlib.sha256(data).hexdigest())
             folder=self.folder/name.replace('/','_')
-            with patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
+            with patch.object(s.sys,'platform','darwin'),patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
                 self.assertEqual(s.ensure_cli(folder).read_bytes(),b'native')
 
     def test_verified_archive_still_rejects_ambiguous_binary_entries(self):
@@ -248,7 +417,7 @@ class SetupTests(unittest.TestCase):
             for name in ['bin/slack','./bin/slack']:
                 member=tarfile.TarInfo(name);member.size=6;bundle.addfile(member,io.BytesIO(b'native'))
         data=archive.getvalue();target=('macOS_arm64',hashlib.sha256(data).hexdigest())
-        with patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.platform,'system',return_value='Darwin'),patch.object(s.platform,'machine',return_value='arm64'),patch.dict(s.ARCHIVES,{('Darwin','arm64'):target}),patch.object(s.urllib.request,'urlopen',return_value=io.BytesIO(data)):
             with self.assertRaises(s.SetupError):s.ensure_cli(self.folder)
 
     def test_existing_app_is_adopted_without_another_identity(self):
@@ -256,5 +425,99 @@ class SetupTests(unittest.TestCase):
         result=s.execute(self.home,'connect',{'manifest':{},'app_id':'AEXISTING'})
         self.assertEqual(result['app_id'],'AEXISTING')
         self.assertEqual(self.created,0)
+
+class HookPathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='Slack hooks  café $& ')
+        self.addCleanup(self.tmp.cleanup)
+        self.home=Path(self.tmp.name).resolve()
+        self.project=self.home/'secrets/slack-setup/project'
+        self.project.parent.mkdir(parents=True)
+        self.system_python=s.sys.executable
+
+    def interpreter(self, target):
+        binary=self.home/'runtime/python'/('python.exe' if target=='win32' else 'bin/python3')
+        binary.parent.mkdir(parents=True,exist_ok=True)
+        binary.write_bytes(b'private interpreter fixture')
+        return binary
+
+    def test_private_hooks_are_fixed_relative_for_each_native_platform(self):
+        for target in ['win32','darwin','linux']:
+            binary=self.interpreter(target)
+            with self.subTest(target=target),patch.object(s.sys,'platform',target),patch.object(s.sys,'executable',str(binary)):
+                for action in ['hooks','manifest','install']:
+                    command=s.hook_command(self.project,action)
+                    expected=(r'& ..\..\..\runtime\python\python.exe -I -B -X utf8 .\hooks.py ' if target=='win32'
+                              else '../../../runtime/python/bin/python3 -I -B -X utf8 ./hooks.py ')+action
+                    self.assertEqual(command,expected)
+                    self.assertNotIn(str(self.home),command)
+
+    def test_wrong_action_or_project_layout_is_refused_before_project_creation(self):
+        binary=self.interpreter('darwin')
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)):
+            for action in ['manifest;echo unsafe','',None]:
+                with self.subTest(action=action),self.assertRaises(s.SetupError):s.hook_command(self.project,action)
+            for project in [self.home/'project',self.project.parent/'project with spaces',Path('secrets/slack-setup/project')]:
+                with self.subTest(project=project),self.assertRaises(s.SetupError):s.hook_command(project,'hooks')
+            with self.assertRaises(s.SetupError):s.prepare_project(self.home/'wrong-folder',{},'',{'team_id':'TONE'})
+        self.assertFalse((self.home/'wrong-folder/project').exists())
+        self.assertFalse(self.project.exists())
+
+    def test_native_missing_interpreter_never_uses_external_python(self):
+        for target in ['win32','darwin']:
+            with self.subTest(target=target),patch.object(s.sys,'platform',target),patch.object(s.sys,'executable',self.system_python),self.assertRaises(s.SetupError):
+                s.hook_command(self.project,'hooks')
+        self.assertFalse(self.project.exists())
+
+    def test_different_copy_or_hardlink_interpreter_is_not_the_selected_path(self):
+        binary=self.interpreter('darwin')
+        other=self.home/'different-python'
+        other.write_bytes(binary.read_bytes())
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(other)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        other.unlink();os.link(binary,other)
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(other)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertEqual(binary.read_bytes(),b'private interpreter fixture')
+
+    def test_existing_project_links_and_file_conflicts_are_not_adopted(self):
+        binary=self.interpreter('darwin')
+        self.project.write_bytes(b'existing unrelated file')
+        before=self.project.stat()
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertEqual(self.project.read_bytes(),b'existing unrelated file')
+        self.assertEqual(self.project.stat().st_ino,before.st_ino)
+
+    @unittest.skipIf(os.name=='nt','Creating symlinks may require Windows developer policy')
+    def test_symlink_project_and_private_interpreter_refused_without_repair(self):
+        binary=self.interpreter('darwin')
+        other=self.home/'other';other.mkdir();self.project.symlink_to(other,target_is_directory=True)
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertTrue(self.project.is_symlink());self.project.unlink()
+        binary.unlink();binary.symlink_to(self.system_python)
+        with patch.object(s.sys,'platform','darwin'),patch.object(s.sys,'executable',str(binary)),self.assertRaises(s.SetupError):
+            s.hook_command(self.project,'hooks')
+        self.assertTrue(binary.is_symlink())
+
+    def test_linux_pam_external_python_is_explicit_and_private_mismatch_never_falls_back(self):
+        with patch.object(s.sys,'platform','linux'),patch.object(s.sys,'executable',self.system_python):
+            with self.assertRaises(s.SetupError):s.hook_command(self.project,'manifest')
+            s.write(self.home/'adapter.json',{'server':{'auth_mode':'pam'}})
+            self.assertEqual(s.hook_command(self.project,'manifest'),s.shlex.join([
+                self.system_python,'-I','-B','-X','utf8','./hooks.py','manifest']))
+            # Rust ServerConfig defaults an omitted auth_mode to Pam for old
+            # configurations; this is not permission to invent a missing config.
+            s.write(self.home/'adapter.json',{'server':{'owner':'legacy fixture'}})
+            self.assertEqual(s.hook_command(self.project,'manifest'),s.shlex.join([
+                self.system_python,'-I','-B','-X','utf8','./hooks.py','manifest']))
+            s.write(self.home/'adapter.json',{'server':{'auth_mode':'local_password'}})
+            with self.assertRaises(s.SetupError):s.hook_command(self.project,'manifest')
+            s.write(self.home/'adapter.json',{'server':{'auth_mode':'pam'}})
+            binary=self.interpreter('linux')
+            with self.assertRaises(s.SetupError):s.hook_command(self.project,'manifest')
+            self.assertEqual(binary.read_bytes(),b'private interpreter fixture')
+
 
 if __name__=='__main__':unittest.main()

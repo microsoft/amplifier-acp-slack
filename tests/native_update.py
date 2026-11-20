@@ -75,6 +75,223 @@ class NativeUpdateTests(unittest.TestCase):
    return SimpleNamespace(pid=123)
   with patch.object(u.subprocess,'Popen',side_effect=spawn):worker.start();worker.start()
   self.assertNotEqual(launches[0],launches[1],'Each dispatch invalidates prior launch identity')
+ def managed_worker(self):
+  marker=u.read(self.home/'native-installation.json');marker['manager_owner']=u.MANAGER_OWNER;u.write(self.home/'native-installation.json',marker)
+  worker=self.worker();worker.save('verifying',binary_sha256=u.digest(self.binary));return worker
+ def test_manager_path_spelling_accepts_only_windows_canonical_prefix_equivalence(self):
+  with patch.object(u.os,'name','nt'):
+   self.assertTrue(u.native_path_matches('\\\\?\\C:\\Owner\\Slack','C:\\Owner\\Slack'))
+   self.assertTrue(u.native_path_matches('\\\\?\\UNC\\server\\owner\\Slack','\\\\server\\owner\\Slack'))
+   self.assertTrue(u.native_path_matches('C:\\OWNER\\Slack','c:/owner/slack'))
+   for value in [None,'C:\\Owner\\Other','C:\\Owner\\x\\..\\Slack','Owner\\Slack','\\\\.\\C:\\Owner\\Slack']:
+    with self.subTest(value=value):self.assertFalse(u.native_path_matches(value,'C:\\Owner\\Slack'))
+  with patch.object(u.os,'name','posix'):
+   self.assertFalse(u.native_path_matches('/home/Owner','/home/owner'))
+ def managed_observation(self,worker,request):
+  return {'schema':u.MANAGER_SCHEMA,'id':self.agent,'home':str(worker.home),'executable':str(worker.binary),
+          'state':'ready','request_current':True,'profile_matches':True,'launch_observed':True,'autostart':False,
+          'request':{'request_id':request,'phase':'ready'},'pid':123,'process_identity':{'pid':123,'start_ticks':'456','boot_id':str(uuid.uuid4())},
+          'service':{'manager':'fixture','name':'acp-slack-adapter-'+self.agent}}
+ def test_managed_launch_records_same_intent_before_one_fixed_manager_dispatch(self):
+  from types import SimpleNamespace
+  worker=self.managed_worker();calls=[]
+  def run(command,**options):
+   launch=u.read(worker.file)['launch'];request=launch['manager_request_id']
+   self.assertEqual(launch['manager_dispatch'],'intent')
+   self.assertEqual(command,[str(worker.binary),'--home',str(worker.home),'native-start','--request-id',request,'--update-plan',self.id,'--update-launch',launch['nonce']])
+   self.assertLessEqual(options['timeout'],60);self.assertGreater(options['timeout'],0)
+   calls.append(command);return SimpleNamespace(returncode=0,stdout=json.dumps(self.managed_observation(worker,request)))
+  with patch.object(u.subprocess,'run',side_effect=run),patch.object(u.subprocess,'Popen') as direct:
+   worker.start();direct.assert_not_called()
+  self.assertEqual(len(calls),1);self.assertEqual(worker.job['launch']['manager_dispatch'],'confirmed')
+  self.assertEqual(worker.started_pid,123);self.assertEqual(worker.started_generation,worker.job['launch']['process_identity'])
+  self.assertFalse(hasattr(worker,'started_process'))
+ def test_managed_lost_start_response_keeps_same_request_and_has_no_child_fallback(self):
+  worker=self.managed_worker()
+  with patch.object(u.subprocess,'run',side_effect=u.subprocess.TimeoutExpired('native-start',60)) as dispatch,patch.object(u.subprocess,'Popen') as direct:
+   with self.assertRaises(u.ManagedUnknown):worker.start()
+   self.assertEqual(dispatch.call_count,1);direct.assert_not_called()
+  launch=u.read(worker.file)['launch'];self.assertEqual(launch['manager_dispatch'],'unknown')
+  self.assertEqual(str(uuid.UUID(launch['manager_request_id'])),launch['manager_request_id'])
+  self.assertEqual(str(uuid.UUID(launch['nonce'])),launch['nonce'])
+  with patch.object(u.subprocess,'run') as repeated,self.assertRaises(u.ManagedUnknown):worker.start()
+  repeated.assert_not_called();self.assertEqual(u.read(worker.file)['launch'],launch)
+ def test_lost_manager_reply_journal_failure_does_not_mask_unknown_or_start_rollback(self):
+  for action in ('start','stop'):
+   with self.subTest(action=action):
+    worker=self.managed_worker()
+    if action=='stop':self.seed_managed_launch(worker)
+    original=worker.save
+    def save(state=None,**values):
+     value=values.get('launch') if action=='start' else values.get('manager_stop')
+     if isinstance(value,dict) and (value.get('manager_dispatch')=='unknown' or value.get('dispatch')=='unknown'):raise OSError('journal unavailable')
+     original(state,**values)
+    with patch.object(worker,'save',side_effect=save),patch.object(u.subprocess,'run',side_effect=u.subprocess.TimeoutExpired('manager',60)),self.assertRaises(u.ManagedUnknown):getattr(worker,action)()
+    saved=u.read(worker.file)['launch' if action=='start' else 'manager_stop']
+    self.assertEqual(saved['manager_dispatch' if action=='start' else 'dispatch'],'intent')
+ def test_confirmed_manager_reply_journal_failure_remains_unknown(self):
+  from types import SimpleNamespace
+  for action in ('start','stop'):
+   with self.subTest(action=action):
+    worker=self.managed_worker()
+    if action=='stop':self.seed_managed_launch(worker)
+    original=worker.save
+    def save(state=None,**values):
+     value=values.get('launch') if action=='start' else values.get('manager_stop')
+     if isinstance(value,dict) and (value.get('manager_dispatch')=='confirmed' or value.get('dispatch')=='confirmed'):raise OSError('journal unavailable')
+     original(state,**values)
+    def run(command,**options):
+     value=self.managed_observation(worker,worker.job['launch']['manager_request_id']) if action=='start' else self.managed_stop_reply(worker,worker.job['manager_stop'])
+     return SimpleNamespace(returncode=0,stdout=json.dumps(value))
+    with patch.object(worker,'save',side_effect=save),patch.object(u.subprocess,'run',side_effect=run),self.assertRaises(u.ManagedUnknown):getattr(worker,action)()
+ def test_managed_ready_requires_current_full_generation_and_profile(self):
+  worker=self.managed_worker();request=str(uuid.uuid4());value=self.managed_observation(worker,request)
+  self.assertEqual(worker.managed_ready(value,request),value['process_identity'])
+  for key,changed in [('schema','old'),('id',str(uuid.uuid4())),('home','other'),('request_current',False),('profile_matches',False),('launch_observed',False),('autostart',True),('pid',124),('request',None),('service',{})]:
+   with self.subTest(key=key),self.assertRaises(u.ManagedUnknown):worker.managed_ready({**value,key:changed},request)
+  with self.assertRaises(u.ManagedUnknown):worker.managed_ready(value,str(uuid.uuid4()))
+  with self.assertRaises(u.ManagedUnknown):worker.managed_ready(value,request,{**value['process_identity'],'start_ticks':'789'})
+ def test_managed_start_and_health_share_one_original_60_second_window(self):
+  from types import SimpleNamespace
+  worker=self.managed_worker();replies=[];timeouts=[];now=[100]
+  def run(command,**options):
+   timeouts.append(options['timeout'])
+   if command[3]=='native-start':replies.append(self.managed_observation(worker,worker.job['launch']['manager_request_id']));now[0]=125
+   return SimpleNamespace(returncode=0,stdout=json.dumps(replies[0]))
+  with patch.object(u.time,'monotonic',side_effect=lambda:now[0]),patch.object(u.subprocess,'run',side_effect=run),patch.object(u.subprocess,'check_output',return_value='acp-slack-adapter 99.0.0\n'),patch.object(worker,'api',return_value={'id':self.agent,'version':'99.0.0','addresses':{'pid':123}}):
+   worker.start();self.assertEqual(worker.managed_deadline,160);worker.health(u.digest(self.binary))
+  self.assertEqual(timeouts,[60,35])
+ def test_managed_unknown_execute_never_autorolls_back_or_replays(self):
+  worker=self.managed_worker();worker.gate();backup=self.folder/'backup';backup.mkdir();(backup/'binary').write_bytes(b'previous')
+  with patch.object(worker,'apply',side_effect=u.ManagedUnknown('lost reply')),patch.object(worker,'rollback') as rollback:
+   worker.execute();rollback.assert_not_called()
+  self.assertEqual(worker.job['state'],'recovery_required');self.assertTrue((self.home/'updates/drain.json').exists())
+ def test_managed_rollback_does_not_treat_a_free_lock_as_stop_proof(self):
+  worker=self.managed_worker()
+  with patch.object(worker,'stop',side_effect=u.ManagedUnknown('unknown stop')),patch.object(u,'locked') as lock,patch.object(worker,'replace') as replace:
+   with self.assertRaises(u.ManagedUnknown):worker.rollback('fixture')
+   lock.assert_not_called();replace.assert_not_called()
+ def test_unknown_or_changed_manager_ownership_is_not_legacy_fallback(self):
+  marker=u.read(self.home/'native-installation.json');marker['manager_owner']='another-owner';u.write(self.home/'native-installation.json',marker)
+  with self.assertRaisesRegex(RuntimeError,'manager_owner_unknown'):self.worker()
+  worker=self.managed_worker();marker=u.read(self.home/'native-installation.json');marker.pop('manager_owner');u.write(self.home/'native-installation.json',marker)
+  with self.assertRaisesRegex(RuntimeError,'manager_owner_changed'):worker.guard_ownership()
+ def seed_managed_launch(self,worker,*,with_witness=True):
+  start=str(uuid.uuid4());process={'pid':123,'start_ticks':'456','boot_id':str(uuid.uuid4())}
+  service={'manager':'fixture','name':'acp-slack-adapter-'+self.agent}
+  binding={'id':self.agent,'home':str(worker.home),'service':service,'profile':{'executable':str(worker.binary),
+           'cwd':str(worker.home),'args':['--home',str(worker.home),'native-serve'],'autostart':False},'binary_sha256':u.digest(worker.binary),'update':None}
+  manager=worker.home/'native-manager';u.write(manager/'active.json',{'request_id':start})
+  u.write(manager/'requests'/(start+'.json'),{'request_id':start,'phase':'ready','binding':binding})
+  if with_witness:u.write(manager/'requests'/(start+'.launched.json'),{'request_id':start,'binding':binding,'process':process})
+  worker.save('stopping',config_sha256=u.digest(self.home/'adapter.json'),installed_sha256=u.digest(worker.binary))
+  return {'start_request_id':start,'process_identity':process if with_witness else None,'service':service}
+ def managed_stop_reply(self,worker,intent):
+  return {'schema':u.MANAGER_SCHEMA,'id':self.agent,'home':str(worker.home),'executable':str(worker.binary),
+          'state':'inactive','control_current':True,'autostart':False,'service':intent['service'],
+          'control':{'request_id':intent['request_id'],'action':'stop','phase':'inactive','start_request_id':intent['start_request_id'],
+                     'dispatch_outcome':'accepted','observation':'exact_profile_inactive_and_service_lock_available',
+                     'process_identity':intent['process_identity'],'process_absent':True,'update_plan':self.id}}
+ def test_managed_stop_is_one_journal_bound_dispatch_without_health_dependency(self):
+  from types import SimpleNamespace
+  worker=self.managed_worker();captured=self.seed_managed_launch(worker);calls=[]
+  def run(command,**options):
+   intent=u.read(worker.file)['manager_stop'];self.assertEqual(intent['dispatch'],'intent')
+   self.assertEqual(intent['config_sha256'],u.digest(self.home/'adapter.json'))
+   self.assertEqual({key:intent[key] for key in captured},captured)
+   self.assertEqual(command,[str(worker.binary),'--home',str(worker.home),'native-stop','--request-id',intent['request_id'],'--update-plan',self.id])
+   self.assertLessEqual(options['timeout'],60);calls.append(command)
+   return SimpleNamespace(returncode=0,stdout=json.dumps(self.managed_stop_reply(worker,intent)))
+  with patch.object(u.subprocess,'run',side_effect=run),patch.object(worker,'api') as health,patch.object(u,'locked') as lock:
+   worker.stop();health.assert_not_called();lock.assert_not_called()
+  self.assertEqual(len(calls),1);self.assertEqual(worker.job['manager_stop']['dispatch'],'confirmed')
+ def test_managed_restore_captures_current_settings_without_rewriting_them(self):
+  from types import SimpleNamespace
+  worker=self.managed_worker();self.seed_managed_launch(worker);check_digest=worker.job['config_sha256']
+  config=u.read(self.home/'adapter.json');config['owner_setting']='changed after CHECK';u.write(self.home/'adapter.json',config)
+  current=(self.home/'adapter.json').read_bytes();worker.save('rolling_back')
+  def run(command,**options):
+   intent=u.read(worker.file)['manager_stop']
+   self.assertEqual(intent['config_sha256'],hashlib.sha256(current).hexdigest())
+   self.assertNotEqual(intent['config_sha256'],check_digest)
+   self.assertEqual(worker.job['config_sha256'],check_digest)
+   return SimpleNamespace(returncode=0,stdout=json.dumps(self.managed_stop_reply(worker,intent)))
+  with patch.object(u.subprocess,'run',side_effect=run):worker.stop()
+  self.assertEqual((self.home/'adapter.json').read_bytes(),current)
+ def test_managed_stop_unknown_preserves_intent_without_repeat_or_free_lock_proof(self):
+  worker=self.managed_worker();self.seed_managed_launch(worker)
+  with patch.object(u.subprocess,'run',side_effect=u.subprocess.TimeoutExpired('native-stop',60)) as dispatch,patch.object(u,'locked') as lock:
+   with self.assertRaises(u.ManagedUnknown):worker.stop()
+   saved=u.read(worker.file)['manager_stop'];self.assertEqual(saved['dispatch'],'unknown')
+   with self.assertRaises(u.ManagedUnknown):worker.stop()
+   self.assertEqual(dispatch.call_count,1);lock.assert_not_called();self.assertEqual(u.read(worker.file)['manager_stop'],saved)
+ def test_managed_stop_rejects_reused_pid_missing_exit_or_wrong_control(self):
+  worker=self.managed_worker();captured=self.seed_managed_launch(worker);intent={'request_id':str(uuid.uuid4()),'dispatch':'intent',**captured}
+  value=self.managed_stop_reply(worker,intent);worker.managed_stopped(value,intent)
+  for key,changed in [('request_id',str(uuid.uuid4())),('start_request_id',str(uuid.uuid4())),('process_absent',False),('process_identity',{**captured['process_identity'],'start_ticks':'789'}),('process_identity',None),('action','retire'),('update_plan',str(uuid.uuid4()))]:
+   with self.subTest(key=key),self.assertRaises(u.ManagedUnknown):worker.managed_stopped({**value,'control':{**value['control'],key:changed}},intent)
+  with self.assertRaises(u.ManagedUnknown):worker.managed_stopped({**value,'control_current':False},intent)
+ def test_never_launched_stop_accepts_null_only_with_exact_recorded_absence(self):
+  worker=self.managed_worker();captured=self.seed_managed_launch(worker,with_witness=False)
+  self.assertEqual(worker.managed_current_launch(),captured)
+  intent={'request_id':str(uuid.uuid4()),'dispatch':'intent',**captured};value=self.managed_stop_reply(worker,intent)
+  worker.managed_stopped(value,intent)
+  del value['control']['process_identity']
+  with self.assertRaises(u.ManagedUnknown):worker.managed_stopped(value,intent)
+ def test_confirmed_same_launch_stop_uses_readonly_observation_not_another_dispatch(self):
+  from types import SimpleNamespace
+  worker=self.managed_worker();captured=self.seed_managed_launch(worker)
+  prior={'request_id':str(uuid.uuid4()),'dispatch':'confirmed',**captured};worker.save(manager_stop=prior)
+  value=self.managed_stop_reply(worker,prior);value.update(request_current=True,profile_matches=True,request={'request_id':captured['start_request_id'],'phase':'ready'})
+  with patch.object(u.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(value))) as command:
+   worker.stop()
+  self.assertEqual(command.call_args.args[0],[str(worker.binary),'--home',str(worker.home),'native-status'])
+  self.assertEqual(worker.job['manager_stop'],prior)
+ def test_managed_stop_refuses_changed_launch_witness_before_dispatch(self):
+  worker=self.managed_worker();captured=self.seed_managed_launch(worker)
+  path=worker.home/'native-manager/requests'/(captured['start_request_id']+'.launched.json');value=u.read(path)
+  value['binding']['profile']['args']=['foreign'];u.write(path,value)
+  with patch.object(u.subprocess,'run') as dispatch,self.assertRaises(u.ManagedUnknown):worker.stop()
+  dispatch.assert_not_called();self.assertNotIn('manager_stop',worker.job)
+ def prepare_worker_dispatch(self,phase='accepted'):
+  worker=self.managed_worker();request=str(uuid.uuid4());worker.save('queued',request_id=request)
+  u.write(self.folder/('worker-dispatch-'+request+'.json'),{'schema':1,'plan_id':self.id,'request_id':request,'phase':phase})
+  return worker,request
+ def test_managed_worker_enters_once_and_records_only_same_request_terminal_state(self):
+  worker,request=self.prepare_worker_dispatch();calls=[]
+  def execute(current):
+   entered=u.read(self.folder/('worker-entered-'+request+'.json'))
+   self.assertEqual(entered,{'schema':1,'plan_id':self.id,'request_id':request,'pid':os.getpid()})
+   calls.append(True);current.save('succeeded')
+  with patch.object(u.Worker,'execute',execute):u.run_managed_worker(self.home,self.id,request)
+  finished=u.read(self.folder/('worker-finished-'+request+'.json'))
+  self.assertEqual(finished['state'],'succeeded');self.assertEqual(finished['request_id'],request)
+  worker.save('queued',request_id=request)
+  with patch.object(u.Worker,'execute') as repeated:u.run_managed_worker(self.home,self.id,request)
+  repeated.assert_not_called();self.assertEqual(len(calls),1)
+  self.assertEqual(u.read(self.folder/('worker-finished-'+request+'.json')),finished)
+ def test_managed_worker_refuses_stale_request_or_unstarted_dispatch_before_entry(self):
+  worker,request=self.prepare_worker_dispatch()
+  cases=[('job','request_id',str(uuid.uuid4())),('dispatch','phase','registering'),('dispatch','plan_id',str(uuid.uuid4())),('active','id',str(uuid.uuid4()))]
+  paths={'job':worker.file,'dispatch':self.folder/('worker-dispatch-'+request+'.json'),'active':self.root/'active.json'}
+  for owner,key,value in cases:
+   original=u.read(paths[owner]);u.write(paths[owner],{**original,key:value})
+   with self.subTest(owner=owner,key=key),patch.object(u.Worker,'execute') as execute,self.assertRaises(RuntimeError):u.run_managed_worker(self.home,self.id,request)
+   execute.assert_not_called();self.assertFalse((self.folder/('worker-entered-'+request+'.json')).exists())
+   u.write(paths[owner],original)
+ def test_managed_worker_unknown_exception_or_changed_request_never_gets_finished_receipt(self):
+  for outcome in ('unknown','exception','changed'):
+   worker,request=self.prepare_worker_dispatch()
+   def execute(current):
+    if outcome=='exception':raise OSError('journal unavailable')
+    current.save('recovery_required' if outcome=='unknown' else 'succeeded')
+    if outcome=='changed':u.write(current.file,{**current.job,'request_id':str(uuid.uuid4())})
+   with patch.object(u.Worker,'execute',execute):
+    if outcome=='unknown':u.run_managed_worker(self.home,self.id,request)
+    else:
+     with self.assertRaises((OSError,RuntimeError)):u.run_managed_worker(self.home,self.id,request)
+   self.assertTrue((self.folder/('worker-entered-'+request+'.json')).exists())
+   self.assertFalse((self.folder/('worker-finished-'+request+'.json')).exists())
  def test_replace_keeps_other_installation_state_and_recovers_missing_runtime_dir(self):
   (self.home/'secrets/token').write_bytes(b'private');(self.home/'runtime/old').write_bytes(b'old');candidate=self.folder/'binary';candidate.write_bytes(b'new');runtime=self.folder/'new-runtime';runtime.mkdir();(runtime/'new').write_bytes(b'new-runtime')
   self.worker().replace(candidate,runtime);self.assertEqual(self.binary.read_bytes(),b'new');self.assertEqual((self.home/'runtime/new').read_bytes(),b'new-runtime');self.assertEqual((self.home/'secrets/token').read_bytes(),b'private')
@@ -104,6 +321,21 @@ class NativeUpdateTests(unittest.TestCase):
   with patch.object(u,'fetch',side_effect=lambda url,limit:blobs[url]),patch.object(u.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='acp-slack-adapter 99.0.0')):
    worker.check()
   self.assertEqual(worker.job['state'],'ready');self.assertEqual(worker.job['release_id'],17);self.assertEqual(worker.job['binary_sha256'],hashlib.sha256(b'candidate').hexdigest())
+ @unittest.skipUnless(os.name=='nt','Windows version-probe creation flags')
+ def test_both_windows_version_probes_are_hidden_without_widening_budgets(self):
+  from types import SimpleNamespace
+  blobs,_=self.release_fixture();worker=self.worker()
+  with patch.object(u,'fetch',side_effect=lambda url,limit:blobs[url]),patch.object(u.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='acp-slack-adapter 99.0.0')) as candidate:
+   worker.check()
+  self.assertEqual(candidate.call_args.kwargs['creationflags'],u.subprocess.CREATE_NO_WINDOW)
+  self.assertEqual(candidate.call_args.kwargs['timeout'],15)
+  worker=self.managed_worker();request=str(uuid.uuid4());value=self.managed_observation(worker,request)
+  worker.managed_deadline=u.time.monotonic()+60;worker.started_pid=value['pid'];worker.started_generation=value['process_identity']
+  worker.job['launch']={'manager_request_id':request,'service':value['service']}
+  with patch.object(u.subprocess,'check_output',return_value='acp-slack-adapter 99.0.0') as installed,patch.object(worker,'manager_call',return_value=value),patch.object(worker,'api',return_value={'id':self.agent,'version':'99.0.0','addresses':{'pid':value['pid']}}):
+   worker.health(u.digest(self.binary))
+  self.assertEqual(installed.call_args.kwargs['creationflags'],u.subprocess.CREATE_NO_WINDOW)
+  self.assertGreater(installed.call_args.kwargs['timeout'],0);self.assertLessEqual(installed.call_args.kwargs['timeout'],15)
  def test_changed_public_asset_digest_is_rejected_before_extraction(self):
   blobs,release=self.release_fixture();release['assets'][0]['digest']='sha256:'+'0'*64;blobs['https://api.github.com/repos/'+u.REPO+'/releases/latest']=json.dumps(release).encode()
   with patch.object(u,'fetch',side_effect=lambda url,limit:blobs[url]),self.assertRaisesRegex(RuntimeError,'release_asset_digest_mismatch'):self.worker().check()

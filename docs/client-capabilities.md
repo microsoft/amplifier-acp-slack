@@ -40,7 +40,11 @@ never a persistent choice. Tool call updates are merged with the permission
 request so a request containing only a tool-call ID can still show its actual
 arguments.
 
-**Review details** opens a private Slack modal for that same authorized person.
+**View request** opens a private Slack modal for that same authorized person.
+Other members receive a private explanation that the details belong to the
+request recipient; no request contents or recipient identity are shown. If Slack
+cannot open the window, the connector attempts one private notice to the clicking
+member in the original channel. These controls never change the decision.
 Full request details also appear in the connector dashboard for its owner. Slack
 cards show a description and affected file locations, not raw arguments in the
 shared room. Long private modal details are explicitly shortened; the dashboard

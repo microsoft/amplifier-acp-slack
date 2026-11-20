@@ -108,7 +108,19 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         setup = api("GET", "/api/v1/setup/slack")[1]
         check(setup["authorization"] == "missing" and setup["next_action"] == "authorize" and not setup["connection_ready"], "Fresh setup exposes one next action")
         check(api("POST", "/api/v1/setup/slack", {"action":"token"})[0] == 400, "Internal token operation is never exposed")
-        check(api("POST", "/api/v1/setup/slack", {"action":"confirm","challenge":"code"})[0] == 400, "Expired authorization gives actionable error")
+        refusal_config = api("GET", "/api/v1/config")[1]
+        config_before_refusal = (home / "adapter.json").read_bytes()
+        expired_code, expired, _ = api("POST", "/api/v1/setup/slack", {"action":"confirm","challenge":"code"})
+        check(expired_code == 200 and expired.get("confirmation_refusal") == {
+            "schema": 1, "action": "confirm", "code": "authorization_expired",
+            "id": refusal_config["id"], "config_revision": refusal_config["revision"],
+        }, "Expired authorization returns the exact installation-bound typed refusal")
+        check(expired["authorization"] == "missing" and expired["next_action"] == "authorize"
+              and all(expired[key] is False for key in ("authorized", "authorization_pending", "connection_ready", "connection_running", "setup_complete"))
+              and "authorization_command" not in expired,
+              "Expired confirmation preserves saved unconnected status without a new authorization")
+        check((home / "adapter.json").read_bytes() == config_before_refusal,
+              "Expired confirmation leaves exact configuration unchanged")
         # A workspace declared at installation is shown everywhere, but it is not a connection.
         declared = {"team_id": "T0EXAMPLE1", "name": "Example Workspace"}
         check(created["intended_workspace"] == declared and status["slack_workspace"] == declared and status["setup_complete"] is False, "Installer arguments declare the workspace through init and status")
