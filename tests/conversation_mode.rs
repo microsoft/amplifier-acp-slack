@@ -24,6 +24,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_directories(false)
+    }
+    fn with_directories(directories: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let home = root.join("adapter");
@@ -38,7 +41,10 @@ for line in sys.stdin:
  r=json.loads(line);m=r.get('method');p=r.get('params',{});i=r.get('id')
  if not m: continue
  with (root/'calls.jsonl').open('a') as f:f.write(json.dumps(r)+'\n')
- if m=='initialize':send({'id':i,'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':True}}})
+ if m=='initialize':
+  caps={'loadSession':True}
+  if not (root/'no-directories').exists():caps['sessionCapabilities']={'additionalDirectories':{}}
+  send({'id':i,'result':{'protocolVersion':1,'agentCapabilities':caps}})
  elif m=='session/load':
   if (root/'unsupported').exists():send({'id':i,'result':{}});continue
   send({'id':'forbidden-write','method':'fs/write_text_file','params':{'sessionId':p['sessionId'],'path':str(root/'outside'),'content':'must not write'}})
@@ -46,7 +52,10 @@ for line in sys.stdin:
   modes=json.loads(saved.read_text()) if saved.exists() else {}
   send({'id':i,'result':{'modes':{'currentModeId':modes.get(p['sessionId'],'ask'),'availableModes':[{'id':'ask','name':'Ask'},{'id':'workspace','name':'Workspace','description':'Local workspace work'}]}}})
  elif m=='session/set_mode':
-  modes=json.loads(saved.read_text()) if saved.exists() else {};modes[p['sessionId']]=p['modeId'];saved.write_text(json.dumps(modes));send({'id':i,'result':{}})
+  modes=json.loads(saved.read_text()) if saved.exists() else {};modes[p['sessionId']]=p['modeId'];saved.write_text(json.dumps(modes))
+  # The connector can terminate this process as soon as it reads the reply.
+  if (root/'lose-capability').exists():(root/'no-directories').touch()
+  send({'id':i,'result':{}})
  else:send({'id':i,'error':{'code':-32601,'message':'not supported'}})
 "#).unwrap();
         let mut c = Config::new("Mode fixture".into(), "owner".into());
@@ -56,6 +65,10 @@ for line in sys.stdin:
             root.to_string_lossy().into_owned(),
         ];
         c.acp.cwd = workspace.to_string_lossy().into_owned();
+        if directories {
+            c.acp.additional_directories =
+                vec![root.join("agent-shared").to_string_lossy().into_owned()];
+        }
         c.slack.team_id = "T1".into();
         c.slack.app_id = "A1".into();
         c.slack.bot_user_id = "UBOT".into();
@@ -198,12 +211,123 @@ async fn owner_changes_only_the_selected_saved_session_without_a_model_prompt() 
         "ask"
     );
     let calls = std::fs::read_to_string(f.root.join("calls.jsonl")).unwrap();
+    assert!(!calls.contains("additionalDirectories"));
     assert!(!calls.contains("session/prompt"));
     assert!(!calls.contains("session/new"));
     assert!(!f.root.join("outside").exists());
     let saved: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("modes.json")).unwrap()).unwrap();
     assert_eq!(saved, json!({"session-one":"workspace"}));
+}
+
+#[tokio::test]
+async fn directory_grants_are_sent_on_mode_load_and_reconnect_verification() {
+    let f = Fixture::with_directories(true);
+    let token = f.token();
+    let (status, result) = f
+        .call(
+            "POST",
+            &f.context,
+            json!({"mode_id":"workspace","expected_session_id":"session-one"}),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    f.wait_mode_settled(&f.context).await;
+    let calls: Vec<Value> = std::fs::read_to_string(f.root.join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let loads: Vec<_> = calls
+        .iter()
+        .filter(|call| call["method"] == "session/load")
+        .collect();
+    assert_eq!(loads.len(), 2);
+    for load in loads {
+        assert_eq!(
+            load["params"]["additionalDirectories"],
+            json!(f.state.instance_config().acp.additional_directories)
+        );
+        assert_eq!(load["params"]["sessionId"], "session-one");
+    }
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call["method"] == "session/new" || call["method"] == "session/prompt")
+    );
+    assert!(!f.root.join("outside").exists());
+}
+
+#[tokio::test]
+async fn mode_load_and_post_change_verification_require_directory_capability() {
+    for lose_after_change in [false, true] {
+        let f = Fixture::with_directories(true);
+        let token = f.token();
+        std::fs::write(
+            f.root.join(if lose_after_change {
+                "lose-capability"
+            } else {
+                "no-directories"
+            }),
+            "",
+        )
+        .unwrap();
+        let (status, result) = f
+            .call(
+                "POST",
+                &f.context,
+                json!({"mode_id":"workspace","expected_session_id":"session-one"}),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        f.wait_mode_settled(&f.context).await;
+        let calls: Vec<Value> = std::fs::read_to_string(f.root.join("calls.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "initialize")
+                .count(),
+            1 + usize::from(lose_after_change)
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/load")
+                .count(),
+            usize::from(lose_after_change)
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_mode")
+                .count(),
+            usize::from(lose_after_change)
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call["method"] == "session/new" || call["method"] == "session/prompt")
+        );
+        if lose_after_change {
+            assert!(
+                result
+                    .to_string()
+                    .contains("accepted but could not be verified"),
+                "{result}"
+            );
+        } else {
+            assert!(
+                result.to_string().contains("additionalDirectories"),
+                "{result}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

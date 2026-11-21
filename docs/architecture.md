@@ -29,7 +29,10 @@ for that context. The endpoint supplies its own identity and instructions. Nativ
 session state remains with that endpoint; the connector stores its opaque ID and
 whether it can be resumed. The current driver records `session_replaced` and
 creates a new session after
-a non-authentication load failure, rebuilding context from Slack. This describes
+a non-authentication load failure when `acp.additional_directories` is empty,
+rebuilding context from Slack. With additional directories configured, a failed
+load instead preserves the saved binding and sends no replacement or prompt:
+the failure may be an endpoint directory-scope denial. This describes
 the implementation; it does not establish successful restoration or an exception
 to the shared [preservation and recovery intent](https://github.com/microsoft/amplifier-constellation/blob/main/contracts/work-continuity.md).
 Evaluate that path when changing recovery behavior. Session separation here is

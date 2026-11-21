@@ -204,6 +204,53 @@ async fn saves_are_revision_checked_and_cannot_change_observed_identity() {
     );
     let mut c = state.instance_config();
     Store::open(&state.home).unwrap().bind_identity(&c).unwrap();
+    // Operator directory grants remain revision-safe edits, not endpoint identity.
+    for directories in [
+        vec![
+            state
+                .home
+                .join("remote-shared")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        vec![],
+    ] {
+        c.acp.additional_directories = directories.clone();
+        let revision = c.revision;
+        let client = serde_json::to_value(&c.acp.client).unwrap();
+        let (status, saved) = request(
+            state.clone(),
+            "PUT",
+            "/api/v1/config",
+            Some(&token),
+            Some(json!({"expected_revision":revision,"config":c})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["revision"], revision + 1);
+        assert_eq!(saved["acp"]["client"], client);
+        c = state.instance_config();
+        assert_eq!(c.acp.additional_directories, directories);
+        assert_eq!(
+            Config::load(&state.home)
+                .unwrap()
+                .acp
+                .additional_directories,
+            directories
+        );
+        assert_eq!(
+            request(
+                state.clone(),
+                "PUT",
+                "/api/v1/config",
+                Some(&token),
+                Some(json!({"expected_revision":revision,"config":c}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
     c.acp.command = "different-agent".into();
     let (status, error) = request(
         state.clone(),
