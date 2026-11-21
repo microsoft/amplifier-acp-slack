@@ -65,6 +65,26 @@ downloads its public certificate. Prefer a trusted HTTPS hostname when available
 PAM sign-in uses the account that installed this connector. Passwords never travel
 over an HTTP management listener.
 
+### Renew an older managed HTTPS certificate
+
+Older generated server certificates omit Authority Key Identifier and can be
+refused by strict clients, including Python 3.13's default TLS context. Newly
+generated leaves include it. An upgrade does not silently replace an existing
+unexpired leaf: normal renewal still occurs within 30 days of expiry or when
+its network names change.
+
+For earlier renewal, stop this installation's service using its normal service
+manager and back up its private `tls` directory. Move only `tls/cert.pem` out of
+its serving path, keeping that backup private, then start the service with the
+updated executable. It generates a new server certificate and leaf key under
+the **same CA**. Do not remove `tls/managed.json`, `tls/root-ca.crt` or
+`tls/root-ca.key`: those preserve the existing trust root and its lifetime.
+Check the new certificate against that root and the intended hostname before
+updating any explicitly configured leaf fingerprint pins. CA trust needs no
+replacement. Never disable certificate or hostname verification as a workaround.
+This procedure is for connector-managed certificates, not operator-provided
+certificates or a reverse proxy's TLS configuration.
+
 ## Connect Slack
 
 1. Open the printed URL and sign in. The installed agent is already selected. The
