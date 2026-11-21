@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.18.4
+
+New connector-managed HTTPS server certificates include the Authority Key
+Identifier required by strict TLS clients such as Python 3.13. Existing
+installations can renew their server certificate under the same CA.
+See the [release notes](docs/releases/0.18.4.md) for the renewal procedure.
+
 ## 0.18.3
 
 Read macOS native connector status from the service's own launchd properties,
