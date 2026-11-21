@@ -1106,6 +1106,8 @@ fn prepare_tls(home: &FsPath, id: &str, names: Vec<String>) -> Result<()> {
     p.not_after = now + Days::days(365);
     p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // RFC 5280 requires AKI on a CA-issued leaf; strict TLS clients enforce it.
+    p.use_authority_key_identifier_extension = true;
     let cert = p.signed_by(&key, &issuer)?;
     private_write(&home.join("tls/cert.pem"), cert.pem().as_bytes())?;
     private_write(&home.join("tls/key.pem"), key.serialize_pem().as_bytes())?;

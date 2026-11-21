@@ -46,6 +46,9 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         endpoints = json.loads((home / "endpoints.json").read_text())
         base = endpoints["base_url"]
         context = ssl.create_default_context(cafile=endpoints["trust_certificate_file"])
+        # Python 3.13 enables this by default; exercise the same chain rules on
+        # older supported test interpreters too, without relaxing hostname/trust.
+        context.verify_flags |= ssl.VERIFY_X509_STRICT
         token = (home / "secrets/control-token").read_text().strip()
         def api(method, path, body=None, credential=token):
             data = None if body is None else json.dumps(body).encode()
@@ -62,16 +65,27 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
             try:
                 result = api("GET", "/healthz", credential=None)
                 break
-            except (OSError, urllib.error.URLError):
+            except (OSError, urllib.error.URLError) as error:
+                if isinstance(error, ssl.SSLCertVerificationError) or isinstance(
+                        getattr(error, "reason", None), ssl.SSLCertVerificationError):
+                    raise
+                if process.poll() is not None:
+                    raise AssertionError("Service exited before TLS readiness")
                 assert time.monotonic() < deadline, "TLS listener startup timed out"
                 time.sleep(0.05)
         check(result[1]["ok"], "Trusted local TLS health")
-        try:
-            urllib.request.urlopen(base + "/healthz", timeout=3)
-            raise AssertionError("Fresh local CA was unexpectedly trusted by the system")
-        except urllib.error.URLError:
-            checks += 1
         parsed = urllib.parse.urlparse(base)
+        def refused_tls(trust, hostname, verify_code, label):
+            with socket.create_connection((parsed.hostname, parsed.port), timeout=3) as connection:
+                try:
+                    with trust.wrap_socket(connection, server_hostname=hostname):
+                        raise AssertionError(label)
+                except ssl.SSLCertVerificationError as error:
+                    check(error.verify_code == verify_code, label + ": " + error.verify_message)
+        untrusted = ssl.create_default_context()
+        untrusted.verify_flags |= ssl.VERIFY_X509_STRICT
+        refused_tls(untrusted, parsed.hostname, 20, "Untrusted local CA refused")
+        refused_tls(context, "wrong-host.invalid", 62, "Trusted CA does not bypass hostname verification")
         with socket.create_connection((parsed.hostname, parsed.port), timeout=3) as connection:
             connection.sendall(b"GET /api/v1/config HTTP/1.0\r\nHost: localhost\r\n\r\n")
             try:
@@ -157,6 +171,8 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         check((home/"connection-gate.json").exists(), "Disconnect remains paused durably")
         check((home/"secrets/provider-key").read_text()=="private-service-canary", "Saved credentials retained")
         root_cert = (home / "tls/root-ca.crt").read_bytes()
+        tls_before_restart = {name: (home / "tls" / name).read_bytes()
+                              for name in ("root-ca.crt", "root-ca.key", "cert.pem", "key.pem", "managed.json")}
         port = parsed.port
         process.terminate()
         process.wait(timeout=10)
@@ -177,7 +193,29 @@ with tempfile.TemporaryDirectory(prefix="adapter-management-") as root:
         failure=connection_call(connect)
         check(failure["settled"] and failure["failed"] and failure["state"]=="disconnected", "Missing authorization is a settled failure, never fake success")
         check((home / "tls/root-ca.crt").read_bytes() == root_cert, "CA stable across restart")
+        check(all((home / "tls" / name).read_bytes() == data for name, data in tls_before_restart.items()),
+              "Ordinary restart preserves existing managed certificates and pins")
         check(json.loads((home / "endpoints.json").read_text())["base_url"].endswith(f":{port}"), "Port stable across restart")
+        # Explicit operator renewal: stop, retain the old leaf, then remove it
+        # from its serving path. Never remove the CA or managed.json.
+        process.terminate()
+        process.wait(timeout=10)
+        (home / "tls/cert.pem").rename(home / "tls/previous-cert.pem")
+        process = subprocess.Popen([binary, "--home", str(home), "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                api("GET", "/healthz", credential=None)
+                break
+            except (OSError, urllib.error.URLError):
+                assert time.monotonic() < deadline, "Renewed TLS listener startup timed out"
+                time.sleep(0.05)
+        check(all((home / "tls" / name).read_bytes() == tls_before_restart[name]
+                  for name in ("root-ca.crt", "root-ca.key")), "Explicit leaf renewal preserves CA trust and key")
+        check(all((home / "tls" / name).read_bytes() != tls_before_restart[name]
+                  for name in ("cert.pem", "key.pem")), "Explicit renewal replaces only the leaf certificate and key")
+        check(api("GET", "/api/v1/status")[0] == 200, "Existing management credential works after strict TLS renewal")
+        refused_tls(context, "wrong-host.invalid", 62, "Renewed leaf still refuses the wrong hostname")
     finally:
         if process.poll() is None:
             process.terminate()
