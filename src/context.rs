@@ -1265,7 +1265,7 @@ pub async fn mcp(
                 if !channel_scope {
                     return Err(ApiError::forbidden());
                 }
-                let value = crate::huddles::call(
+                let result = crate::huddles::call(
                     &config,
                     &state.home,
                     job,
@@ -1273,10 +1273,17 @@ pub async fn mcp(
                     &body["params"]["arguments"],
                     channel_scope,
                 )
-                .await?;
+                .await;
                 return Ok(rpc(
                     id,
-                    json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
+                    match result {
+                        Ok(value) => {
+                            json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value})
+                        }
+                        Err(_) => {
+                            json!({"isError":true,"content":[{"type":"text","text":"The huddle request could not be completed. Check the saved thread and delivery receipts before attempting any further action."}]})
+                        }
+                    },
                 ));
             }
             if body["params"]["name"] == "slack_read_document" {
