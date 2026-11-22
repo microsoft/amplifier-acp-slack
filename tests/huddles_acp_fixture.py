@@ -131,6 +131,19 @@ def prompt(params):
         assert not expected & advertised
     else:
         assert expected <= advertised
+    if case == "happy":
+        missing = str(uuid.uuid4())
+        for name, args in [
+            ("slack_huddle_status", {}),
+            ("slack_huddle_post", dict(huddle_id=missing, request_id=str(uuid.uuid4()), text="Fixture only")),
+        ]:
+            try:
+                call(name, **args)
+            except RuntimeError as error:
+                assert error.args[0]["isError"] is True
+            else:
+                raise AssertionError("Expected huddle tool error")
+        assert rpc("tools/list", {})["tools"] == tools
     try:
         first = call("slack_huddle_ensure", purpose="HUDDLE_CASE " + case, peer_user_ids=["Ubeta"])
     except (urllib.error.HTTPError, RuntimeError):
