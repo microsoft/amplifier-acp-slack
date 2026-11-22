@@ -69,9 +69,10 @@ over an HTTP management listener.
 
 Older generated server certificates omit Authority Key Identifier and can be
 refused by strict clients, including Python 3.13's default TLS context. Newly
-generated leaves include it. An upgrade does not silently replace an existing
-unexpired leaf: normal renewal still occurs within 30 days of expiry or when
-its network names change.
+generated leaves include it. An upgrade alone keeps the existing leaf. Each
+time the connector's HTTPS service starts, it checks the managed leaf and
+renews it if 30 days or fewer remain before expiry, or if its network names
+have changed.
 
 For earlier renewal, stop this installation's service using its normal service
 manager and back up its private `tls` directory. Move only `tls/cert.pem` out of
