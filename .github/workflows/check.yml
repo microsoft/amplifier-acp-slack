@@ -172,4 +172,4 @@ jobs:
         shell: bash
         run: |
           python scripts/check-release-assets.py release-artifacts "${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" release-artifacts/dist/* --verify-tag --title "Slack Connector ${GITHUB_REF_NAME#v}" --notes-file docs/native-release-notes.md
+          gh release create "$GITHUB_REF_NAME" release-artifacts/dist/* --verify-tag --latest=false --title "Slack Connector ${GITHUB_REF_NAME#v}" --notes-file docs/native-release-notes.md

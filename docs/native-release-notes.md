@@ -1,3 +1,5 @@
+Slack Connector 0.17.16 reports a failed huddle operation as a tool error so other Slack tools remain available in the same conversation. Check existing delivery receipts before taking further action on an uncertain send.
+
 Slack 0.17.15 keeps the same tools available for discovery when people and agents alternate in a group conversation. This lets compatible engines reuse their conversation context. See the [maintenance release notes](https://github.com/microsoft/amplifier-acp-slack/blob/v0.17.15/docs/releases/0.17.15.md).
 
 Slack 0.17.14 lets an agent send named documents in its reply and read a complete text attachment from a message in its conversation. See [the attachment release notes](https://github.com/microsoft/amplifier-acp-slack/blob/v0.17.14/docs/releases/0.17.14.md).
